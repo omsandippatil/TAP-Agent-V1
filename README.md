@@ -1,12 +1,12 @@
 # TAP CSR Research Agent
 
-An AI-powered research tool that helps [The Apprentice Project (TAP)](https://theapprenticeproject.org) find and prioritize corporate CSR funding prospects in India. Give it a company name and it researches the company's CSR activity across six sources, scores its fit with TAP's mission on a 0–100 scale, and produces a shareable report for leadership.
+An AI-powered research tool that helps [The Apprentice Project (TAP)](https://theapprenticeproject.org) find and prioritize corporate CSR funding prospects in India. Give it a company name and it researches the company's CSR activity across seven sources, scores its fit with TAP's mission on a 0–100 scale, and produces a shareable report for leadership.
 
 ## What it does
 
 Type a company name and the agent:
 
-1. **Researches 6 sources** — the company's India CSR page (found via domain discovery, link crawling, and sitemap scanning), MCA portal, the National CSR Portal, annual reports (with PDF extraction), funded/implementation partners, and CSR decision-makers on LinkedIn.
+1. **Researches 7 sources** — the company's India CSR page (found via domain discovery, link crawling, and sitemap scanning), MCA portal, the National CSR Portal, annual reports (with PDF extraction), funded/implementation partners, CSR decision-makers on LinkedIn, and recent partnership announcements / future CSR plans / leadership statements.
 2. **Extracts evidence** — every fact is cited with a source URL and excerpt, then re-verified.
 3. **Scores fit across 6 weighted dimensions** — with an AI semantic layer (Groq / Llama-3.3-70B) that reads the collected evidence against TAP's mission, so companies whose CSR pages say "digital inclusion" instead of "education" still score correctly.
 4. **Generates reports** — an interactive dashboard, a downloadable DOCX brief, and an HTML report with partners, decision-makers, spend data, and a verification log.
@@ -73,7 +73,7 @@ Two modes on the home page:
 
 ```
 app.py            Streamlit UI (dashboard, modes, downloads)
-scraper.py        6-source research engine (domain discovery, sitemap scan, PDF extraction)
+scraper.py        7-source research engine (domain discovery, sitemap scan, PDF extraction)
 parser.py         Evidence extraction from fetched text
 scorer.py         Weighted 6-dimension scoring + AI semantic lift + strict penalties
 llm.py            Groq semantic alignment (silent fallback if no API key)
