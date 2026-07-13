@@ -13,6 +13,12 @@ import sys
 import os
 import streamlit as st
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # loads ANTHROPIC_API_KEY etc. from .env into os.environ
+except ImportError:
+    pass  # python-dotenv not installed; env vars can still be set manually
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scraper       import fetch_screen_sources, fetch_deep_sources
@@ -453,6 +459,8 @@ if go and company.strip():
 
             st.markdown("#### Breakdown")
             for dim, info_d in breakdown.items():
+                if not isinstance(info_d, dict):
+                    continue   # skip "penalties" list and "raw_score" int
                 s  = info_d.get("score", 0)
                 mx = info_d.get("max", 10)
                 st.markdown(f"**{dim_label(dim)}** `{s}/{mx}`")
