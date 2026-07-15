@@ -215,6 +215,52 @@ def generate_docx_report(company: str, result: dict, mode: str = "deep") -> byte
         if sem.get("rationale"):
             _small(p.add_run("  —  " + sem["rationale"]), 8.5, GREY)
 
+    # ── Methodology scorecard — 8 criteria (0–5), per the manual research
+    #    methodology template. Verdict tiers: Priority Hunt / Worth Hunting /
+    #    Conditional Fit / Low Priority.
+    meth = None
+    try:
+        from methodology import derive_criteria
+        from scorer import _cfg as _load_cfg
+        meth = derive_criteria(company, result, _load_cfg())
+    except Exception:
+        pass   # methodology view is additive — never block the brief
+    if meth:
+        _h(doc, "METHODOLOGY SCORECARD — 8 CRITERIA (0–5)")
+        tier = meth["tier"]
+        tier_rgb = {"#7C3AED": PURPLE, "#16A34A": GREEN,
+                    "#0EA5E9": BLUE, "#DC2626": RED}.get(tier["color"], INK)
+        p = doc.add_paragraph()
+        r = p.add_run(f"Verdict: {tier['label']}  ·  {meth['average']} / 5")
+        r.bold = True; r.font.size = Pt(11); r.font.color.rgb = tier_rgb
+
+        mt = doc.add_table(rows=1 + len(meth["criteria"]), cols=4)
+        mt.columns[0].width = Cm(6.0)
+        for i, htxt in enumerate(("Criterion", "Score", "Rating", "Evidence (one line)")):
+            c = mt.rows[0].cells[i]
+            c.text = htxt
+            run = c.paragraphs[0].runs[0]
+            run.bold = True; run.font.size = Pt(9)
+            _shade(c, "EDE9F8")
+        for i, cri in enumerate(meth["criteria"], start=1):
+            cells = mt.rows[i].cells
+            vals = (cri["name"], str(cri["score"]), cri["rating"], cri["evidence"])
+            for j, val in enumerate(vals):
+                cells[j].text = val
+                cells[j].paragraphs[0].runs[0].font.size = Pt(8.5)
+            if cri["evidence"].startswith("To confirm"):
+                _shade(cells[3], "FFF3CD")
+
+        p = doc.add_paragraph()
+        r = p.add_run(meth["csr_head_note"] + "  Gaps are marked 'To confirm' "
+                      "— the engine drafts, a person verifies every figure.")
+        _small(r)
+        if meth.get("open_questions"):
+            p = doc.add_paragraph()
+            r = p.add_run("Open questions: " +
+                          " · ".join(meth["open_questions"][:4]))
+            _small(r, 8.5, GREY, italic=False)
+
     # ── CSR spend ────────────────────────────────────────────────────────────
     spend = data.get("spend", {})
     _h(doc, "INDIA CSR SPEND")

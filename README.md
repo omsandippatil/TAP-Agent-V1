@@ -56,23 +56,33 @@ Verify it's connected:
 python -c "from llm import api_health_check; print(api_health_check())"
 ```
 
-## Run
+## Run (local)
 
 ```bash
-streamlit run app.py
+python api/index.py
 ```
 
-Two modes on the home page:
+Open http://localhost:5000. Two modes on the home page:
 
 - **🔍 Prospect Screening** — fast first-pass check of a company.
-- **🔬 Deep Research** — full 6-source investigation with DOCX + HTML report downloads.
+- **🔬 Deep Research** — full investigation with DOCX + HTML + XLSX + JSON downloads and the 8-criteria methodology scorecard.
 
-> **Note:** after editing any `.py` file, fully restart Streamlit (Ctrl+C, then `streamlit run app.py`). A browser refresh alone keeps old code cached.
+## Deploy (Vercel)
+
+Push the repo to GitHub, import it at vercel.com/new, deploy — no build
+settings needed. `vercel.json` routes all traffic to the Flask app in
+`api/index.py` and sets a 300-second function limit (the Hobby-plan maximum
+with Fluid compute; Deep Research needs the headroom). Optional: add
+`GROQ_API_KEY` under Project → Settings → Environment Variables to enable
+AI semantic scoring.
 
 ## Project structure
 
 ```
-app.py            Streamlit UI (dashboard, modes, downloads)
+api/index.py      Flask app — Vercel serverless entrypoint (all routes)
+webui.py          Server-rendered HTML pages (home + results, embedded downloads)
+vercel.json       Vercel routing + 300s function duration
+app.py            Legacy Streamlit UI (no longer deployed; safe to delete)
 scraper.py        7-source research engine (domain discovery, sitemap scan, PDF extraction)
 parser.py         Evidence extraction from fetched text
 scorer.py         Weighted 6-dimension scoring + AI semantic lift + strict penalties

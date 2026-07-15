@@ -1,4 +1,4 @@
-streamlit>=1.35
+flask>=3.0
 pyyaml>=6.0
 ddgs>=0.1
 requests>=2.31

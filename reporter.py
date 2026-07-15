@@ -191,6 +191,42 @@ def generate_html_report(company: str, result: dict, mode: str = "deep") -> str:
         bars_html += _bar("AI Semantic Alignment",
                           sem_bd.get("score") or 0, 100, "#7c3aed")
 
+    # ── Methodology scorecard (8 criteria, 0–5) ───────────────────────────────
+    meth_html = ""
+    try:
+        from methodology import derive_criteria
+        from scorer import _cfg as _load_cfg
+        _meth = derive_criteria(company, result, _load_cfg())
+    except Exception:
+        _meth = None   # additive — never block the report
+    if _meth:
+        _tier = _meth["tier"]
+        _rows = ""
+        for c in _meth["criteria"]:
+            _ev_style = ("background:#FFF3CD;" if
+                         c["evidence"].startswith("To confirm") else "")
+            _rows += (f"<tr><td>{c['name']}</td>"
+                      f"<td style='text-align:center'><b>{c['score']}</b></td>"
+                      f"<td>{c['rating']}</td>"
+                      f"<td style='{_ev_style}color:var(--muted)'>{c['evidence']}</td></tr>")
+        _oq = " · ".join(_meth.get("open_questions", [])[:4])
+        meth_html = f"""
+  <h2>📐 Methodology Scorecard — 8 Criteria (0–5)</h2>
+  <p><span style="display:inline-block;padding:5px 14px;border-radius:8px;
+     font-weight:700;color:#fff;background:{_tier['color']}">
+     {_tier['label']} · {_meth['average']} / 5</span></p>
+  <table style="width:100%;border-collapse:collapse;font-size:0.85rem">
+    <tr style="background:#EDE9F8">
+      <th align="left" style="padding:6px">Criterion</th>
+      <th style="padding:6px">Score</th>
+      <th align="left" style="padding:6px">Rating</th>
+      <th align="left" style="padding:6px">Evidence (one line)</th></tr>
+    {_rows}
+  </table>
+  <p style="font-size:0.8rem;color:var(--muted)">{_meth['csr_head_note']}
+     Gaps are marked 'To confirm' — the engine drafts, a person verifies
+     every figure. Open questions: {_oq}</p>"""
+
     # ── Adjacency clusters ────────────────────────────────────────────────────
     adj_html = ""
     adj_fired = breakdown.get("adjacency_boost",{}).get("fired_clusters",[])
@@ -366,6 +402,9 @@ def generate_html_report(company: str, result: dict, mode: str = "deep") -> str:
   <!-- Score breakdown -->
   <h2>Score Breakdown</h2>
   {bars_html}
+
+  <!-- Methodology scorecard (8 criteria, 0-5) -->
+  {meth_html}
 
   <!-- CSR Spend -->
   <h2>💰 India CSR Spend</h2>
