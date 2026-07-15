@@ -17,7 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from scraper       import fetch_screen_sources, fetch_deep_sources
 from parser        import parse_all
-from scorer        import score as compute_score
+from scorer        import score as compute_score, _cfg as load_cfg
+from methodology   import derive_criteria
+from deep_dive_xlsx import generate_deep_dive_xlsx
 from reporter      import generate_html_report
 from docx_reporter import generate_docx_report
 
@@ -326,7 +328,6 @@ with st.form("main_form"):
 # ── Research ──────────────────────────────────────────────────────────────────
 if go and company.strip():
     company = company.strip()
-    st.divider()
 
     bar  = st.progress(0, "Initialising…")
     info = st.empty()
@@ -363,6 +364,19 @@ if go and company.strip():
 
     info.empty()
     bar.empty()
+
+    # Cache the finished research: st.download_button clicks rerun the whole
+    # script with go=False, which used to reset the page to the input form.
+    st.session_state["tap_run"] = {"company": company, "result": result,
+                                    "is_screen": is_screen}
+
+# ── Render results from the session cache (survives download reruns) ─────────
+_run = st.session_state.get("tap_run")
+if _run:
+    company   = _run["company"]
+    result    = _run["result"]
+    is_screen = _run["is_screen"]
+    st.divider()
 
     fit       = result["fit_score"]
     state     = result["state"]
@@ -456,6 +470,8 @@ if go and company.strip():
             for dim, info_d in breakdown.items():
                 if not isinstance(info_d, dict):
                     continue   # skip "penalties" list and "raw_score" int
+                if "score" not in info_d or "max" not in info_d:
+                    continue   # skip info dicts (education_dominance, existing_partner)
                 if dim == "semantic_alignment":
                     continue   # rendered separately below
                 s  = info_d.get("score", 0)
@@ -657,6 +673,28 @@ if go and company.strip():
                 if url:
                     st.caption(f"[View]({url})")
 
+        # ── Methodology scorecard (8 criteria, 0–5) ──────────────────────
+        st.divider()
+        _meth = derive_criteria(company, result, load_cfg())
+        _mt   = _meth["tier"]
+        st.markdown("### 📐 Methodology Scorecard — 8 criteria (0–5)")
+        st.markdown(
+            f"<div style='display:inline-block;padding:6px 14px;border-radius:8px;"
+            f"font-weight:700;color:#fff;background:{_mt['color']}'>"
+            f"{_mt['label']} · {_meth['average']} / 5</div>",
+            unsafe_allow_html=True)
+        _rows = "".join(
+            f"<tr><td>{c['name']}</td><td style='text-align:center'><b>{c['score']}</b></td>"
+            f"<td>{c['rating']}</td><td style='opacity:0.8'>{c['evidence']}</td></tr>"
+            for c in _meth["criteria"])
+        st.markdown(
+            "<table style='width:100%;font-size:0.85rem'>"
+            "<tr><th align='left'>Criterion</th><th>Score</th>"
+            "<th align='left'>Rating</th><th align='left'>Evidence</th></tr>"
+            f"{_rows}</table>", unsafe_allow_html=True)
+        st.caption(_meth["csr_head_note"] + " Gaps are marked 'To confirm' — "
+                   "the engine drafts, a person verifies every figure.")
+
         # Downloads
         st.divider()
         dl_col1, dl_col2, dl_col3 = st.columns(3)
@@ -717,11 +755,23 @@ if go and company.strip():
                 use_container_width=True,
             )
 
+        xlsx_bytes = generate_deep_dive_xlsx(company, result, load_cfg())
+        st.download_button(
+            label="📊 Download Deep-Dive Base (XLSX — 7-sheet methodology template)",
+            data=xlsx_bytes,
+            file_name=f"TAP_DeepDive_{company.replace(' ','_')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            help="Verdict, Fit Against Criteria, Conclusive Evidence, Project "
+                 "Ledger, Approach, Open Questions, Sources — per the TAP CSR "
+                 "Research Methodology. Engine draft: verify every figure.",
+        )
+
 elif go:
     st.warning("Please enter a company name.")
 
 # ── How it works (shown before first search) ─────────────────────────────────
-if not go:
+if not st.session_state.get("tap_run"):
     st.markdown("")
     st.markdown("##### How it works")
     c1, c2, c3, c4 = st.columns(4)

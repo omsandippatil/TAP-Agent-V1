@@ -151,6 +151,7 @@ def _dim_labels():
     return {
         "focus_alignment": ("🎯 Focus Alignment", "#7c3aed"),
         "adjacency_boost": ("🔗 Adjacency Boost", "#8b5cf6"),
+        "partner_similarity": ("🤝 Partner Similarity", "#0ea5e9"),
         "geography_fit":   ("📍 Geography",       "#f59e0b"),
         "csr_maturity":    ("📋 CSR Maturity",    "#10b981"),
         "budget_size":     ("💰 Budget",           "#ef4444"),

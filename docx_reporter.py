@@ -196,6 +196,7 @@ def generate_docx_report(company: str, result: dict, mode: str = "deep") -> byte
     # ── Score breakdown ──────────────────────────────────────────────────────
     _h(doc, "SCORE BREAKDOWN")
     dims = {"focus_alignment": "Focus Alignment", "adjacency_boost": "Adjacency Boost",
+            "partner_similarity": "Partner Similarity",
             "geography_fit": "Geography", "csr_maturity": "CSR Maturity",
             "budget_size": "Budget", "source_quality": "Source Quality"}
     bar_rows = {k: v for k, v in breakdown.items()

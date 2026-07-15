@@ -4,12 +4,13 @@
 
 # ── Scoring weights (must sum to 100) ────────────────────────────────────────
 weights:
-  focus_alignment:  55    # How closely CSR focus matches TAP's exact mission (education-first)
-  adjacency_boost:  15    # Adjacent/related programs that create partnership opportunity
-  geography_fit:    10    # India presence and relevant states
-  csr_maturity:     10    # How structured/mature is their CSR programme
-  budget_size:      5     # India CSR spend (unknown → neutral, not 0)
-  source_quality:   5     # Quality of sources where evidence was found
+  focus_alignment:     40  # How closely CSR focus matches TAP's exact mission (education-first)
+  adjacency_boost:     18  # Adjacent/related programs that create partnership opportunity
+  partner_similarity:  15  # Similarity to TAP's ACTUAL partners (see partner_exemplar_traits)
+  geography_fit:       9   # India presence and relevant states
+  csr_maturity:        8   # How structured/mature is their CSR programme
+  budget_size:         5   # India CSR spend (unknown → neutral, not 0)
+  source_quality:      5   # Quality of sources where evidence was found
 
 # ── TAP's exact focus areas (for Focus Alignment scoring) ────────────────────
 # TAP = 21st-century skills & mindsets (critical thinking, creativity,
@@ -45,12 +46,12 @@ tap_focus_areas:
   "school education":               75
   "middle school":                  75
   "secondary school":               75
-  "high school":                    70
-  "edtech":                         70
-  "skill development":              65
-  "skilling":                       65
-  "education":                      55
-  "scholarship":                    40
+  "high school":                    75
+  "edtech":                         80
+  "skill development":              75
+  "skilling":                       75
+  "education":                      70
+  "scholarship":                    55
 
 # ── Adjacency clusters (THE CORE INTELLIGENCE) ───────────────────────────────
 # Each cluster = a set of signals that indicate adjacent fit with TAP
@@ -224,6 +225,254 @@ adjacency_clusters:
 
 # Cap on total adjacency boost (prevents unrealistic over-scoring)
 max_adjacency_boost: 20
+
+# ── Structural misalignment penalties ────────────────────────────────────────
+penalties:
+  higher_education_only:
+    cap: 70    # university-only CSR — not TAP's school-age model
+  employability_only:
+    cap: 50    # vocational/job-placement CSR — TAP explicitly does NOT do
+               # this; cap keeps such companies out of the Conditional tier
+  infra_donations_only:
+    deduction: 15
+
+# Ceiling for INDIRECT education alignment (adjacency-uplifted scores).
+# Education supporters can reach Strong Fit (80–89) but the 90+ Immediate
+# Target tier stays reserved for direct mission matches — UNLESS the company
+# is a known existing TAP partner (see tap_existing_partners below).
+indirect_alignment_cap: 89
+
+# ── Known existing TAP collaborating partners ────────────────────────────────
+# Ground truth beats the model: these companies already partner with TAP, so
+# their proven collaboration floors the score at tap_partner_floor and
+# exempts them from the indirect-alignment cap. Matched case-insensitively
+# against the company name entered in the tool.
+tap_existing_partners:
+  - "Capgemini"
+  - "Ericsson"
+  - "Tenerity"
+  - "Bajaj Finserv"
+  - "NRB Bearings"
+  - "SVP India"
+  - "Project Tech4Dev"
+tap_partner_floor: 92
+
+# ── Partner exemplar traits (researched from TAP's REAL partners) ────────────
+# Derived July 2026 from public CSR data of Tenerity, Capgemini, Bajaj
+# Finserv, NRB Bearings, SVP India and Project Tech4Dev. A prospect that
+# looks like TAP's actual partners scores on the partner_similarity
+# dimension. Each trait that matches adds its points (capped below).
+partner_exemplar_traits:
+
+  ngo_funding_partnerships:
+    label: "Funds NGO-implemented programmes"
+    evidence_from: >
+      All six partners fund or enable NGOs: Bajaj Finserv Activate runs 200+
+      partner-implemented programmes (incl. Masoom night schools); Capgemini
+      works with DEF & EduBridge; NRB funds Gyan Prakash Foundation (Pune);
+      SVP India has 120 grantee NGOs.
+    keywords:
+      - "implementing partner"
+      - "implementation partner"
+      - "ngo partner"
+      - "partnered with"
+      - "grants to"
+      - "grantee"
+      - "supported ngos"
+      - "night school"
+    points: 4
+
+  digital_skilling_dna:
+    label: "Digital inclusion / digital skilling"
+    evidence_from: >
+      Capgemini: Digital Academies (55+ across 13 cities), digital
+      citizenship for govt-school students; Bajaj Finserv: digital and
+      tech-based education; Tech4Dev: digital capacity building.
+    keywords:
+      - "digital inclusion"
+      - "digital skilling"
+      - "digital academy"
+      - "digital literacy"
+      - "digital divide"
+      - "digital empowerment"
+      - "digital education"
+      - "edtech"
+      - "e-learning"
+    points: 4
+
+  stem_coding_robotics:
+    label: "STEM / coding / robotics for school students"
+    evidence_from: >
+      NRB Bearings: FIRST robotics competition for 9th-graders with industry
+      mentors; Capgemini: AI, robotics, coding & tinkering in govt schools,
+      Atal Innovation Mission collaboration.
+    keywords:
+      - "stem"
+      - "robotics"
+      - "coding"
+      - "tinkering"
+      - "atal"
+      - "innovation lab"
+      - "science education"
+    points: 3
+
+  govt_school_students:
+    label: "Government school student outreach"
+    evidence_from: >
+      Capgemini adopted 10 govt schools + Project Akshara in 46 govt
+      schools; NRB focuses on under-served communities and the girl child.
+    keywords:
+      - "government school"
+      - "govt school"
+      - "school adoption"
+      - "municipal school"
+      - "zilla parishad"
+    points: 3
+
+  employee_volunteering_mentorship:
+    label: "Skilled employee volunteering & mentoring"
+    evidence_from: >
+      SVP India's entire model is skilled-volunteer partners mentoring NGOs;
+      NRB provides industry mentors; TAP's corporate volunteers mentor
+      students directly.
+    keywords:
+      - "employee volunteering"
+      - "employee volunteers"
+      - "skilled volunteering"
+      - "mentoring"
+      - "mentorship"
+      - "industry mentors"
+    points: 2
+
+  chatbot_whatsapp_delivery:
+    label: "WhatsApp / chatbot programme delivery"
+    evidence_from: >
+      Project Tech4Dev built Glific, the open-source WhatsApp chatbot
+      platform — the exact delivery category of TAP Buddy.
+    keywords:
+      - "whatsapp"
+      - "chatbot"
+      - "conversational platform"
+    points: 3
+
+  child_youth_soft_skills:
+    label: "Children/youth soft skills & FLN"
+    evidence_from: >
+      Bajaj Finserv Activate: children & youth 0–18, soft skills,
+      foundational literacy & numeracy, mental health support.
+    keywords:
+      - "soft skills"
+      - "foundational literacy"
+      - "children and youth"
+      - "life skills"
+      - "youth development"
+      - "adolescent"
+    points: 2
+
+  ngo_capacity_building:
+    label: "NGO capacity building / tech enablement"
+    evidence_from: >
+      SVP India mentors NGO leaders for scale; Tech4Dev has tech-enabled
+      200+ NGOs with open-source digital public goods.
+    keywords:
+      - "capacity building"
+      - "capacity-building"
+      - "tech for good"
+      - "technology for ngos"
+      - "nonprofit enablement"
+    points: 2
+
+# Native cap for partner-similarity dimension (rescaled to its weight)
+partner_similarity_cap: 15
+
+# ── Education-dominance dampener ─────────────────────────────────────────────
+# Keyword scoring has no sense of PROPORTION: a healthcare-dominant CSR
+# portfolio with stray mentions of "skill development" or "health education"
+# can rack up education points (Apollo Tyres fix). This measures what share
+# of the CSR evidence is actually about education, and dampens the
+# focus/adjacency/partner-similarity dimensions when education is a minor
+# side theme. Occurrences are counted, so repetition weighs.
+domain_dominance:
+  education_terms:
+    - "education"
+    - "school"
+    - "schools"
+    - "student"
+    - "students"
+    - "learning"
+    - "teacher"
+    - "teachers"
+    - "classroom"
+    - "literacy"
+    - "numeracy"
+    - "stem"
+    - "coding"
+    - "robotics"
+    - "scholarship"
+    - "curriculum"
+    - "edtech"
+    - "life skills"
+  other_domain_terms:
+    - "healthcare"
+    - "health"
+    - "hospital"
+    - "medical"
+    - "clinic"
+    - "hiv"
+    - "tuberculosis"
+    - "malnutrition"
+    - "palliative"
+    - "vision care"
+    - "blood donation"
+    - "sanitation"
+    - "drinking water"
+    - "water conservation"
+    - "watershed"
+    - "environment"
+    - "plantation"
+    - "afforestation"
+    - "biodiversity"
+    - "road safety"
+    - "disaster relief"
+    - "disaster response"
+    - "rural development"
+    - "women empowerment"
+    - "livelihood"
+    - "livelihoods"
+    - "sports"
+    # vocational/employability = NOT TAP's education (Diageo fix):
+    # "Learning for Life"-style skilling floods text with education-ish
+    # words while being downstream vocational training
+    - "vocational"
+    - "employability"
+    - "job readiness"
+    - "placement"
+    - "apprenticeship"
+    - "hospitality"
+    - "responsible drinking"
+    - "road to safety"
+  # multiplier applied to focus + adjacency + partner-similarity
+  bands:
+    - min_share: 0.45
+      multiplier: 1.0    # education is a core theme — no dampening
+    - min_share: 0.25
+      multiplier: 0.8    # education is secondary
+    - min_share: 0.10
+      multiplier: 0.6    # education is a side mention
+    - min_share: 0.0
+      multiplier: 0.4    # education is incidental noise
+
+# Context passed to the semantic LLM alongside the mission, so it judges
+# prospects against what TAP's REAL partners look like.
+partner_pattern_context: >
+  Profile of TAP's actual partners (Tenerity, Capgemini, Bajaj Finserv, NRB
+  Bearings, SVP India, Project Tech4Dev): they fund NGO-implemented
+  education programmes, run digital-inclusion or digital-skilling
+  initiatives, support STEM/coding/robotics for government-school students,
+  engage employees as skilled volunteers and mentors, build NGO capacity,
+  and typically have a Maharashtra/Pune presence. A company matching this
+  profile is a strong TAP fit even if education is not its primary CSR
+  label.
 
 # ── Geography scoring ─────────────────────────────────────────────────────────
 # TAP's government partners: MCD & DoE (Delhi), SCERT Maharashtra, BMC,
