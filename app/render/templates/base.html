@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FundFinder</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+
+  <script>
+    (function () {
+      function showError(target, title, body) {
+        target.outerHTML =
+          '<div id="result" class="ff-error">' +
+          '<strong>' + title + '</strong>' +
+          '<p>' + body + '</p>' +
+          '</div>';
+      }
+
+      document.body.addEventListener('htmx:responseError', function (evt) {
+        var target = evt.detail.target;
+        if (!target || target.id !== 'result') return;
+        showError(
+          target,
+          'Something went wrong running that request.',
+          'The server returned an error (status ' + evt.detail.xhr.status + '). Try again, or try Screen mode instead of Deep Research.'
+        );
+      });
+
+      document.body.addEventListener('htmx:sendError', function (evt) {
+        var target = evt.detail.target;
+        if (!target || target.id !== 'result') return;
+        showError(target, 'Could not reach the server.', 'Check your connection and try again.');
+      });
+
+      document.body.addEventListener('htmx:timeout', function (evt) {
+        var target = evt.detail.target;
+        if (!target || target.id !== 'result') return;
+        showError(
+          target,
+          'That request timed out.',
+          'This can happen on a slow connection while a research job is still running. Wait a moment and refresh, or try again.'
+        );
+      });
+    })();
+  </script>
+</body>
+</html>

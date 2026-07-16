@@ -1,0 +1,75 @@
+<div
+  id="result"
+  class="skeleton"
+  hx-get="/screen/{{ job_id }}"
+  hx-trigger="load delay:10s"
+  hx-target="#result"
+  hx-swap="outerHTML"
+>
+  <div class="loading-joke">
+    <span class="loading-joke-text" data-mode="{{ mode }}">Waking up the interns...</span>
+  </div>
+
+  <div class="skeleton-scorecard">
+    <div class="skeleton-box skeleton-scorebox"></div>
+    <div class="skeleton-lines">
+      <div class="skeleton-box skeleton-line" style="width:92%"></div>
+      <div class="skeleton-box skeleton-line" style="width:78%"></div>
+      <div class="skeleton-box skeleton-line" style="width:85%"></div>
+    </div>
+  </div>
+
+  <div class="skeleton-box skeleton-heading" style="width:180px"></div>
+  <div class="skeleton-bars">
+    <div class="skeleton-bar"><div class="skeleton-box" style="width:120px;height:11px"></div><div class="skeleton-box" style="flex:1;height:7px"></div></div>
+    <div class="skeleton-bar"><div class="skeleton-box" style="width:140px;height:11px"></div><div class="skeleton-box" style="flex:1;height:7px"></div></div>
+    <div class="skeleton-bar"><div class="skeleton-box" style="width:100px;height:11px"></div><div class="skeleton-box" style="flex:1;height:7px"></div></div>
+    <div class="skeleton-bar"><div class="skeleton-box" style="width:150px;height:11px"></div><div class="skeleton-box" style="flex:1;height:7px"></div></div>
+  </div>
+
+  <div class="skeleton-box skeleton-heading" style="width:260px"></div>
+  <div class="skeleton-box skeleton-table"></div>
+  <div class="skeleton-hint">
+    {% if mode == 'deep' %}
+      {{ "Still researching " + company + " — deep research across eight sources can take a minute or two." if still_working else "Running deep research across eight sources — this can take up to a minute." }}
+    {% else %}
+      {{ "Still screening " + company + "..." if still_working else "Screening the fastest sources first — usually just a few seconds." }}
+    {% endif %}
+  </div>
+</div>
+
+<script>
+  (function () {
+    var el = document.currentScript.previousElementSibling.querySelector('.loading-joke-text');
+    if (!el) return;
+    var mode = el.getAttribute('data-mode');
+    var screenLines = [
+      'You give it a search, we do the rest...',
+      'Working hard so you can sit back and watch...',
+      'Meanwhile, you have done absolutely nothing. Impressive...',
+      '5 star. Do nothing. That\'s the tagline...',
+      'We fetch, we read, we score. You blink...',
+      'Somewhere, someone is doing your job for you...',
+      'You: chai break. Us: reading annual reports...',
+      'Go on, give us 5 stars, you have earned it by doing nothing...'
+    ];
+    var deepLines = [
+      'You give it a search, we do the rest...',
+      'Eight sources deep. Your effort level: zero...',
+      '5 star. Do nothing. That\'s the tagline...',
+      'Deep research, shallow effort from you, we are not judging...',
+      'We are doing the reading. You are doing the scrolling...',
+      'Somewhere, someone is doing your job for you...',
+      'This is the part where you take credit later...',
+      'Go on, give us 5 stars, you have earned it by doing nothing...'
+    ];
+    var lines = mode === 'deep' ? deepLines : screenLines;
+    var i = 0;
+    el.textContent = lines[0];
+    var timer = setInterval(function () {
+      if (!document.body.contains(el)) { clearInterval(timer); return; }
+      i = (i + 1) % lines.length;
+      el.textContent = lines[i];
+    }, 2200);
+  })();
+</script>

@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero-section">
+  <h1>FundFinder</h1>
+  <p class="subtitle">Research CSR alignment and fit for prospective funding partners.</p>
+
+  <form hx-post="/screen" hx-target="#result" hx-swap="innerHTML" hx-indicator="none" class="search-form">
+    <div class="search-field">
+      <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/>
+        <path d="M21 21L16.65 16.65" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <input type="text" name="company" placeholder="Search a company" required autofocus autocomplete="off">
+      <button type="submit" class="search-submit" aria-label="Run research">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M5 12H19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <path d="M13 6L19 12L13 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="mode-toggle">
+      <input type="radio" id="mode-screen" name="mode" value="screen" checked>
+      <label for="mode-screen">Screen</label>
+      <input type="radio" id="mode-deep" name="mode" value="deep">
+      <label for="mode-deep">Deep Research</label>
+    </div>
+  </form>
+</section>
+
+<div id="result"></div>
+{% endblock %}

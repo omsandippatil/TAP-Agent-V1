@@ -1,0 +1,90 @@
+import functools
+import os
+
+import yaml
+
+from app.config import settings
+
+DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.yaml")
+
+
+@functools.lru_cache(maxsize=1)
+def load_config() -> dict:
+    config_path = settings.config_yaml_path or DEFAULT_CONFIG_PATH
+    if not os.path.isabs(config_path):
+        candidate = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), config_path)
+        if os.path.exists(candidate):
+            config_path = candidate
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        loaded = yaml.safe_load(config_file)
+    return loaded or {}
+
+
+def reload_config() -> dict:
+    load_config.cache_clear()
+    return load_config()
+
+
+import httpx
+
+from app.config import settings
+
+GOOGLE_SEARCH_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
+GOOGLE_SEARCH_DAILY_CAP_DEFAULT = 90
+
+
+def google_search_configured_and_available(quota_guard=None) -> bool:
+    if not settings.google_search_configured:
+        return False
+    if quota_guard is None:
+        return True
+    return bool(quota_guard.has_quota())
+
+
+async def _register_quota_usage(quota_guard) -> None:
+    if quota_guard is not None:
+        await quota_guard.record_usage()
+
+
+async def call_google_custom_search(query: str, num: int = 8, quota_guard=None) -> list[dict]:
+    if not google_search_configured_and_available(quota_guard):
+        return []
+    params = {
+        "key": settings.google_search_api_key,
+        "cx": settings.google_search_engine_id,
+        "q": query,
+        "num": min(max(num, 1), 10),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(GOOGLE_SEARCH_ENDPOINT, params=params)
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.HTTPError:
+        return []
+    await _register_quota_usage(quota_guard)
+    return payload.get("items", []) or []
+
+
+async def google_search_web(query: str, max_results: int = 5, quota_guard=None) -> list[dict]:
+    items = await call_google_custom_search(query, num=max_results, quota_guard=quota_guard)
+    return [
+        {"href": item.get("link", ""), "title": item.get("title", ""), "body": item.get("snippet", "")}
+        for item in items
+        if item.get("link")
+    ]
+
+
+def is_linkedin_profile_url(url: str) -> bool:
+    return bool(url) and "linkedin.com/in/" in url.lower()
+
+
+async def google_search_linkedin_profiles(company: str, role_hint: str = "", max_results: int = 8, quota_guard=None) -> list[dict]:
+    query = f'site:linkedin.com/in "{company}" {role_hint}'.strip()
+    items = await call_google_custom_search(query, num=max_results, quota_guard=quota_guard)
+    return [
+        {"href": item.get("link", ""), "title": item.get("title", ""), "body": item.get("snippet", "")}
+        for item in items
+        if is_linkedin_profile_url(item.get("link", ""))
+    ]
+
