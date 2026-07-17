@@ -4,8 +4,6 @@ import re
 
 import certifi
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 BOILERPLATE_LINE_PATTERNS = [
     re.compile(r"^(home|about us?|contact us?|careers?|sign in|log ?in|sign up|register)$", re.IGNORECASE),
@@ -32,15 +30,6 @@ MAIN_CONTENT_SELECTORS = ["main", "article", "[role=main]", "#content", ".conten
 
 def build_http_session() -> requests.Session:
     session = requests.Session()
-    retry_policy = Retry(
-        total=3,
-        backoff_factor=0.7,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retry_policy)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
     session.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -256,5 +245,3 @@ def evidence_hash(sources: list) -> str:
 def mission_hash(mission: str) -> str:
     digest_input = (mission or "").strip().encode("utf-8", errors="ignore")
     return hashlib.sha256(digest_input).hexdigest()
-
- 

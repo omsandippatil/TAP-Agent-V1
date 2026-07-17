@@ -21,6 +21,7 @@ SCAFFOLD_SAFETY_MARGIN = 250
 MIN_EVIDENCE_BUDGET = 350
 INSIGHT_MAX_TOKENS = 500
 ELIGIBILITY_MAX_TOKENS = 400
+INTER_CALL_DELAY_SECONDS = 2.0
 
 DEFAULT_MISSION = (
     "The Apprentice Project (TAP) develops 21st-century skills (critical thinking, "
@@ -276,6 +277,8 @@ _cooldown_reason: str = ""
 _TPM_WINDOW_SECONDS = 60.0
 _tpm_window_events: list[tuple] = []
 
+_last_call_finished_at_monotonic: float = 0.0
+
 
 def _prune_tpm_window(now: float) -> None:
     cutoff = now - _TPM_WINDOW_SECONDS
@@ -480,7 +483,7 @@ async def call_groq_chat(
     model: str | None = None,
     caller: str = "unknown",
 ) -> str | None:
-    global _cooldown_until_monotonic, _cooldown_reason
+    global _cooldown_until_monotonic, _cooldown_reason, _last_call_finished_at_monotonic
 
     if not settings.groq_configured:
         logger.warning("groq call skipped caller=%s reason=not_configured", caller)
@@ -493,6 +496,12 @@ async def call_groq_chat(
             caller, cooldown_remaining, _cooldown_reason,
         )
         return None
+
+    since_last_call = time.monotonic() - _last_call_finished_at_monotonic
+    if since_last_call < INTER_CALL_DELAY_SECONDS:
+        wait_seconds = INTER_CALL_DELAY_SECONDS - since_last_call
+        logger.info("groq pacing delay caller=%s waiting=%.1fs", caller, wait_seconds)
+        time.sleep(wait_seconds)
 
     estimated_prompt_tokens = estimate_tokens(prompt)
     estimated_total_tokens = estimated_prompt_tokens + max_tokens
@@ -542,9 +551,11 @@ async def call_groq_chat(
             )
     except httpx.HTTPError as exc:
         logger.error("groq transport error caller=%s error=%s", caller, exc)
+        _last_call_finished_at_monotonic = time.monotonic()
         return None
 
     elapsed_ms = (time.monotonic() - request_started_at) * 1000
+    _last_call_finished_at_monotonic = time.monotonic()
 
     if response.status_code == 429:
         retry_after_header = response.headers.get("retry-after", "")
@@ -1180,5 +1191,3 @@ async def api_health_check() -> dict:
             "message": "Google Custom Search configured" if google_ok else "Google Search not configured — using DDGS fallback for all queries",
         },
     }
-
- 

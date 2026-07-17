@@ -1,4 +1,3 @@
-
 import re
 from urllib.parse import urljoin, urlparse
 
@@ -449,16 +448,14 @@ async def fetch_mca_portal(company: str, search_cfg: dict, quota_guard=None) -> 
     return make_source("mca_portal", 2, status="NOT_FOUND")
 
 
-async def fetch_national_csr_portal(company: str, search_cfg: dict, quota_guard=None, verify_ssl: bool = True) -> dict:
+async def fetch_national_csr_portal(company: str, search_cfg: dict, quota_guard=None) -> dict:
     company_query = company.replace(" ", "+")
     direct_urls = [
         f"https://www.csr.gov.in/content/csr/global/master/home/companydetail.html?companyName={company_query}",
         f"https://csr.gov.in/csr/companyprofile?company_name={company_query}",
     ]
     for url in direct_urls:
-        text = fetch_page_text(url, verify_ssl=verify_ssl)
-        if not text and verify_ssl:
-            text = fetch_page_text(url, verify_ssl=False)
+        text = fetch_page_text(url)
         if text and len(text) > 250 and mentions_company(company, text):
             return make_source("national_csr_portal", 3, url, text, "FOUND", "direct")
 
@@ -472,11 +469,7 @@ async def fetch_national_csr_portal(company: str, search_cfg: dict, quota_guard=
             body = result.get("body", "")
             if not url:
                 continue
-            text = fetch_page_text(url, verify_ssl=verify_ssl) if url else ""
-            if not text and url and verify_ssl:
-                text = fetch_page_text(url, verify_ssl=False)
-            if not text:
-                text = body
+            text = fetch_page_text(url) or body
             if text and mentions_company(company, text) and ("csr" in url.lower() or is_csr_relevant(text)):
                 return make_source("national_csr_portal", 3, url, text, "FOUND", "search")
 
@@ -711,4 +704,3 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
     source_8 = await fetch_sector_eligibility_source(company, search_cfg, quota_guard)
 
     return [source_1, source_2, source_3, source_4, source_5, source_6, source_7, source_8]
-
