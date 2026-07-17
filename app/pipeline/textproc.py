@@ -2,7 +2,6 @@ import functools
 import re
 from collections import Counter
 
-SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 WORD_SPLIT = re.compile(r"[a-zA-Z][a-zA-Z\-']{1,}")
 CLAUSE_BOUNDARY = re.compile(r"[.!?;,\n]")
 
@@ -91,6 +90,32 @@ BOILERPLATE_SENTENCE_PATTERNS = [
     re.compile(r"^\W*$"),
 ]
 
+_ABBREVIATIONS = frozenset([
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "eg", "ie",
+    "no", "rs", "inr", "co", "ltd", "pvt", "govt", "dept", "univ", "assn",
+    "fig", "approx", "est", "u.s", "u.k", "vol", "resp", "rev",
+])
+
+_SENTENCE_END_PATTERN = re.compile(r"([.!?])(\s+)(?=[A-Z\u20b9\"'(])")
+_ABBREV_GUARD_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(a) for a in sorted(_ABBREVIATIONS, key=len, reverse=True)) + r")\.\s*$",
+    re.IGNORECASE,
+)
+_DECIMAL_NUMBER_PATTERN = re.compile(r"\d\.\d")
+_ELLIPSIS_PLACEHOLDER = "\u0000ELLIPSIS\u0000"
+
+_CURRENCY_NORMALIZE_PATTERN = re.compile(
+    r"(?:₹|Rs\.?|INR)\s?([\d,]+(?:\.\d+)?)\s?(crores?|cr\.?|lakhs?|lac|lacs)?",
+    re.IGNORECASE,
+)
+_BARE_CRORE_PATTERN = re.compile(r"\b([\d,]+(?:\.\d+)?)\s?(crores?|cr\.?)\b", re.IGNORECASE)
+
+_TRIGRAM_HEAD_TERMS = frozenset([
+    "csr", "corporate", "social", "government", "annual", "financial",
+    "employee", "board", "group", "parent", "net", "section", "digital",
+    "central", "request", "call", "grant",
+])
+
 
 def is_boilerplate_sentence(sentence: str) -> bool:
     stripped = sentence.strip()
@@ -104,25 +129,62 @@ def is_boilerplate_sentence(sentence: str) -> bool:
 def normalize_document(raw_text: str) -> str:
     text = re.sub(r"<[^>]+>", " ", raw_text)
     text = re.sub(r"http\S+", " ", text)
+    text = normalize_currency_mentions(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def normalize_currency_mentions(text: str) -> str:
+    def _rewrite(match: re.Match) -> str:
+        amount = match.group(1)
+        unit = (match.group(2) or "").lower()
+        if unit.startswith("cr"):
+            unit_label = "crore"
+        elif unit.startswith("la"):
+            unit_label = "lakh"
+        else:
+            unit_label = ""
+        return f"₹{amount} {unit_label}".strip() + " "
+
+    text = _CURRENCY_NORMALIZE_PATTERN.sub(_rewrite, text)
+    text = _BARE_CRORE_PATTERN.sub(lambda m: f"₹{m.group(1)} crore ", text)
+    return text
 
 
 def split_sentences(text: str) -> list[str]:
     normalized = normalize_document(text)
     if not normalized:
         return []
-    pieces = SENTENCE_SPLIT.split(normalized)
-    return [p.strip() for p in pieces if p.strip()]
+
+    protected = normalized.replace("...", _ELLIPSIS_PLACEHOLDER)
+
+    boundaries = []
+    for match in _SENTENCE_END_PATTERN.finditer(protected):
+        prefix = protected[: match.end(1)]
+        if _ABBREV_GUARD_PATTERN.search(prefix):
+            continue
+        if _DECIMAL_NUMBER_PATTERN.search(protected[max(0, match.start(1) - 2): match.start(1) + 2]):
+            continue
+        boundaries.append(match.end(2))
+
+    pieces = []
+    start = 0
+    for boundary in boundaries:
+        pieces.append(protected[start:boundary])
+        start = boundary
+    pieces.append(protected[start:])
+
+    restored = [p.replace(_ELLIPSIS_PLACEHOLDER, "...").strip() for p in pieces]
+    return [p for p in restored if p]
 
 
-def _clause_safe_bigrams(normalized_text: str) -> list[str]:
-    bigrams = []
+def _clause_safe_ngrams(normalized_text: str, n: int) -> list[str]:
+    ngrams = []
     for clause in CLAUSE_BOUNDARY.split(normalized_text.lower()):
         words = [w for w in WORD_SPLIT.findall(clause) if w not in STOPWORDS and len(w) > 2]
-        for i in range(len(words) - 1):
-            bigrams.append(f"{words[i]} {words[i + 1]}")
-    return bigrams
+        for i in range(len(words) - n + 1):
+            ngrams.append(" ".join(words[i:i + n]))
+    return ngrams
 
 
 def extract_keywords(text: str, top_n: int = 40, document_frequency: Counter | None = None, corpus_size: int = 1) -> list[tuple]:
@@ -130,7 +192,11 @@ def extract_keywords(text: str, top_n: int = 40, document_frequency: Counter | N
     words = WORD_SPLIT.findall(normalized)
     filtered = [w for w in words if w not in STOPWORDS and len(w) > 2]
     unigram_counts = Counter(filtered)
-    bigram_counts = Counter(bg for bg in _clause_safe_bigrams(normalized) if bg.count(" ") == 1)
+    bigram_counts = Counter(_clause_safe_ngrams(normalized, 2))
+    trigram_counts = Counter(
+        tg for tg in _clause_safe_ngrams(normalized, 3)
+        if tg.split(" ", 1)[0] in _TRIGRAM_HEAD_TERMS
+    )
 
     scored = Counter()
     for word, count in unigram_counts.items():
@@ -139,6 +205,10 @@ def extract_keywords(text: str, top_n: int = 40, document_frequency: Counter | N
     for phrase, count in bigram_counts.items():
         if count >= 2:
             scored[phrase] += count * 1.5
+
+    for phrase, count in trigram_counts.items():
+        if count >= 2:
+            scored[phrase] += count * 2.0
 
     for phrase, weight in CSR_SIGNAL_WEIGHTS.items():
         occurrences = normalized.count(phrase)
@@ -153,6 +223,18 @@ def extract_keywords(text: str, top_n: int = 40, document_frequency: Counter | N
 
     ranked = scored.most_common(top_n)
     return ranked
+
+
+def _numeric_richness_score(sentence: str) -> float:
+    currency_hits = len(re.findall(r"₹\s?[\d,]+(?:\.\d+)?\s?(?:crore|lakh)?", sentence))
+    percent_hits = len(re.findall(r"\b\d{1,3}(?:\.\d+)?\s?%", sentence))
+    year_hits = len(re.findall(r"\b(?:19|20)\d{2}(?:-\d{2,4})?\b", sentence))
+    digit_groups = len(re.findall(r"\d[\d,]*", sentence))
+
+    score = currency_hits * 3.0 + percent_hits * 1.5 + year_hits * 0.75
+    if digit_groups >= 2 and currency_hits == 0 and percent_hits == 0:
+        score += 0.5
+    return score
 
 
 def score_sentence_relevance(sentence: str, company_tokens: list[str]) -> float:
@@ -183,9 +265,7 @@ def score_sentence_relevance(sentence: str, company_tokens: list[str]) -> float:
     if any(term in lowered for term in GOVERNANCE_TERMS):
         score += 1.5
 
-    digit_density = sum(1 for ch in sentence if ch.isdigit())
-    if digit_density >= 2:
-        score += 1.0
+    score += _numeric_richness_score(sentence)
 
     if distinct_signal_hits >= 2:
         score += min(distinct_signal_hits - 1, 3) * 0.75
@@ -200,23 +280,35 @@ def company_name_tokens(company: str) -> list[str]:
     return [t for t in re.sub(r"[^a-z0-9 ]", " ", company.lower()).split() if len(t) > 2 and t not in stop]
 
 
+def _dedup_key(sentence: str) -> str:
+    lowered = re.sub(r"[^a-z0-9 ]", " ", sentence.lower())
+    words = sorted(set(w for w in lowered.split() if w not in STOPWORDS and len(w) > 2))
+    return " ".join(words[:18])
+
+
 def structure_source_text(source_name: str, raw_text: str, company: str, max_sentences: int = 40,
-                           document_frequency: Counter | None = None, corpus_size: int = 1) -> dict:
+                           document_frequency: Counter | None = None, corpus_size: int = 1,
+                           global_seen_keys: set | None = None) -> dict:
     sentences = split_sentences(raw_text)
     company_tokens = company_name_tokens(company)
 
     kept = []
-    seen_sentence_keys = set()
+    local_seen_keys = set()
     for sentence in sentences:
         if is_boilerplate_sentence(sentence):
             continue
-        key = re.sub(r"\s+", " ", sentence.lower()).strip()[:140]
-        if key in seen_sentence_keys:
+        exact_key = re.sub(r"\s+", " ", sentence.lower()).strip()[:140]
+        if exact_key in local_seen_keys:
+            continue
+        fuzzy_key = _dedup_key(sentence)
+        if fuzzy_key and global_seen_keys is not None and fuzzy_key in global_seen_keys:
             continue
         relevance = score_sentence_relevance(sentence, company_tokens)
         if relevance <= 0:
             continue
-        seen_sentence_keys.add(key)
+        local_seen_keys.add(exact_key)
+        if fuzzy_key and global_seen_keys is not None:
+            global_seen_keys.add(fuzzy_key)
         kept.append((relevance, sentence))
 
     kept.sort(key=lambda pair: pair[0], reverse=True)
@@ -256,19 +348,26 @@ def structure_all_sources(sources: list, company: str, max_sentences_per_source:
     document_frequency = _document_frequency_across_sources(found_sources, company)
     corpus_size = max(len(found_sources), 1)
 
-    structured = []
-    for source in found_sources:
-        structured.append(
-            structure_source_text(
-                source.get("source_name", "source"),
-                source["text"],
-                company,
-                max_sentences=max_sentences_per_source,
-                document_frequency=document_frequency,
-                corpus_size=corpus_size,
-            )
+    ordered_for_dedup = sorted(
+        found_sources,
+        key=lambda s: SOURCE_PRIORITY_WEIGHT.get(s.get("source_name", ""), 1.0),
+        reverse=True,
+    )
+
+    global_seen_keys: set = set()
+    structured_by_name = {}
+    for source in ordered_for_dedup:
+        structured_by_name[source.get("source_name", "source")] = structure_source_text(
+            source.get("source_name", "source"),
+            source["text"],
+            company,
+            max_sentences=max_sentences_per_source,
+            document_frequency=document_frequency,
+            corpus_size=corpus_size,
+            global_seen_keys=global_seen_keys,
         )
-    return structured
+
+    return [structured_by_name[s.get("source_name", "source")] for s in found_sources]
 
 
 @functools.lru_cache(maxsize=1)
@@ -308,25 +407,58 @@ def build_token_budgeted_evidence(structured_sources: list[dict], company: str, 
 
     ordered_sources = sorted(structured_sources, key=lambda s: s.get("priority_weight", 1.0), reverse=True)
 
-    for source in ordered_sources:
-        if used_tokens >= token_budget:
-            break
-        share = source.get("priority_weight", 1.0) / total_weight
-        source_token_allowance = max(150, int(remaining_budget * share))
-        block_lines = [f"[{source['source_name']}]"]
-        block_tokens = estimate_tokens(block_lines[0])
-        for sentence in source["sentences"]:
+    pending_sentences = {
+        s["source_name"]: list(s["sentences"]) for s in ordered_sources
+    }
+    source_allowance = {
+        s["source_name"]: max(150, int(remaining_budget * (s.get("priority_weight", 1.0) / total_weight)))
+        for s in ordered_sources
+    }
+    source_used = {s["source_name"]: 0 for s in ordered_sources}
+    block_lines_by_source = {s["source_name"]: [f"[{s['source_name']}]"] for s in ordered_sources}
+    block_tokens_by_source = {
+        name: estimate_tokens(lines[0]) for name, lines in block_lines_by_source.items()
+    }
+
+    made_progress = True
+    while used_tokens < token_budget and made_progress:
+        made_progress = False
+        for source in ordered_sources:
+            name = source["source_name"]
+            queue = pending_sentences[name]
+            if not queue or used_tokens >= token_budget:
+                continue
+            allowance = source_allowance[name]
+            if source_used[name] >= allowance:
+                continue
+            sentence = queue[0]
             candidate_line = f"- {sentence}"
             candidate_tokens = estimate_tokens(candidate_line)
-            if block_tokens + candidate_tokens > source_token_allowance:
-                break
+            if source_used[name] + candidate_tokens > allowance:
+                continue
             if used_tokens + candidate_tokens > token_budget:
-                break
-            block_lines.append(candidate_line)
-            block_tokens += candidate_tokens
+                continue
+            queue.pop(0)
+            block_lines_by_source[name].append(candidate_line)
+            block_tokens_by_source[name] += candidate_tokens
+            source_used[name] += candidate_tokens
             used_tokens += candidate_tokens
-        if len(block_lines) > 1:
-            chunks.append("\n".join(block_lines))
+            made_progress = True
+
+        if not made_progress and used_tokens < token_budget:
+            exhausted_names = [n for n in source_allowance if source_used[n] >= source_allowance[n]]
+            leftover_names = [n for n in pending_sentences if pending_sentences[n] and n in exhausted_names]
+            if not leftover_names:
+                break
+            spare = token_budget - used_tokens
+            for name in leftover_names:
+                source_allowance[name] += spare
+            made_progress = True
+
+    for source in ordered_sources:
+        name = source["source_name"]
+        lines = block_lines_by_source[name]
+        if len(lines) > 1:
+            chunks.append("\n".join(lines))
 
     return "\n\n".join(chunks)
-

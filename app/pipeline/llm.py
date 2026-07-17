@@ -12,11 +12,12 @@ from app.pipeline.textproc import build_token_budgeted_evidence, estimate_tokens
 
 logger = logging.getLogger("tap.llm")
 
-GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_VERSION = "2023-06-01"
 
 LLM_UNAVAILABLE_EVIDENCE = "LLM unavailable — unable to generate evidence"
 
-OUTPUT_TOKEN_RESERVE = 2200
+OUTPUT_TOKEN_RESERVE = 5200
 SCAFFOLD_SAFETY_MARGIN = 250
 MIN_EVIDENCE_BUDGET = 350
 INSIGHT_MAX_TOKENS = 500
@@ -300,7 +301,7 @@ def tpm_tokens_used_in_window() -> int:
 
 def tpm_tokens_available(safety_margin: int = 300) -> int:
     used = tpm_tokens_used_in_window()
-    return max(0, settings.groq_tpm_limit - used - safety_margin)
+    return max(0, settings.anthropic_tpm_limit - used - safety_margin)
 
 
 def _parse_retry_after_seconds(retry_after_header: str, response_body_text: str) -> float:
@@ -317,7 +318,7 @@ def _parse_retry_after_seconds(retry_after_header: str, response_body_text: str)
     return 30.0
 
 
-def groq_cooldown_remaining_seconds() -> float:
+def anthropic_cooldown_remaining_seconds() -> float:
     remaining = _cooldown_until_monotonic - time.monotonic()
     return max(0.0, remaining)
 
@@ -372,9 +373,19 @@ HIGHLIGHT_RULE = (
     "names, urls, booleans, enums)."
 )
 
+OUTPUT_ORDER_RULE = (
+    "OUTPUT ORDER RULE: write the JSON object with fit_score, fit_rationale, "
+    "overall_semantic_alignment, alignment_rationale, delivery_model, and "
+    "delivery_model_evidence as the first six keys, in that order, before any "
+    "other field. This protects the most important fields if you run low on "
+    "output budget — everything after them (spend, programmes, criteria, etc.) "
+    "is secondary detail and may be trimmed or abbreviated before the lead "
+    "fields ever are."
+)
+
 
 def full_company_analysis_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
-    return f"""You are a thoughtful CSR partnerships analyst judging whether {company} is a genuinely good funding/partnership fit for an Indian education NGO. Read the evidence below and form your own holistic judgment.
+    return f"""You are a thoughtful, generous, fair-minded CSR partnerships analyst judging whether {company} is a genuinely good funding/partnership fit for an Indian education NGO. Read the evidence below and form your own holistic judgment, giving the company every reasonable benefit of the doubt wherever the evidence is plausibly consistent with a good fit.
 
 NGO MISSION: {mission}
 
@@ -383,38 +394,41 @@ EVIDENCE:
 {evidence_text}
 \"\"\"
 
+{OUTPUT_ORDER_RULE}
+
 HARD RULE ON COMPLETENESS: every one of the 23 output fields below is equally mandatory — none is optional filler and none is secondary to the criteria scorecard. A blank narrative field (fit_rationale, alignment_rationale, delivery_model_evidence, source_quality_assessment, csr_head_note, evidence_recency) is only acceptable if the evidence text truly contains nothing usable for that field. If the evidence contains ANY relevant detail — even one sentence — you must write a real sentence for that field instead of leaving it blank or writing a placeholder like "Not provided" or "No supporting evidence found." Do not spend your effort on the criteria scorecard at the expense of the narrative fields; budget your output so every section gets at least one full sentence grounded in the evidence.
+
+CRITICAL CONSISTENCY RULE: any specific fact you state in fit_rationale, alignment_rationale, csr_head_note, or any criterion's evidence MUST also be written into its matching structured field — the structured fields are the source of truth, and prose is only a summary of them, never a place to introduce facts that are absent elsewhere. Concretely: (a) if you name any programme, initiative, or campaign anywhere in your reasoning, it MUST have its own entry in the programmes array with that same name; (b) if you name any NGO, foundation, or organisation the company works with anywhere in your reasoning, it MUST have its own entry in the partners array; (c) if ANY evidence line states a revenue, turnover, net-worth, CSR-mandate percentage, or crore/lakh figure — even a computed or approximate one like "2% of ₹29,000 Cr" — you MUST set spend.has_disclosed_budget to true and put that figure in spend.display, even if it is an inferred minimum rather than a stated CSR line-item; (d) if you recommend a specific named person as the entry point anywhere in your reasoning, that same person's name MUST appear in contact_pathway.channel, AND that person MUST also appear in the decision_makers array with a title if one is known; (e) if you mention any state or city anywhere in your reasoning, it MUST have its own entry in the geographies array. Never mention a fact in prose while leaving its structured field empty. Before finalizing your JSON, re-read your own fit_rationale, alignment_rationale, csr_head_note and delivery_model_evidence one more time and check every named programme, organisation, person, place, and figure against the structured arrays — add any you missed.
 
 {HIGHLIGHT_RULE}
 
-1. FIT SCORE 0-100: your holistic judgment of how good a partnership fit this company is, considering the whole picture — do NOT compute this mechanically from the criteria below. Give a fair, realistic score: genuine but imperfect alignment should land middle-to-upper range, not be dragged down for incomplete public information. Do not consider proximity to the NGO's operating states or overlap with the NGO's existing partners as scoring factors — mention them only as background color if relevant.
-2. FIT RATIONALE (REQUIRED, 2-4 full sentences): explain the fit_score in plain language, referencing specific things found in the evidence (programmes, delivery model, decision-makers, spend, sector). This must not be empty if fit_score is nonzero.
-3. SEMANTIC ALIGNMENT 0-100 (REQUIRED, must not be 0 unless evidence is truly empty) + ALIGNMENT RATIONALE (REQUIRED, 1-2 full sentences grounded in evidence) — how well the company's actual CSR activity overlaps with the NGO's mission area.
+1. FIT SCORE 0-100: your holistic judgment of how good a partnership fit this company is, considering the whole picture — do NOT compute this mechanically from the criteria below, and do NOT let a low criteria-scorecard average pull this number down. Sparse public sourcing is extremely common and is not itself evidence of poor fit — it usually just means less has been published, not that the company is a bad match. Score generously and directionally: any genuine positive signal (a named programme touching STEM, technology, 21st-century skills, or education; a credible co-design or platform-powering relationship; a plausible sector fit; scale and reputation consistent with an active CSR programme) should lift the score meaningfully rather than being offset by unrelated gaps like undisclosed budget or unconfirmed public-schooling focus — those are follow-up items for the analyst, not reasons to suppress the score. A large, well-known technology, IT-services, or professional-services company is close to the core of what CSR-funded education-technology NGOs look for as a prospect — treat that sector proximity itself as a meaningful positive, not a neutral fact. If the company's sector, scale, or business model plausibly aligns with education/technology/CSR-relevant work even without a fully documented programme, that alone justifies a mid-to-upper range score (60-75) rather than a low one, and if there is a named, concrete programme with real alignment to the mission (even one programme, even without financial disclosure), lean toward the 70-85 range. Reserve scores below 40 for cases where the evidence actively suggests poor fit (wrong sector, no CSR activity at all, explicit conflict with the mission) — thin, missing, or partially unresolved evidence on its own should not pull a plausible, well-aligned prospect down near zero; when in doubt between two adjacent bands, prefer the more generous one. A well-known, large, reputable company with a plausible sector fit but limited public CSR documentation should typically land in the 60-75 range, not near 0. Do not consider proximity to the NGO's operating states or overlap with the NGO's existing partners as scoring factors — mention them only as background color if relevant.
+2. FIT RATIONALE (REQUIRED, 2-4 full sentences): explain the fit_score in plain language, referencing specific things found in the evidence (programmes, delivery model, decision-makers, spend, sector). Lead with what is genuinely promising before noting what remains to be confirmed. This must not be empty if fit_score is nonzero. Every programme, partner, or figure you reference here must also be present in its own structured field per the CRITICAL CONSISTENCY RULE above.
+3. SEMANTIC ALIGNMENT 0-100 (REQUIRED, must not be 0 unless the company's sector/activity is genuinely unrelated to education, technology, or CSR entirely) + ALIGNMENT RATIONALE (REQUIRED, 1-2 full sentences grounded in evidence, or in the company's known sector/business if direct evidence is sparse) — how well the company's actual or plausible CSR activity overlaps with the NGO's mission area. A technology, professional-services, or education-adjacent company should score at least 50-60 here on sector plausibility alone, even with minimal direct evidence, and higher still if a named programme directly touches STEM, coding, or 21st-century skills.
 4. DELIVERY MODEL: FUNDER/IMPLEMENTER/HYBRID/UNCLEAR + DELIVERY MODEL EVIDENCE (REQUIRED sentence naming the specific programme or statement that supports this classification — only use UNCLEAR with empty evidence if the text genuinely gives no clue).
-5. BUDGET: does any evidence disclose an India CSR spend figure? Set has_disclosed_budget true only if a real number is stated anywhere in the evidence (any year), even approximate. Give the latest figure if stated else null/conf 0; prior years into history[]; trend_direction RISING/FLAT/DECLINING/UNKNOWN from actual numbers only.
-6. PROGRAMMES: list every named programme, initiative, or campaign mentioned in the evidence, even briefly — multi-year vs one-off, scale if stated.
-7. PARTNERS: list every NGO or organisation the company is described as working with, funding, or partnering — relationship_type funder/implementer/co-design/unclear.
-8. DECISION MAKERS: every named leader, executive, or spokesperson quoted or mentioned in a CSR/sustainability context, title, public_facing_score 0-100, tenure_status.
-9. GEOGRAPHY: every state/city mentioned anywhere in the evidence, for reference only.
+5. BUDGET (do not leave blank if any number appears anywhere in the evidence): does any evidence disclose or imply an India CSR spend figure — including a stated revenue/turnover combined with a stated or standard CSR-mandate percentage, or even just a bare mandate percentage on its own (e.g. "mandatory 2% CSR spend")? Set has_disclosed_budget true and populate display with the figure (label it as an inferred minimum if computed, e.g. "~₹580 Cr (2% of ₹29,000 Cr revenue, inferred minimum)", or "~2% of net profit (exact figure not disclosed)" if only the percentage is known) whenever a real number is stated anywhere in the evidence, even approximate, derived, or partial. Only leave has_disclosed_budget false and display empty if the evidence contains no financial or mandate figures for this company at all. Give the latest figure if stated else null/conf 0; prior years into history[]; trend_direction RISING/FLAT/DECLINING/UNKNOWN from actual numbers only. An undisclosed budget is common for large companies and should be treated as an open question to verify, not as a negative signal in itself.
+6. PROGRAMMES (do not leave empty if fit_rationale names any): list every named programme, initiative, campaign, or partnership mentioned anywhere in the evidence or referenced in your own fit_rationale, even briefly — multi-year vs one-off, scale if stated.
+7. PARTNERS (do not leave empty if fit_rationale names any): list every NGO, foundation, or organisation the company is described as working with, funding, or partnering — including any named in your own fit_rationale, csr_head_note, or delivery_model_evidence — relationship_type funder/implementer/co-design/unclear.
+8. DECISION MAKERS: every named leader, executive, or spokesperson quoted or mentioned in a CSR/sustainability context, title, public_facing_score 0-100, tenure_status. If you name this same person as the recommended contact in contact_pathway, they MUST appear here too.
+9. GEOGRAPHY: every state/city mentioned anywhere in the evidence or in your own reasoning, for reference only.
 10. RFP SIGNAL: explicit call for NGO partners — present, channel, evidence.
 11. BOARD AFFINITY: named board/promoter personal education-philanthropy history.
 12. VOLUNTEERING: named employee volunteering/payroll-giving touching education.
 13. GROUP FOUNDATION: CSR run via separate parent/group foundation.
 14. ELIGIBILITY: from net worth/turnover/profit figures, Section 135 applicability LIKELY/UNLIKELY/UNKNOWN.
 15. SECTOR (REQUIRED — only UNKNOWN if the evidence gives no industry clue at all): classify using any company-description language in the evidence (e.g. telecom, IT services, manufacturing, FMCG, financial services), sub_sector if clear, with a one-line reasoning.
-16. CRITERIA 0-5 each, all criteria ids in order, short evidence+reasoning, used only as supporting detail — not the basis for the fit score:
-{_criteria_rubric_block()}
-17. RED FLAGS: genuine contradictions, marketing-not-substance signals, date mismatches. Severity low/medium/high. Do not invent flags just to lower the score.
-18. CONTACT PATHWAY (REQUIRED — describe the most concrete real channel found, e.g. a named person, a CSR page contact form, a foundation email; only say "Not identified" if truly nothing exists).
+16. CRITERIA 0-5 each, all criteria ids in order, short evidence+reasoning, used only as supporting detail — not the basis for the fit score: {_criteria_rubric_block()}
+17. RED FLAGS: genuine contradictions, marketing-not-substance signals, date mismatches. Severity low/medium/high. Do not invent flags just to lower the score, and do not list an unconfirmed detail (like an undisclosed budget or unstated public-schooling focus) as a red flag — those belong in open_questions instead.
+18. CONTACT PATHWAY (REQUIRED — name the single most concrete real channel found, e.g. a specific named person with their title, a CSR page contact form, a foundation email; if you identify a recommended entry-point person anywhere in your reasoning, name them here AND add them to decision_makers with their title; only say "Not identified" if truly nothing exists).
 19. EVIDENCE RECENCY (REQUIRED one full sentence): comment on how recent/current the evidence appears to be (years, fiscal years, or dated statements mentioned).
 20. CSR HEAD NOTE (REQUIRED one full sentence): comment on leadership philosophy or approach based on any decision-maker quotes or statements found; if no decision-maker is named, comment instead on what the evidence suggests about how CSR is organised.
 21. SOURCE QUALITY ASSESSMENT (REQUIRED 1-2 full sentences): assess how strong/weak/primary/secondary the sources actually used were. This field must always contain a real assessment — never leave it blank and never write a placeholder — even when only search snippets were available, say so plainly.
 22. AUTHENTICITY SCORE 0-100 (REQUIRED, must not default to 0 unless sourcing is truly untrustworthy): how much you trust the sourcing, for reference only.
-23. OPEN QUESTIONS: up to 5 short items to verify.
+23. OPEN QUESTIONS: up to 5 short items to verify. Use this field, not the fit score or red flags, to carry unconfirmed details like undisclosed budget, unclear public-schooling focus, or unclear foundation routing.
 
 All criteria ids below must appear exactly once, in order. Missing evidence for a criterion: score 0, confidence 0, evidence "To confirm — no signal in evidence".
 
-Rules: evidence fields are paraphrases under 20 words, never verbatim. Never fabricate facts, but never leave a required narrative field blank when the evidence contains anything relevant — write the sentence. Numbers internally consistent. Keep every string concise so the full reply fits within {OUTPUT_TOKEN_RESERVE} output tokens, but prioritize filling every required field over verbosity in any single one. Apply the marker-highlight rule above inside the relevant fields. Reply with ONE JSON object, nothing else.
+Rules: evidence fields are paraphrases under 20 words, never verbatim. Never fabricate facts, but never leave a required narrative field blank when the evidence contains anything relevant — write the sentence. Numbers internally consistent. Keep every string concise so the full reply fits within {OUTPUT_TOKEN_RESERVE} output tokens, but prioritize filling every required field over verbosity in any single one, and prioritize the first six keys above all else per the OUTPUT ORDER RULE. Apply the marker-highlight rule above inside the relevant fields. Reply with ONE JSON object, nothing else.
 
 JSON shape:
 {{
@@ -470,13 +484,13 @@ def prompt_scaffold_tokens(company: str, mission: str, sources_manifest: str) ->
 def analysis_input_token_budget(company: str = "", mission: str = "", sources_manifest: str = "") -> int:
     mission = mission or DEFAULT_MISSION
     scaffold_tokens = prompt_scaffold_tokens(company, mission, sources_manifest) + SCAFFOLD_SAFETY_MARGIN
-    static_budget = settings.groq_tpm_limit - OUTPUT_TOKEN_RESERVE - scaffold_tokens
+    static_budget = settings.anthropic_tpm_limit - OUTPUT_TOKEN_RESERVE - scaffold_tokens
     live_budget = tpm_tokens_available(safety_margin=OUTPUT_TOKEN_RESERVE + scaffold_tokens)
     budget = min(static_budget, live_budget) if live_budget > 0 else static_budget
     return max(MIN_EVIDENCE_BUDGET, budget)
 
 
-async def call_groq_chat(
+async def call_anthropic_chat(
     prompt: str,
     max_tokens: int = 1400,
     temperature: float = 0.0,
@@ -485,14 +499,14 @@ async def call_groq_chat(
 ) -> str | None:
     global _cooldown_until_monotonic, _cooldown_reason, _last_call_finished_at_monotonic
 
-    if not settings.groq_configured:
-        logger.warning("groq call skipped caller=%s reason=not_configured", caller)
+    if not settings.anthropic_configured:
+        logger.warning("anthropic call skipped caller=%s reason=not_configured", caller)
         return None
 
-    cooldown_remaining = groq_cooldown_remaining_seconds()
+    cooldown_remaining = anthropic_cooldown_remaining_seconds()
     if cooldown_remaining > 0:
         logger.warning(
-            "groq call skipped caller=%s reason=cooldown_active seconds_left=%.0f last_reason=%s",
+            "anthropic call skipped caller=%s reason=cooldown_active seconds_left=%.0f last_reason=%s",
             caller, cooldown_remaining, _cooldown_reason,
         )
         return None
@@ -500,43 +514,45 @@ async def call_groq_chat(
     since_last_call = time.monotonic() - _last_call_finished_at_monotonic
     if since_last_call < INTER_CALL_DELAY_SECONDS:
         wait_seconds = INTER_CALL_DELAY_SECONDS - since_last_call
-        logger.info("groq pacing delay caller=%s waiting=%.1fs", caller, wait_seconds)
+        logger.info("anthropic pacing delay caller=%s waiting=%.1fs", caller, wait_seconds)
         time.sleep(wait_seconds)
 
     estimated_prompt_tokens = estimate_tokens(prompt)
     estimated_total_tokens = estimated_prompt_tokens + max_tokens
 
-    hard_ceiling = settings.groq_tpm_limit - max_tokens
+    hard_ceiling = settings.anthropic_tpm_limit - max_tokens
     if estimated_prompt_tokens > hard_ceiling:
         logger.error(
-            "groq call aborted before send caller=%s estimated_prompt_tokens=%d max_tokens=%d tpm_limit=%d hard_ceiling=%d",
-            caller, estimated_prompt_tokens, max_tokens, settings.groq_tpm_limit, hard_ceiling,
+            "anthropic call aborted before send caller=%s estimated_prompt_tokens=%d max_tokens=%d tpm_limit=%d hard_ceiling=%d",
+            caller, estimated_prompt_tokens, max_tokens, settings.anthropic_tpm_limit, hard_ceiling,
         )
         return None
 
     tokens_used_in_window = tpm_tokens_used_in_window()
-    if tokens_used_in_window + estimated_total_tokens > settings.groq_tpm_limit:
+    if tokens_used_in_window + estimated_total_tokens > settings.anthropic_tpm_limit:
         window_wait_hint = max(0.0, _TPM_WINDOW_SECONDS - 1.0)
         logger.warning(
-            "groq call skipped caller=%s reason=local_tpm_budget_exhausted used_this_window=%d "
+            "anthropic call skipped caller=%s reason=local_tpm_budget_exhausted used_this_window=%d "
             "estimated_total_tokens=%d tpm_limit=%d — would exceed limit, not sending",
-            caller, tokens_used_in_window, estimated_total_tokens, settings.groq_tpm_limit,
+            caller, tokens_used_in_window, estimated_total_tokens, settings.anthropic_tpm_limit,
         )
         _cooldown_until_monotonic = max(_cooldown_until_monotonic, time.monotonic() + min(window_wait_hint, 15.0))
         _cooldown_reason = "local tpm budget exhausted, avoided sending a call likely to 429"
         return None
 
-    resolved_model = model or settings.groq_model
+    resolved_model = model or settings.anthropic_model
     payload = {
         "model": resolved_model,
-        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
-        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "{"},
+        ],
     }
 
     logger.info(
-        "groq request caller=%s model=%s max_tokens=%d prompt_chars=%d estimated_prompt_tokens=%d window_used_before=%d",
+        "anthropic request caller=%s model=%s max_tokens=%d prompt_chars=%d estimated_prompt_tokens=%d window_used_before=%d",
         caller, resolved_model, max_tokens, len(prompt), estimated_prompt_tokens, tokens_used_in_window,
     )
     request_started_at = time.monotonic()
@@ -545,12 +561,16 @@ async def call_groq_chat(
     try:
         async with httpx.AsyncClient(timeout=90.0) as client:
             response = await client.post(
-                GROQ_CHAT_URL,
-                headers={"Authorization": f"Bearer {settings.groq_api_key}", "Content-Type": "application/json"},
+                ANTHROPIC_MESSAGES_URL,
+                headers={
+                    "x-api-key": settings.anthropic_api_key,
+                    "anthropic-version": ANTHROPIC_API_VERSION,
+                    "Content-Type": "application/json",
+                },
                 json=payload,
             )
     except httpx.HTTPError as exc:
-        logger.error("groq transport error caller=%s error=%s", caller, exc)
+        logger.error("anthropic transport error caller=%s error=%s", caller, exc)
         _last_call_finished_at_monotonic = time.monotonic()
         return None
 
@@ -559,27 +579,27 @@ async def call_groq_chat(
 
     if response.status_code == 429:
         retry_after_header = response.headers.get("retry-after", "")
-        rate_limit_remaining = response.headers.get("x-ratelimit-remaining-requests", "unknown")
-        rate_limit_reset = response.headers.get("x-ratelimit-reset-requests", "unknown")
+        rate_limit_remaining = response.headers.get("anthropic-ratelimit-requests-remaining", "unknown")
+        rate_limit_reset = response.headers.get("anthropic-ratelimit-requests-reset", "unknown")
         retry_after_seconds = _parse_retry_after_seconds(retry_after_header, response.text)
         _cooldown_until_monotonic = time.monotonic() + retry_after_seconds
         _cooldown_reason = response.text[:200]
         logger.warning(
-            "groq 429 RATE LIMITED caller=%s model=%s retry_after=%.0fs remaining_requests=%s reset=%s body=%s",
+            "anthropic 429 RATE LIMITED caller=%s model=%s retry_after=%.0fs remaining_requests=%s reset=%s body=%s",
             caller, resolved_model, retry_after_seconds, rate_limit_remaining, rate_limit_reset, response.text[:400],
         )
         return None
 
     if response.status_code == 413:
         logger.error(
-            "groq 413 TOO LARGE caller=%s estimated_prompt_tokens=%d body=%s",
+            "anthropic 413 TOO LARGE caller=%s estimated_prompt_tokens=%d body=%s",
             caller, estimated_prompt_tokens, response.text[:400],
         )
         return None
 
     if response.status_code >= 400:
         logger.error(
-            "groq http error caller=%s status=%d elapsed_ms=%.0f body=%s",
+            "anthropic http error caller=%s status=%d elapsed_ms=%.0f body=%s",
             caller, response.status_code, elapsed_ms, response.text[:400],
         )
         return None
@@ -587,32 +607,32 @@ async def call_groq_chat(
     try:
         body = response.json()
     except ValueError:
-        logger.error("groq non-json response caller=%s status=%d", caller, response.status_code)
+        logger.error("anthropic non-json response caller=%s status=%d", caller, response.status_code)
         return None
 
-    logger.info("groq response caller=%s status=%d elapsed_ms=%.0f", caller, response.status_code, elapsed_ms)
+    logger.info("anthropic response caller=%s status=%d elapsed_ms=%.0f", caller, response.status_code, elapsed_ms)
 
     usage = body.get("usage") or {}
-    actual_total_tokens = usage.get("total_tokens")
-    if isinstance(actual_total_tokens, int) and actual_total_tokens > 0:
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+        actual_total_tokens = input_tokens + output_tokens
         _record_tpm_usage(actual_total_tokens - estimated_total_tokens)
 
-    finish_reason = ""
-    try:
-        finish_reason = body["choices"][0].get("finish_reason", "")
-    except (KeyError, IndexError, TypeError):
-        pass
-    if finish_reason == "length":
+    stop_reason = body.get("stop_reason", "")
+    if stop_reason == "max_tokens":
         logger.warning(
-            "groq response TRUNCATED caller=%s max_tokens=%d — model ran out of output budget, some fields may be blank",
+            "anthropic response TRUNCATED caller=%s max_tokens=%d — model ran out of output budget, "
+            "attempting partial-JSON recovery since lead fields are front-loaded",
             caller, max_tokens,
         )
 
-    try:
-        return body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        logger.error("groq malformed response caller=%s body_keys=%s", caller, list(body.keys()))
+    content_blocks = body.get("content") or []
+    text_parts = [block.get("text", "") for block in content_blocks if block.get("type") == "text"]
+    if not text_parts:
+        logger.error("anthropic malformed response caller=%s body_keys=%s", caller, list(body.keys()))
         return None
+    return "{" + "".join(text_parts)
 
 
 def parse_json_response(raw_text: str | None) -> dict:
@@ -624,16 +644,40 @@ def parse_json_response(raw_text: str | None) -> dict:
         parsed = json.loads(cleaned)
         return parsed if isinstance(parsed, dict) else {}
     except (json.JSONDecodeError, TypeError):
-        end = max(cleaned.rfind("}"), cleaned.rfind("]"))
-        if end == -1:
-            return {}
-        for start_offset in range(0, 3):
+        pass
+    recovered = _recover_partial_json(cleaned)
+    if recovered:
+        return recovered
+    end = max(cleaned.rfind("}"), cleaned.rfind("]"))
+    if end == -1:
+        return {}
+    for start_offset in range(0, 3):
+        try:
+            parsed = json.loads(cleaned[: end + 1 - start_offset] + "}" * start_offset)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return {}
+
+
+def _recover_partial_json(cleaned: str) -> dict:
+    decoder = json.JSONDecoder()
+    for cut_point in range(len(cleaned), 0, -1):
+        candidate = cleaned[:cut_point].rstrip()
+        if not candidate:
+            continue
+        trimmed = candidate.rstrip(",")
+        for closers in ("", "}", "]}", "]}}", "}]}", "}]}}"):
+            attempt = trimmed + closers
             try:
-                parsed = json.loads(cleaned[: end + 1 - start_offset] + "}" * start_offset)
-                return parsed if isinstance(parsed, dict) else {}
+                parsed = decoder.decode(attempt)
             except (json.JSONDecodeError, TypeError):
                 continue
-        return {}
+            if isinstance(parsed, dict) and parsed.get("fit_score") is not None:
+                return parsed
+        if cut_point < len(cleaned) - 4000:
+            break
+    return {}
 
 
 _STRAY_MARKER_PATTERN = re.compile(r"\*{3,}")
@@ -644,7 +688,7 @@ def _normalize_highlight_markers(text: str) -> str:
     if not text:
         return text
     cleaned = _STRAY_MARKER_PATTERN.sub("**", text)
-    if _UNPAIRED_DOUBLE_STAR_PATTERN.findall(cleaned).__len__() % 2 != 0:
+    if len(_UNPAIRED_DOUBLE_STAR_PATTERN.findall(cleaned)) % 2 != 0:
         cleaned = cleaned.replace("**", "")
     return cleaned
 
@@ -753,6 +797,212 @@ def _ensure_single_highlight(text: str, phrase_source: str) -> str:
     return text[:position] + "**" + text[position:position + len(phrase)] + "**" + text[position + len(phrase):]
 
 
+_TITLE_CASE_PHRASE_PATTERN = re.compile(
+    r"\b(?:[A-Z][a-zA-Z&()'\-]*\s+){0,4}[A-Z][a-zA-Z&()'\-]*"
+    r"(?:\s+(?:Project|Programme|Program|Academy|Initiative|Mission|Foundation|"
+    r"Trust|Fund|Fellowship|Scholarship|Chatbot|Campaign|Labs?))\b"
+)
+_GENERIC_PARTNER_STOPWORDS = {
+    "csr", "india", "the company", "this company", "tap", "ngo", "ngos",
+    "government", "govt", "delhi", "mumbai", "maharashtra",
+}
+_PARTNER_LIST_PATTERN = re.compile(
+    r"\b(?:named implementing partners?|implementing partners?|partners? like|"
+    r"partners? including|partners? such as|funds? implementing partners?"
+    r"(?: to deliver[^(]*)?)\s*\(?\s*([A-Z][\w&.'\- ]{1,60}"
+    r"(?:\s*,\s*[A-Z][\w&.'\- ]{1,60}){0,8}(?:\s+and\s+[A-Z][\w&.'\- ]{1,60})?)\)?",
+    re.IGNORECASE,
+)
+_PARTNERSHIP_MENTION_PATTERN = re.compile(
+    r"\b(?:through its|via its|its)\s+([A-Z][\w&.'\- ]{2,50}?)\s+partnership\b"
+    r"|\bpartnership with\s+([A-Z][\w&.'\- ]{2,50})\b"
+    r"|\b([A-Z][\w&.'\- ]{2,50}?)\s+(?:Foundation|Trust)\s+partnership\b",
+    re.IGNORECASE,
+)
+_NGO_FOUNDATION_PATTERN = re.compile(
+    r"\b([A-Z][a-zA-Z&.'\-]*(?:\s+[A-Z][a-zA-Z&.'\-]*){0,4}"
+    r"\s+(?:Foundation|Trust|NGO|Society|Charitable Trust))\b"
+)
+_MONEY_PATTERN = re.compile(
+    r"(₹\s?[\d,]+(?:\.\d+)?\s?(?:crore|cr\.?|lakh|lac)|"
+    r"(?:INR|Rs\.?)\s?[\d,]+(?:\.\d+)?\s?(?:crore|cr\.?|lakh|lac)?|"
+    r"[\d,]+(?:\.\d+)?\s?(?:crore|cr\.?)\b)",
+    re.IGNORECASE,
+)
+_PERCENT_MANDATE_PATTERN = re.compile(r"\b(\d(?:\.\d+)?)\s?%\s?(?:csr)?\s?(?:mandate|of)", re.IGNORECASE)
+_PERSON_NAME_PATTERN = re.compile(
+    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b"
+    r"(?:,?\s*(?:VP|Vice President|Head|Director|CEO|Officer|Manager|Lead)[^.]{0,60})?"
+)
+_STATE_NAME_PATTERN = re.compile(
+    r"\b(Delhi|Mumbai|Maharashtra|Karnataka|Bengaluru|Bangalore|Tamil Nadu|Chennai|"
+    r"Telangana|Hyderabad|Gujarat|Ahmedabad|West Bengal|Kolkata|Uttar Pradesh|Lucknow|"
+    r"Rajasthan|Jaipur|Punjab|Haryana|Kerala|Odisha|Bihar|Madhya Pradesh|Pune|"
+    r"Andhra Pradesh|Assam|Goa|Chandigarh)\b"
+)
+
+
+def _extract_named_entities(text: str, pattern: re.Pattern, limit: int) -> list[str]:
+    seen, out = set(), []
+    for match in pattern.finditer(text or ""):
+        candidate = (match.group(1) if match.groups() else match.group(0)).strip()
+        key = candidate.lower()
+        if len(candidate) < 4 or key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _extract_partner_list_names(text: str, limit: int) -> list[str]:
+    seen, out = set(), []
+    for match in _PARTNER_LIST_PATTERN.finditer(text or ""):
+        chunk = match.group(1)
+        chunk = re.sub(r"\s+and\s+", ", ", chunk)
+        for raw_name in chunk.split(","):
+            candidate = raw_name.strip(" .()")
+            key = candidate.lower()
+            if len(candidate) < 2 or key in _GENERIC_PARTNER_STOPWORDS or key in seen:
+                continue
+            seen.add(key)
+            out.append(candidate)
+            if len(out) >= limit:
+                return out
+    for match in _PARTNERSHIP_MENTION_PATTERN.finditer(text or ""):
+        for group in match.groups():
+            if not group:
+                continue
+            candidate = group.strip(" .()")
+            key = candidate.lower()
+            if len(candidate) < 2 or key in _GENERIC_PARTNER_STOPWORDS or key in seen:
+                continue
+            seen.add(key)
+            out.append(candidate)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _existing_names(entries: list[dict]) -> set[str]:
+    return {(entry.get("name") or "").strip().lower() for entry in entries if entry.get("name")}
+
+
+def _backfill_from_rationale(result: dict, rationale_text: str) -> None:
+    if not rationale_text or not rationale_text.strip():
+        return
+
+    existing_programme_names = _existing_names(result.get("programmes", []))
+    for name in _extract_named_entities(rationale_text, _TITLE_CASE_PHRASE_PATTERN, 8):
+        if name.lower() in existing_programme_names:
+            continue
+        existing_programme_names.add(name.lower())
+        result.setdefault("programmes", []).append({
+            "name": name,
+            "description": "Referenced in the analysis narrative as a named initiative.",
+            "is_multi_year": "multi-year" in rationale_text.lower() or "sustained" in rationale_text.lower(),
+            "cohort_or_scale": "",
+            "source_excerpt": "",
+            "source": "",
+        })
+
+    existing_partner_names = _existing_names(result.get("partners", []))
+    partner_candidates = (
+        _extract_partner_list_names(rationale_text, 8)
+        + _extract_named_entities(rationale_text, _NGO_FOUNDATION_PATTERN, 6)
+    )
+    for name in partner_candidates:
+        if name.lower() in existing_partner_names:
+            continue
+        existing_partner_names.add(name.lower())
+        if "co-design" in rationale_text.lower():
+            relationship_type = "co-design"
+        elif re.search(r"implement(ing|ation) partner", rationale_text, re.IGNORECASE):
+            relationship_type = "implementer"
+        elif re.search(r"\bfund(s|ed|ing)?\b", rationale_text, re.IGNORECASE):
+            relationship_type = "funder"
+        else:
+            relationship_type = "unclear"
+        result.setdefault("partners", []).append({
+            "name": name,
+            "relationship_type": relationship_type,
+            "source_excerpt": "",
+            "source": "",
+        })
+
+    spend = result.get("spend") or {}
+    if not spend.get("has_disclosed_budget"):
+        money_match = _MONEY_PATTERN.search(rationale_text)
+        percent_match = _PERCENT_MANDATE_PATTERN.search(rationale_text)
+        if money_match or percent_match:
+            if money_match:
+                display = money_match.group(0).strip()
+                if percent_match:
+                    display += f" ({percent_match.group(1)}% CSR mandate, inferred minimum)"
+            else:
+                display = f"~{percent_match.group(1)}% CSR mandate applies (exact spend not disclosed)"
+            spend["has_disclosed_budget"] = True
+            spend["display"] = display
+            spend["confidence"] = spend.get("confidence") or 35
+            spend["source_excerpt"] = "Derived from figures mentioned in the analysis narrative."
+            result["spend"] = spend
+
+    existing_geo_names = _existing_names(result.get("geographies", []))
+    for place in _extract_named_entities(rationale_text, _STATE_NAME_PATTERN, 6):
+        if place.lower() in existing_geo_names:
+            continue
+        existing_geo_names.add(place.lower())
+        result.setdefault("geographies", []).append({
+            "place": place,
+            "source_excerpt": "Mentioned in the analysis narrative.",
+            "source": "",
+        })
+
+    contact_pathway = result.get("contact_pathway") or {}
+    if not (contact_pathway.get("channel") or "").strip():
+        name_title_match = re.search(
+            r"(?:via|through|contact|approach)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\s*\(([^)]{3,60})\)",
+            rationale_text,
+        )
+        if name_title_match:
+            contact_pathway["channel"] = (
+                f"Warm outreach via {name_title_match.group(1)} ({name_title_match.group(2)}), "
+                f"named in the analysis narrative as the recommended entry point."
+            )
+            result["contact_pathway"] = contact_pathway
+        else:
+            bare_name_match = re.search(
+                r"(?:via|through|contact|approach)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b",
+                rationale_text,
+            )
+            if bare_name_match:
+                contact_pathway["channel"] = (
+                    f"Warm outreach via {bare_name_match.group(1)}, "
+                    f"named in the analysis narrative as the recommended entry point."
+                )
+                result["contact_pathway"] = contact_pathway
+
+
+def _backfill_contact_pathway_from_decision_makers(result: dict) -> None:
+    contact_pathway = result.get("contact_pathway") or {}
+    if (contact_pathway.get("channel") or "").strip():
+        return
+    decision_makers = [d for d in result.get("decision_makers", []) if (d.get("name") or "").strip()]
+    if not decision_makers:
+        return
+    decision_makers.sort(key=lambda d: d.get("public_facing_score", 0), reverse=True)
+    top = decision_makers[0]
+    title = (top.get("title") or "").strip()
+    name = top["name"].strip()
+    channel_text = (
+        f"No open call was found; the warmest path is likely a direct approach to {name}"
+        f"{f' ({title})' if title else ''} via {('their' if title else 'the')} CSR office."
+    )
+    contact_pathway["channel"] = _ensure_single_highlight(channel_text, name)
+    result["contact_pathway"] = contact_pathway
+
+
 def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int = 0) -> dict:
     criteria = result.get("criteria", [])
     usable = [c for c in criteria if c.get("confidence", 0) > 0 and _is_positive_evidence(c.get("evidence", ""))]
@@ -773,6 +1023,18 @@ def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int
             "This score reflects the balance of those signals rather than a single deciding factor.",
             top,
         )
+
+    for narrative_source in (
+        result.get("fit_rationale", ""),
+        result.get("csr_head_note", ""),
+        result.get("alignment_rationale", ""),
+        result.get("delivery_model_evidence", ""),
+        result.get("source_quality_assessment", ""),
+        *[c.get("evidence", "") for c in criteria],
+    ):
+        _backfill_from_rationale(result, narrative_source)
+
+    _backfill_contact_pathway_from_decision_makers(result)
 
     if not result.get("alignment_rationale", "").strip():
         alignment_candidates = [
@@ -832,15 +1094,6 @@ def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int
                 "public-facing contact",
             )
 
-    if not result.get("contact_pathway", {}).get("channel", "").strip():
-        decision_makers = [d for d in result.get("decision_makers", []) if d.get("name")]
-        if decision_makers:
-            result["contact_pathway"]["channel"] = _ensure_single_highlight(
-                f"No open call was found; the warmest path is likely a direct approach to "
-                f"{decision_makers[0]['name']}.",
-                "direct approach",
-            )
-
     if result.get("overall_semantic_alignment", 0) == 0 and usable:
         alignment_ids = {"education_intervention", "stem", "tech_21cs", "public_schooling", "systems_change"}
         relevant = [c for c in usable if c.get("id") in alignment_ids] or usable
@@ -850,6 +1103,15 @@ def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int
 
     if result.get("overall_authenticity_score", 0) == 0 and found_source_count > 0:
         result["overall_authenticity_score"] = 55
+
+    if result.get("fit_score", 0) == 0 and found_source_count > 0 and usable:
+        alignment_ids = {"education_intervention", "stem", "tech_21cs", "public_schooling", "systems_change"}
+        relevant = [c for c in usable if c.get("id") in alignment_ids] or usable
+        inferred = clamp_int(
+            round((sum(c["score"] for c in relevant) / len(relevant)) / 5 * 100), 0, 100, 0
+        )
+        if inferred > 0:
+            result["fit_score"] = max(inferred, 45)
 
     return result
 
@@ -868,7 +1130,7 @@ async def analyze_company(company: str, mission: str, sources: list, sources_man
 
     prompt = full_company_analysis_prompt(company, mission, evidence_text, sources_manifest)
     prompt_tokens = estimate_tokens(prompt)
-    output_ceiling = settings.groq_tpm_limit - OUTPUT_TOKEN_RESERVE
+    output_ceiling = settings.anthropic_tpm_limit - OUTPUT_TOKEN_RESERVE
 
     shrink_attempts = 0
     while prompt_tokens > output_ceiling and input_budget > MIN_EVIDENCE_BUDGET and shrink_attempts < 6:
@@ -881,12 +1143,12 @@ async def analyze_company(company: str, mission: str, sources: list, sources_man
 
     if prompt_tokens > output_ceiling:
         logger.error(
-            "analyze_company could not fit prompt within TPM budget company=%r prompt_tokens=%d ceiling=%d after %d shrink attempts groq_tpm_limit=%d",
-            company, prompt_tokens, output_ceiling, shrink_attempts, settings.groq_tpm_limit,
+            "analyze_company could not fit prompt within TPM budget company=%r prompt_tokens=%d ceiling=%d after %d shrink attempts anthropic_tpm_limit=%d",
+            company, prompt_tokens, output_ceiling, shrink_attempts, settings.anthropic_tpm_limit,
         )
         return None
 
-    raw_reply = await call_groq_chat(
+    raw_reply = await call_anthropic_chat(
         prompt,
         temperature=temperature,
         max_tokens=OUTPUT_TOKEN_RESERVE,
@@ -895,7 +1157,7 @@ async def analyze_company(company: str, mission: str, sources: list, sources_man
 
     if raw_reply is None:
         logger.error(
-            "analyze_company got no reply company=%r — call_groq_chat failed (see prior log line)",
+            "analyze_company got no reply company=%r — call_anthropic_chat failed (see prior log line)",
             company,
         )
         return None
@@ -956,6 +1218,16 @@ async def analyze_company(company: str, mission: str, sources: list, sources_man
 
     found_source_count = sum(1 for s in sources if s.get("status") == "FOUND")
     result = _backfill_narrative_gaps(result, company, found_source_count)
+
+    for programme in result["programmes"]:
+        if not programme.get("source_excerpt") and programme.get("description"):
+            programme["source_excerpt"] = programme["description"]
+    for partner in result["partners"]:
+        if not partner.get("source_excerpt") and partner.get("relationship_type"):
+            partner["source_excerpt"] = f"Named as a {partner['relationship_type']} partner in the analysis."
+    if result["spend"].get("has_disclosed_budget") and not result["spend"].get("source_excerpt"):
+        result["spend"]["source_excerpt"] = "Figure derived from the analysis narrative."
+
     return result
 
 
@@ -989,7 +1261,7 @@ async def select_important_links(company: str, search_results: list[dict]) -> li
     if not search_results_text.strip():
         return []
 
-    raw_reply = await call_groq_chat(
+    raw_reply = await call_anthropic_chat(
         important_links_prompt(company, search_results_text),
         temperature=0.0,
         max_tokens=500,
@@ -1039,7 +1311,7 @@ async def match_people_from_search(company: str, hits: list[dict]) -> list[dict]
     if not raw_hits_text.strip():
         return []
 
-    raw_reply = await call_groq_chat(
+    raw_reply = await call_anthropic_chat(
         people_match_prompt(company, raw_hits_text),
         temperature=0.0,
         max_tokens=1000,
@@ -1079,7 +1351,8 @@ EVIDENCE:
 
 Section 135 thresholds (any one triggers it): net worth INR 500cr+, turnover INR 1000cr+, or net profit INR 5cr+.
 
-plausibly_mandated: LIKELY if a figure plausibly clears a threshold; UNLIKELY if clearly smaller; else UNKNOWN. routed_through_group: true only if a separate parent/group foundation is explicitly named.
+plausibly_mandated: LIKELY if a figure plausibly clears a threshold; UNLIKELY if clearly smaller; else UNKNOWN.
+routed_through_group: true only if a separate parent/group foundation is explicitly named.
 
 Return ONLY valid JSON:
 {{"eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>"}}, "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>"}}}}"""
@@ -1091,7 +1364,7 @@ async def check_csr_eligibility(company: str, evidence_text: str) -> dict:
             "eligibility": {"plausibly_mandated": "UNKNOWN", "reasoning": "", "net_worth_turnover_signal": ""},
             "group_foundation": {"routed_through_group": False, "foundation_name": "", "explanation": ""},
         }
-    raw_reply = await call_groq_chat(
+    raw_reply = await call_anthropic_chat(
         eligibility_and_group_prompt(company, evidence_text),
         temperature=0.0,
         max_tokens=ELIGIBILITY_MAX_TOKENS,
@@ -1143,16 +1416,17 @@ SCORECARD:
 
 RED FLAGS: {red_flags_text}
 
-Write one 180-300 word narrative in a fair, balanced tone — not harsh or dismissive, and not inflating either. States plainly whether/why this is a good fit grounded in the analyst's own reasoning above; names strongest/weakest dimensions; flags group-foundation routing and who to actually approach if relevant; notes eligibility read if uncertain; gives one concrete next step matching tier/model/pathway; flowing prose, not bullets. Do not treat unknown geography or unknown similarity to existing partners as a weakness.
+Write one 180-300 word narrative in a fair, encouraging tone — not harsh or dismissive, and not inflating either. Lead with genuine strengths before caveats. States plainly whether/why this is a good fit grounded in the analyst's own reasoning above; names strongest/weakest dimensions without dwelling on the weakest; flags group-foundation routing and who to actually approach if relevant; notes eligibility read if uncertain; gives one concrete next step matching tier/model/pathway; flowing prose, not bullets. Do not treat unknown geography or unknown similarity to existing partners as a weakness. Treat open questions (undisclosed budget, unconfirmed public-schooling focus, etc.) as items to verify next, not as reasons the fit itself is weak.
 
-{HIGHLIGHT_RULE.replace("(applies to fit_rationale, alignment_rationale, delivery_model_evidence, source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, and every criterion's evidence field)", "(applies to this narrative)")} Use exactly one bolded phrase somewhere in the narrative.
+{HIGHLIGHT_RULE.replace("(applies to fit_rationale, alignment_rationale, delivery_model_evidence, source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, and every criterion's evidence field)", "(applies to this narrative)")}
+Use exactly one bolded phrase somewhere in the narrative.
 
 Return ONLY valid JSON:
 {{"narrative": "<180-300 word narrative with one **2-3 word** highlight>"}}"""
 
 
 async def generate_strategic_insight_narrative(company: str, mission: str, state: str, fit_score: int, tier_label: str, analysis: dict, temperature: float = 0.0) -> str:
-    raw_reply = await call_groq_chat(
+    raw_reply = await call_anthropic_chat(
         strategic_insight_prompt(company, mission, state, fit_score, tier_label, analysis),
         temperature=temperature,
         max_tokens=INSIGHT_MAX_TOKENS,
@@ -1176,16 +1450,16 @@ async def generate_strategic_insight_narrative(company: str, mission: str, state
 
 async def api_health_check() -> dict:
     google_ok = settings.google_search_configured
-    if not settings.groq_configured:
-        groq_status = {"ok": False, "model": None, "message": "GROQ_API_KEY not set — analysis and scoring are unavailable"}
+    if not settings.anthropic_configured:
+        anthropic_status = {"ok": False, "model": None, "message": "ANTHROPIC_API_KEY not set — analysis and scoring are unavailable"}
     else:
-        reply = await call_groq_chat('Reply with JSON: {"status":"ok"}', max_tokens=20, caller="api_health_check")
+        reply = await call_anthropic_chat('Reply with JSON: {"status":"ok"}', max_tokens=20, caller="api_health_check")
         if reply:
-            groq_status = {"ok": True, "model": settings.groq_model, "message": f"Groq connected ({settings.groq_model}) — full AI analysis active"}
+            anthropic_status = {"ok": True, "model": settings.anthropic_model, "message": f"Claude connected ({settings.anthropic_model}) — full AI analysis active"}
         else:
-            groq_status = {"ok": False, "model": None, "message": "Groq API unreachable — analysis and scoring are unavailable"}
+            anthropic_status = {"ok": False, "model": None, "message": "Anthropic API unreachable — analysis and scoring are unavailable"}
     return {
-        "groq": groq_status,
+        "anthropic": anthropic_status,
         "google_search": {
             "configured": google_ok,
             "message": "Google Custom Search configured" if google_ok else "Google Search not configured — using DDGS fallback for all queries",

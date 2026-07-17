@@ -17,7 +17,7 @@ TIER_DEFAULT = [
     {"min": 65, "tier": 3, "label": "Conditional", "color": "#20B2AA", "key": "CONDITIONAL",
      "action": "Strengthen evidence. Identify warmest introduction path.",
      "description": "Solid signals. Needs tailored case before outreach."},
-    {"min": 50, "tier": 4, "label": "Watchlist", "color": "#F5C518", "key": "WATCHLIST",
+    {"min": 45, "tier": 4, "label": "Watchlist", "color": "#F5C518", "key": "WATCHLIST",
      "action": "Monitor CSR policy updates quarterly. Nurture relationship.",
      "description": "Partial alignment. Not partnership-ready yet."},
     {"min": 0, "tier": 0, "label": "Not a Target", "color": "#9CA3A3", "key": "REJECT",
@@ -26,8 +26,8 @@ TIER_DEFAULT = [
 ]
 
 SCORE_BANDS = [
-    {"min": 80, "key": "HIGH", "label": "Strong fit — prioritise", "color": "#146B65"},
-    {"min": 45, "key": "MID", "label": "Partial fit — monitor", "color": "#F5C518"},
+    {"min": 75, "key": "HIGH", "label": "Strong fit — prioritise", "color": "#146B65"},
+    {"min": 40, "key": "MID", "label": "Partial fit — monitor", "color": "#F5C518"},
     {"min": 0, "key": "LOW", "label": "Low fit — deprioritise", "color": "#9CA3A3"},
 ]
 
@@ -203,7 +203,7 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None) -> dic
     logo_url = await resolve_logo(company, sources, cfg, quota_guard)
 
     if state == "CONFIRMED_ABSENT":
-        logger.info("score SKIP company=%r reason=confirmed_absent no_groq_calls", company)
+        logger.info("score SKIP company=%r reason=confirmed_absent no_anthropic_calls", company)
         tier = get_scoring_tier(0, cfg)
         return {
             "state": state,
@@ -236,17 +236,17 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None) -> dic
             logger.error("score analyze_company raised company=%r error=%s", company, exc)
             analysis = None
     else:
-        logger.info("score SKIP company=%r reason=no_relevant_evidence no_groq_calls", company)
+        logger.info("score SKIP company=%r reason=no_relevant_evidence no_anthropic_calls", company)
 
     if not analysis:
-        cooldown_remaining = llm.groq_cooldown_remaining_seconds()
+        cooldown_remaining = llm.anthropic_cooldown_remaining_seconds()
         if cooldown_remaining > 0:
             insight = (
-                f"{llm.LLM_UNAVAILABLE_EVIDENCE} — Groq rate limit is active, "
+                f"{llm.LLM_UNAVAILABLE_EVIDENCE} — Anthropic rate limit is active, "
                 f"try again in about {int(cooldown_remaining // 60)}m {int(cooldown_remaining % 60)}s."
             )
             logger.warning(
-                "score ABORT company=%r reason=groq_cooldown_active seconds_left=%.0f fit_score=0",
+                "score ABORT company=%r reason=anthropic_cooldown_active seconds_left=%.0f fit_score=0",
                 company, cooldown_remaining,
             )
         else:
@@ -311,4 +311,3 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None) -> dic
         "logo_url": logo_url,
         "cache_key": (company.strip().lower(), evidence_hash(sources), mission_hash(mission)),
     }
- 

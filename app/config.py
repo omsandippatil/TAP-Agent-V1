@@ -7,9 +7,9 @@ class Settings(BaseSettings):
     database_url: str = ""
     app_env: str = "development"
 
-    groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile" 
-    groq_tpm_limit: int = 12000
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-5"
+    anthropic_tpm_limit: int = 40000
 
     google_search_api_key: str = ""
     google_search_engine_id: str = ""
@@ -19,10 +19,11 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
     @property
-    def groq_configured(self) -> bool:
-        return bool(self.groq_api_key.strip())
+    def anthropic_configured(self) -> bool:
+        return bool(self.anthropic_api_key.strip())
 
     @property
     def google_search_configured(self) -> bool:
