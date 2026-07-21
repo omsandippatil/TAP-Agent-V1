@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.pipeline import scorer, scraper
 from app.pipeline.config_loader import load_config
+from app.pipeline.source_registry import SourceRegistry
 from app.render.xlsx_reporter import generate_deep_dive_xlsx
 from app.render.docx_reporter import generate_docx_report
 from app.render.reporters import render_results, templates
@@ -55,19 +56,21 @@ async def _run_screen_job(job_id: str, company: str, mode: str):
 
         cfg = load_config()
         search_cfg = cfg.get("search_source_toggles", {})
+        registry = SourceRegistry(company)
 
         if mode == "deep":
-            sources = await scraper.fetch_deep_sources(company, search_cfg)
+            sources = await scraper.fetch_deep_sources(company, search_cfg, registry=registry)
         else:
-            sources = await scraper.fetch_screen_sources(company, search_cfg)
+            sources = await scraper.fetch_screen_sources(company, search_cfg, registry=registry)
 
         found_count = sum(1 for s in sources if s.get("status") == "FOUND")
         logger.info("job sources job_id=%s company=%r found=%d/%d", job_id, company, found_count, len(sources))
 
-        result = await scorer.score(company, sources, cfg)
+        result = await scorer.score(company, sources, cfg, registry=registry)
         logger.info(
-            "job scored job_id=%s company=%r state=%s fit_score=%s analysis_present=%s",
+            "job scored job_id=%s company=%r state=%s fit_score=%s analysis_present=%s source_bank_size=%d",
             job_id, company, result.get("state"), result.get("fit_score"), bool(result.get("analysis")),
+            len(result.get("source_bank", [])),
         )
 
         files = {}

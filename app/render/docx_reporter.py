@@ -4,7 +4,7 @@ import datetime
 import re
 
 from docx import Document
-from docx.shared import Pt, Cm, Emu
+from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
@@ -26,6 +26,7 @@ GREY = RGBColor(0x6B, 0x72, 0x80)
 GREEN = RGBColor(0x16, 0xA3, 0x4A)
 AMBER = RGBColor(0xD9, 0x77, 0x06)
 RED = RGBColor(0xDC, 0x26, 0x26)
+LINKEDIN_BLUE = RGBColor(0x0A, 0x66, 0xC2)
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 CREAM_HEX = "FAF7F2"
 TEAL_DARK_HEX = "0F3D3E"
@@ -86,27 +87,59 @@ def fit_label(score):
     return "LOW FIT"
 
 
+TC_PR_CHILD_ORDER = ("cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd", "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign", "hideMark", "cellIns", "cellDel", "cellMerge", "tcPrChange")
+
+
+def insert_tc_pr_child(tc_pr, new_element, tag_name):
+    insert_index = TC_PR_CHILD_ORDER.index(tag_name)
+    for existing in tc_pr:
+        existing_tag = existing.tag.split("}")[-1]
+        if existing_tag in TC_PR_CHILD_ORDER and TC_PR_CHILD_ORDER.index(existing_tag) > insert_index:
+            existing.addprevious(new_element)
+            return
+    tc_pr.append(new_element)
+
+
 def shade_cell(cell, hex_color):
     tc_pr = cell._tc.get_or_add_tcPr()
+    for existing in tc_pr.findall(qn("w:shd")):
+        tc_pr.remove(existing)
     shading = OxmlElement("w:shd")
     shading.set(qn("w:val"), "clear")
     shading.set(qn("w:fill"), hex_color)
-    tc_pr.append(shading)
+    insert_tc_pr_child(tc_pr, shading, "shd")
 
 
 def set_cell_margins(cell, top=100, bottom=100, left=140, right=140):
     tc_pr = cell._tc.get_or_add_tcPr()
+    for existing in tc_pr.findall(qn("w:tcMar")):
+        tc_pr.remove(existing)
     margins = OxmlElement("w:tcMar")
-    for side, value in (("top", top), ("bottom", bottom), ("left", left), ("right", right)):
+    for side, value in (("top", top), ("left", left), ("bottom", bottom), ("right", right)):
         node = OxmlElement(f"w:{side}")
         node.set(qn("w:w"), str(value))
         node.set(qn("w:type"), "dxa")
         margins.append(node)
-    tc_pr.append(margins)
+    insert_tc_pr_child(tc_pr, margins, "tcMar")
+
+
+TBL_PR_CHILD_ORDER = ("tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize", "tblStyleColBandSize", "tblW", "jc", "tblCellSpacing", "tblInd", "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook")
+
+
+def insert_tbl_pr_child(tbl_pr, new_element, tag_name):
+    insert_index = TBL_PR_CHILD_ORDER.index(tag_name)
+    for existing in tbl_pr:
+        existing_tag = existing.tag.split("}")[-1]
+        if existing_tag in TBL_PR_CHILD_ORDER and TBL_PR_CHILD_ORDER.index(existing_tag) > insert_index:
+            existing.addprevious(new_element)
+            return
+    tbl_pr.append(new_element)
 
 
 def set_table_borders(table, color="E1E9E7", size=4):
     tbl_pr = table._tbl.tblPr
+    for existing in tbl_pr.findall(qn("w:tblBorders")):
+        tbl_pr.remove(existing)
     borders = OxmlElement("w:tblBorders")
     for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
         node = OxmlElement(f"w:{edge}")
@@ -115,20 +148,22 @@ def set_table_borders(table, color="E1E9E7", size=4):
         node.set(qn("w:space"), "0")
         node.set(qn("w:color"), color)
         borders.append(node)
-    tbl_pr.append(borders)
+    insert_tbl_pr_child(tbl_pr, borders, "tblBorders")
 
 
 def no_table_borders(table):
     tbl_pr = table._tbl.tblPr
+    for existing in tbl_pr.findall(qn("w:tblBorders")):
+        tbl_pr.remove(existing)
     borders = OxmlElement("w:tblBorders")
     for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
         node = OxmlElement(f"w:{edge}")
         node.set(qn("w:val"), "nil")
         borders.append(node)
-    tbl_pr.append(borders)
+    insert_tbl_pr_child(tbl_pr, borders, "tblBorders")
 
 
-def add_hyperlink(paragraph, url, display_text, color=TEAL_MID_HEX):
+def add_hyperlink(paragraph, url, display_text, color=TEAL_MID_HEX, bold=False):
     part = paragraph.part
     relationship_id = part.relate_to(
         url, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
@@ -150,12 +185,27 @@ def add_hyperlink(paragraph, url, display_text, color=TEAL_MID_HEX):
     size_element = OxmlElement("w:sz")
     size_element.set(qn("w:val"), "18")
     run_properties.append(size_element)
+    if bold:
+        run_properties.append(OxmlElement("w:b"))
     run.append(run_properties)
     text_element = OxmlElement("w:t")
     text_element.text = display_text
     run.append(text_element)
     hyperlink.append(run)
     paragraph._p.append(hyperlink)
+
+
+PPR_CHILD_ORDER = ("pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl", "numPr", "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens", "kinsoku", "wordWrap", "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid", "spacing", "ind", "contextualSpacing", "mirrorIndents", "suppressOverlap", "jc", "textDirection", "textAlignment", "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr", "pPrChange")
+
+
+def insert_ppr_child(ppr, new_element, tag_name):
+    insert_index = PPR_CHILD_ORDER.index(tag_name)
+    for existing in ppr:
+        existing_tag = existing.tag.split("}")[-1]
+        if existing_tag in PPR_CHILD_ORDER and PPR_CHILD_ORDER.index(existing_tag) > insert_index:
+            existing.addprevious(new_element)
+            return
+    ppr.append(new_element)
 
 
 def add_section_heading(doc, text, size=13, color=TEAL_DARK, space_before=16):
@@ -170,7 +220,7 @@ def add_section_heading(doc, text, size=13, color=TEAL_DARK, space_before=16):
     bottom_element.set(qn("w:space"), "3")
     bottom_element.set(qn("w:color"), TEAL_SOFT_HEX)
     border_element.append(bottom_element)
-    paragraph._p.get_or_add_pPr().append(border_element)
+    insert_ppr_child(paragraph._p.get_or_add_pPr(), border_element, "pBdr")
     run = paragraph.add_run(text.upper())
     run.font.name = FONT_NAME
     run.bold = True
@@ -238,6 +288,24 @@ def add_marked_paragraph(doc, text, base_size=9.5):
     return paragraph
 
 
+def add_source_reference_paragraph(doc, source_name, source_lookup, base_size=8.5):
+    if not source_name:
+        return
+    url = source_lookup.get(source_name, "")
+    label = SOURCE_LABELS.get(source_name, source_name)
+    paragraph = doc.add_paragraph()
+    paragraph.paragraph_format.left_indent = Cm(0.6)
+    paragraph.paragraph_format.space_after = Pt(4)
+    prefix_run = paragraph.add_run("Source: ")
+    prefix_run.font.name = FONT_NAME
+    style_small(prefix_run, base_size)
+    if url:
+        add_hyperlink(paragraph, url, label, color="6B7280")
+    else:
+        label_run = paragraph.add_run(label)
+        style_small(label_run, base_size)
+
+
 def set_col_widths(table, widths_cm):
     table.autofit = False
     for row in table.rows:
@@ -277,6 +345,22 @@ def style_body_cell(cell, text, size=8.5, bold=False, color=INK, align=None):
     return paragraph
 
 
+def style_link_cell(cell, url, display_text="LinkedIn", size=8.5):
+    cell.text = ""
+    paragraph = cell.paragraphs[0]
+    paragraph.paragraph_format.space_after = Pt(0)
+    set_cell_margins(cell)
+    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    if url:
+        add_hyperlink(paragraph, url, display_text, color="0A66C2", bold=True)
+    else:
+        run = paragraph.add_run("—")
+        run.font.name = FONT_NAME
+        run.font.size = Pt(size)
+        run.font.color.rgb = GREY
+    return paragraph
+
+
 def build_data_table(doc, headers, col_widths_cm, rows_data, zebra=True):
     table = doc.add_table(rows=1, cols=len(headers))
     table.alignment = WD_TABLE_ALIGNMENT.LEFT
@@ -294,6 +378,55 @@ def build_data_table(doc, headers, col_widths_cm, rows_data, zebra=True):
     return table
 
 
+def merge_decision_makers(result: dict) -> list:
+    analysis = result.get("analysis") or {}
+    llm_people = analysis.get("decision_makers") or []
+    scraped_people = result.get("decision_makers") or []
+
+    scraped_by_name = {}
+    for person in scraped_people:
+        key = (person.get("name") or "").strip().lower()
+        if key and key not in scraped_by_name:
+            scraped_by_name[key] = person
+
+    merged = []
+    seen_names = set()
+
+    for person in llm_people:
+        name = (person.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        seen_names.add(key)
+        scraped_match = scraped_by_name.get(key, {})
+        linkedin_url = person.get("linkedin_url") or scraped_match.get("url", "")
+        merged.append({
+            "name": name,
+            "title": person.get("title") or scraped_match.get("title", ""),
+            "linkedin_url": linkedin_url,
+            "tenure_status": person.get("tenure_status", "UNKNOWN"),
+            "source_excerpt": person.get("source_excerpt", ""),
+            "source": person.get("source", ""),
+        })
+
+    for person in scraped_people:
+        name = (person.get("name") or "").strip()
+        key = name.lower()
+        if not name or key in seen_names:
+            continue
+        seen_names.add(key)
+        merged.append({
+            "name": name,
+            "title": person.get("title", ""),
+            "linkedin_url": person.get("url", ""),
+            "tenure_status": "UNKNOWN",
+            "source_excerpt": "",
+            "source": "people_search",
+        })
+
+    return merged
+
+
 async def generate_docx_report(company: str, result: dict, mode: str = "deep") -> bytes:
     fit_score = result.get("fit_score", 0)
     state = result.get("state", "")
@@ -301,7 +434,8 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     analysis = result.get("analysis") or {}
     breakdown = result.get("score_breakdown", {}) or {}
     sources = result.get("sources", []) or []
-    decision_makers = result.get("decision_makers", []) or []
+    source_lookup = {s.get("source_name", ""): s.get("url", "") for s in sources if s.get("url")}
+    decision_makers = merge_decision_makers(result)
     important_links = result.get("important_links", []) or []
     tier = result.get("scoring_tier", {}) or {}
     has_analysis = bool(analysis)
@@ -419,6 +553,8 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     model_run.font.color.rgb = delivery_color
     if has_analysis:
         add_marked_run(model_paragraph, analysis.get("delivery_model_evidence", ""), base_size=9.5)
+    if has_analysis and analysis.get("delivery_model_source"):
+        add_source_reference_paragraph(doc, analysis["delivery_model_source"], source_lookup)
 
     add_section_heading(doc, "Semantic alignment & authenticity")
     if has_analysis:
@@ -459,14 +595,21 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
             row_cells = criteria_table.add_row().cells
             style_body_cell(row_cells[0], criterion["name"], bold=True)
             style_body_cell(row_cells[1], criterion["score"], align=WD_ALIGN_PARAGRAPH.CENTER)
-            confidence_paragraph = style_body_cell(row_cells[2], f"{criterion.get('confidence', 0)}%",
-                                                     align=WD_ALIGN_PARAGRAPH.CENTER)
+            style_body_cell(row_cells[2], f"{criterion.get('confidence', 0)}%", align=WD_ALIGN_PARAGRAPH.CENTER)
             row_cells[3].text = ""
             evidence_paragraph = row_cells[3].paragraphs[0]
             evidence_paragraph.paragraph_format.space_after = Pt(0)
             set_cell_margins(row_cells[3])
             row_cells[3].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             add_marked_run(evidence_paragraph, criterion.get("evidence", ""), base_size=8.5)
+            criterion_source = criterion.get("source", "")
+            if criterion_source:
+                source_url = source_lookup.get(criterion_source, "")
+                if source_url:
+                    footer_run = evidence_paragraph.add_run("  ")
+                    footer_run.font.size = Pt(7.5)
+                    add_hyperlink(evidence_paragraph, source_url,
+                                  f"[{SOURCE_LABELS.get(criterion_source, criterion_source)}]", color="6B7280")
             if row_index % 2 == 0:
                 for cell in row_cells:
                     shade_cell(cell, TEAL_SOFT_HEX)
@@ -506,6 +649,8 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
             explanation_run = flag_paragraph.add_run(flag.get("explanation", ""))
             explanation_run.font.name = FONT_NAME
             explanation_run.font.size = Pt(9.5)
+            if flag.get("source"):
+                add_source_reference_paragraph(doc, flag["source"], source_lookup)
 
     spend = analysis.get("spend", {}) if has_analysis else {}
     add_section_heading(doc, "India CSR spend")
@@ -519,7 +664,7 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     spend_run.font.size = Pt(11)
     spend_run.font.color.rgb = TEAL_DARK
     if spend.get("source_excerpt"):
-        add_evidence_paragraph(doc, spend["source_excerpt"])
+        add_evidence_paragraph(doc, spend["source_excerpt"], source_lookup.get(spend.get("source", ""), ""))
     if spend.get("trend_direction") and spend.get("trend_direction") != "UNKNOWN":
         trend_paragraph = doc.add_paragraph()
         trend_paragraph.paragraph_format.space_after = Pt(4)
@@ -534,8 +679,7 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
             (entry.get("fiscal_year", ""), entry.get("display", ""), entry.get("source_excerpt", ""))
             for entry in spend["history"]
         ]
-        history_table = build_data_table(
-            doc, ["Fiscal year", "Amount", "Excerpt"], [3.2, 3.2, 9.9], history_rows)
+        build_data_table(doc, ["Fiscal year", "Amount", "Excerpt"], [3.2, 3.2, 9.9], history_rows)
 
     add_section_heading(doc, "Programmes & initiatives")
     programmes = analysis.get("programmes", []) if has_analysis else []
@@ -561,7 +705,7 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
                 scale_run.font.name = FONT_NAME
                 scale_run.font.size = Pt(8.5)
             if programme.get("description"):
-                add_evidence_paragraph(doc, programme["description"])
+                add_evidence_paragraph(doc, programme["description"], source_lookup.get(programme.get("source", ""), ""))
     else:
         note_run = doc.add_paragraph().add_run("No named programmes found in fetched sources.")
         note_run.font.name = FONT_NAME
@@ -587,10 +731,10 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
 
     add_section_heading(doc, "CSR decision-makers")
     if decision_makers:
-        people_table = doc.add_table(rows=1, cols=4)
+        people_table = doc.add_table(rows=1, cols=5)
         people_table.alignment = WD_TABLE_ALIGNMENT.LEFT
         set_table_borders(people_table)
-        for index, heading_text in enumerate(["Name", "Title / role", "Tenure", "Evidence"]):
+        for index, heading_text in enumerate(["Name", "Title / role", "Tenure", "LinkedIn", "Evidence"]):
             style_header_cell(people_table.rows[0].cells[index], heading_text)
         for row_index, person in enumerate(decision_makers, start=1):
             row_cells = people_table.add_row().cells
@@ -600,13 +744,14 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
             is_new = person.get("tenure_status") == "NEW_UNDER_1YR"
             style_body_cell(row_cells[2], tenure_display, bold=is_new,
                              color=YELLOW_DARK if is_new else INK, align=WD_ALIGN_PARAGRAPH.CENTER)
-            style_body_cell(row_cells[3], person.get("source_excerpt", ""), size=8.5)
+            style_link_cell(row_cells[3], person.get("linkedin_url", ""))
+            style_body_cell(row_cells[4], person.get("source_excerpt", ""), size=8.5)
             if is_new:
                 shade_cell(row_cells[2], YELLOW_SOFT_HEX)
             elif row_index % 2 == 0:
                 for cell in row_cells:
                     shade_cell(cell, TEAL_SOFT_HEX)
-        set_col_widths(people_table, [3.6, 4.2, 2.4, 6.1])
+        set_col_widths(people_table, [3.4, 3.8, 2.0, 2.1, 5.0])
         note_paragraph = doc.add_paragraph()
         note_paragraph.paragraph_format.space_before = Pt(8)
         note_run = note_paragraph.add_run(
@@ -636,6 +781,8 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     else:
         no_run = governance_paragraph.add_run("No named board or promoter affinity found.")
         style_small(no_run, 9, GREY)
+    if board_affinity.get("present") and board_affinity.get("source"):
+        add_source_reference_paragraph(doc, board_affinity["source"], source_lookup)
 
     volunteering_paragraph = doc.add_paragraph()
     volunteering_paragraph.paragraph_format.space_after = Pt(4)
@@ -652,6 +799,8 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     else:
         no_run = volunteering_paragraph.add_run("No named volunteering programme found.")
         style_small(no_run, 9, GREY)
+    if volunteering.get("present") and volunteering.get("source"):
+        add_source_reference_paragraph(doc, volunteering["source"], source_lookup)
 
     eligibility = analysis.get("eligibility", {}) if has_analysis else {}
     group_foundation = analysis.get("group_foundation", {}) if has_analysis else {}
@@ -684,7 +833,7 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
         else AMBER if eligibility.get("plausibly_mandated") == "UNLIKELY" else GREY
     )
     if eligibility.get("reasoning"):
-        add_evidence_paragraph(doc, eligibility["reasoning"])
+        add_evidence_paragraph(doc, eligibility["reasoning"], source_lookup.get(eligibility.get("source", ""), ""))
     if group_foundation.get("routed_through_group"):
         group_paragraph = doc.add_paragraph()
         group_paragraph.paragraph_format.space_after = Pt(4)
@@ -699,13 +848,15 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
             f"{group_foundation.get('explanation', '')}",
             base_size=9.5,
         )
+        if group_foundation.get("source"):
+            add_source_reference_paragraph(doc, group_foundation["source"], source_lookup)
 
     add_section_heading(doc, "Contact pathway")
     contact_pathway = analysis.get("contact_pathway", {}) if has_analysis else {}
     if contact_pathway.get("channel"):
         add_marked_paragraph(doc, contact_pathway["channel"], base_size=9.5)
         if contact_pathway.get("evidence"):
-            add_evidence_paragraph(doc, contact_pathway["evidence"])
+            add_evidence_paragraph(doc, contact_pathway["evidence"], source_lookup.get(contact_pathway.get("source", ""), ""))
     else:
         note_run = doc.add_paragraph().add_run(
             "No concrete outreach channel was identified in the fetched sources.")
@@ -752,6 +903,17 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
         source_run.font.color.rgb = TEAL_MID if source.get("status") == "FOUND" else GREY
         if source.get("url"):
             add_hyperlink(source_paragraph, source["url"], source["url"][:70])
+        if source.get("source_name") == "people_search" and source.get("people_hits"):
+            for hit in source["people_hits"][:10]:
+                hit_paragraph = doc.add_paragraph()
+                hit_paragraph.paragraph_format.left_indent = Cm(0.6)
+                hit_paragraph.paragraph_format.space_after = Pt(2)
+                hit_name = (hit.get("name") or "").strip()
+                hit_title = (hit.get("title") or "").strip()
+                hit_run = hit_paragraph.add_run(f"{hit_name}{' — ' + hit_title if hit_title else ''}   ")
+                style_small(hit_run, 8.5, INK, italic=False)
+                if hit.get("url"):
+                    add_hyperlink(hit_paragraph, hit["url"], "LinkedIn", color="0A66C2", bold=True)
 
     if important_links:
         add_section_heading(doc, "Important links")

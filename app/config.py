@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
 
     anthropic_api_key: str = ""
-    anthropic_model: str = "claude-sonnet-5"
+    anthropic_model: str = "claude-haiku-4-5"
     anthropic_tpm_limit: int = 40000
 
     google_search_api_key: str = ""

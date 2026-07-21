@@ -2,8 +2,9 @@ import logging
 
 from app.pipeline import google_search, llm, logo
 from app.pipeline.scraper import mentions_company
+from app.pipeline.source_registry import SourceRegistry, extract_cited_numbers, strip_unknown_citation_tokens
 from app.pipeline.textproc import build_token_budgeted_evidence, structure_all_sources
-from app.pipeline.utils import build_sources_manifest, evidence_hash, mission_hash
+from app.pipeline.utils import build_sources_manifest, evidence_hash, merge_manifest_with_registry, mission_hash
 
 logger = logging.getLogger("tap.scorer")
 
@@ -81,6 +82,7 @@ def build_score_breakdown(analysis: dict) -> dict:
                 "confidence": c["confidence"],
                 "evidence": c["evidence"],
                 "reasoning": c["reasoning"],
+                "cited_sources": extract_cited_numbers(c.get("evidence", "") + " " + c.get("reasoning", "")),
             }
             for c in criteria
         ],
@@ -95,17 +97,21 @@ def resolve_decision_makers(sources: list) -> list[dict]:
     for hit in hits:
         name = (hit.get("name") or "").strip()
         if not name:
-            title_text = (hit.get("title") or "").strip()
-            name = title_text.split("-")[0].split("|")[0].strip() if title_text else ""
-        if not name:
             continue
         key = name.lower()
         if key in seen_names:
             continue
         seen_names.add(key)
-        title = (hit.get("person_title") or hit.get("title") or "").strip()
-        url = (hit.get("url") or hit.get("href") or "").strip()
-        out.append({"name": name, "title": title, "url": url})
+        out.append({
+            "name": name,
+            "title": (hit.get("title") or "").strip(),
+            "company_affiliation": (hit.get("company_affiliation") or "").strip(),
+            "url": (hit.get("url") or "").strip(),
+            "india_location_signal": bool(hit.get("india_location_signal")),
+            "is_current_csr_role": bool(hit.get("is_current_csr_role")),
+            "confidence": hit.get("confidence", "LOW"),
+            "source_number": hit.get("source_number"),
+        })
     return out
 
 
@@ -120,6 +126,7 @@ def build_source_links(sources: list) -> list[dict]:
         "partner_search": "Partner search",
         "people_search": "LinkedIn people search",
         "plans_search": "Partnerships & plans search",
+        "sector_eligibility_search": "Sector & eligibility search",
     }
     out = []
     for source in sources:
@@ -131,11 +138,12 @@ def build_source_links(sources: list) -> list[dict]:
             "url": url,
             "status": source.get("status", ""),
             "is_pdf": url.lower().endswith(".pdf"),
+            "source_number": source.get("source_number"),
         })
     return out
 
 
-async def gather_important_links(company: str, quota_guard=None) -> list[dict]:
+async def gather_important_links(company: str, quota_guard=None, registry: SourceRegistry | None = None) -> list[dict]:
     if not google_search.google_search_configured_and_available(quota_guard):
         return []
 
@@ -145,6 +153,7 @@ async def gather_important_links(company: str, quota_guard=None) -> list[dict]:
         f'"{company}" annual report OR sustainability report CSR India filetype:pdf',
         f'"{company}" CSR "request for proposal" OR "open call" OR "looking for partners" India',
         f'"{company}" board of directors CSR committee India',
+        f'"{company}" CSR press release India {"news"}',
     ]
 
     all_results: list[dict] = []
@@ -167,9 +176,20 @@ async def gather_important_links(company: str, quota_guard=None) -> list[dict]:
         return []
 
     try:
-        return await llm.select_important_links(company, all_results)
+        selected = await llm.select_important_links(company, all_results)
     except Exception:
-        return []
+        selected = []
+
+    if registry is not None:
+        for link in selected:
+            link["source_number"] = registry.register_child_hit(
+                source_name="important_link",
+                url=link.get("url", ""),
+                label=link.get("label", "") or link.get("url", ""),
+                excerpt=link.get("relevance", ""),
+            )
+
+    return selected
 
 
 def is_primarily_about_company(company: str, hit: dict) -> bool:
@@ -195,9 +215,15 @@ async def resolve_logo(company: str, sources: list, cfg: dict, quota_guard=None)
         return ""
 
 
-async def score(company: str, sources: list, cfg: dict, quota_guard=None) -> dict:
+async def score(company: str, sources: list, cfg: dict, quota_guard=None,
+                 registry: SourceRegistry | None = None) -> dict:
+    registry = registry or SourceRegistry(company)
+    for source in sources:
+        if source.get("status") == "FOUND" and not source.get("source_number"):
+            registry.register_core_source(source)
+
     state = determine_state(sources)
-    logger.info("score START company=%r state=%s", company, state)
+    logger.info("score START company=%r state=%s source_bank_size=%d", company, state, len(registry.entries()))
 
     source_links = build_source_links(sources)
     logo_url = await resolve_logo(company, sources, cfg, quota_guard)
@@ -222,10 +248,11 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None) -> dic
             "source_links": source_links,
             "important_links": [],
             "logo_url": logo_url,
+            "source_bank": registry.as_source_bank(),
         }
 
     mission = cfg.get("org_mission") or llm.DEFAULT_MISSION
-    sources_manifest = build_sources_manifest(sources)
+    sources_manifest = merge_manifest_with_registry(build_sources_manifest(sources), registry)
     relevant_evidence_preview, _ = build_evidence_for_analysis(sources, company)
 
     analysis = None
@@ -237,6 +264,8 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None) -> dic
             analysis = None
     else:
         logger.info("score SKIP company=%r reason=no_relevant_evidence no_anthropic_calls", company)
+
+    valid_numbers = {entry["number"] for entry in registry.entries()}
 
     if not analysis:
         cooldown_remaining = llm.anthropic_cooldown_remaining_seconds()
@@ -261,11 +290,12 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None) -> dic
             "scoring_tier": tier,
             "analysis": None,
             "score_breakdown": {},
-            "decision_makers": [],
+            "decision_makers": resolve_decision_makers(sources),
             "sources": sources,
             "source_links": source_links,
             "important_links": [],
             "logo_url": logo_url,
+            "source_bank": registry.as_source_bank(),
         }
 
     final_score = int(round(min(max(analysis.get("fit_score", 0), 0), 100)))
@@ -282,6 +312,7 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None) -> dic
 
     try:
         insight = await llm.generate_strategic_insight_narrative(company, mission, state, final_score, tier["label"], analysis)
+        insight = strip_unknown_citation_tokens(insight, valid_numbers)
     except Exception as exc:
         logger.error("score strategic_insight raised company=%r error=%s", company, exc)
         insight = llm.LLM_UNAVAILABLE_EVIDENCE
@@ -289,12 +320,15 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None) -> dic
     decision_makers = resolve_decision_makers(sources)
 
     try:
-        important_links = await gather_important_links(company, quota_guard=quota_guard)
+        important_links = await gather_important_links(company, quota_guard=quota_guard, registry=registry)
     except Exception as exc:
         logger.error("score gather_important_links raised company=%r error=%s", company, exc)
         important_links = []
 
-    logger.info("score DONE company=%r fit_score=%d tier=%s", company, final_score, tier.get("label"))
+    logger.info(
+        "score DONE company=%r fit_score=%d tier=%s source_bank_size=%d",
+        company, final_score, tier.get("label"), len(registry.entries()),
+    )
 
     return {
         "state": state,
@@ -309,5 +343,6 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None) -> dic
         "source_links": source_links,
         "important_links": important_links,
         "logo_url": logo_url,
+        "source_bank": registry.as_source_bank(),
         "cache_key": (company.strip().lower(), evidence_hash(sources), mission_hash(mission)),
     }

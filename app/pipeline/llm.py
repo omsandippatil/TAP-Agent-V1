@@ -1,8 +1,10 @@
+import asyncio
 import functools
 import json
 import logging
 import re
 import time
+import typing
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
@@ -17,12 +19,18 @@ ANTHROPIC_API_VERSION = "2023-06-01"
 
 LLM_UNAVAILABLE_EVIDENCE = "LLM unavailable — unable to generate evidence"
 
-OUTPUT_TOKEN_RESERVE = 5200
+OUTPUT_TOKEN_RESERVE = 6000
 SCAFFOLD_SAFETY_MARGIN = 250
 MIN_EVIDENCE_BUDGET = 350
 INSIGHT_MAX_TOKENS = 500
 ELIGIBILITY_MAX_TOKENS = 400
+QUESTION_TRIAGE_MAX_TOKENS = 350
+QUESTION_RESOLUTION_MAX_TOKENS = 400
 INTER_CALL_DELAY_SECONDS = 2.0
+
+ANTHROPIC_REQUEST_TIMEOUT_SECONDS = 120.0
+
+MAX_OPEN_QUESTIONS_TO_RESOLVE = 3
 
 DEFAULT_MISSION = (
     "The Apprentice Project (TAP) develops 21st-century skills (critical thinking, "
@@ -75,6 +83,14 @@ CRITERIA_TITLES = {
     "employee_volunteering": "Employee volunteering / payroll-giving programmes",
 }
 
+QUESTION_CATEGORY_KEYWORDS = {
+    "education_programme": ("education", "stem", "skilling", "skill development", "curriculum", "classroom", "learning"),
+    "csr_budget": ("budget", "spend", "expenditure", "crore", "lakh", "percentage-of-profit", "financials"),
+    "decision_maker": ("decision-maker", "decision maker", "contact", "head of", "who is the", "csr lead"),
+    "ngo_partner": ("ngo", "partner", "implementation", "implementing", "funded"),
+    "csr_policy": ("policy", "annual report", "csr report", "disclosure"),
+}
+
 
 class CriterionResultSchema(BaseModel):
     id: str
@@ -105,6 +121,9 @@ class SpendSchema(BaseModel):
     trend_evidence: str = Field(default="", max_length=240)
     trend_source: str = ""
     history: list[SpendYearSchema] = Field(default_factory=list)
+    estimated_min_inr_crore: float | None = None
+    estimated_basis: str = Field(default="", max_length=200)
+    estimated_is_computed: bool = False
 
 
 class ProgrammeSchema(BaseModel):
@@ -114,6 +133,7 @@ class ProgrammeSchema(BaseModel):
     cohort_or_scale: str = ""
     source_excerpt: str = Field(default="", max_length=200)
     source: str = ""
+    confidence: str = "confirmed"
 
 
 class PartnerSchema(BaseModel):
@@ -121,6 +141,7 @@ class PartnerSchema(BaseModel):
     relationship_type: str = ""
     source_excerpt: str = Field(default="", max_length=200)
     source: str = ""
+    confidence: str = "confirmed"
 
 
 class DecisionMakerSchema(BaseModel):
@@ -131,6 +152,7 @@ class DecisionMakerSchema(BaseModel):
     tenure_evidence: str = Field(default="", max_length=200)
     source_excerpt: str = Field(default="", max_length=200)
     source: str = ""
+    linkedin_url: str = ""
 
 
 class GeographySchema(BaseModel):
@@ -187,6 +209,8 @@ class EligibilitySchema(BaseModel):
     plausibly_mandated: str = "UNKNOWN"
     reasoning: str = Field(default="", max_length=280)
     net_worth_turnover_signal: str = Field(default="", max_length=200)
+    net_worth_turnover_inr_crore: float | None = None
+    net_profit_inr_crore: float | None = None
     source: str = ""
 
 
@@ -253,6 +277,13 @@ class PeopleMatchListSchema(BaseModel):
     people: list[PersonMatchSchema] = Field(default_factory=list)
 
 
+class QuestionResolutionSchema(BaseModel):
+    answered: bool = False
+    answer: str = Field(default="", max_length=300)
+    confidence: int = Field(ge=0, le=100, default=0)
+    updates: dict = Field(default_factory=dict)
+
+
 def clamp_int(value, minimum: int, maximum: int, default: int) -> int:
     if not isinstance(value, (int, float)):
         return default
@@ -279,6 +310,7 @@ _TPM_WINDOW_SECONDS = 60.0
 _tpm_window_events: list[tuple] = []
 
 _last_call_finished_at_monotonic: float = 0.0
+_anthropic_call_lock = asyncio.Lock()
 
 
 def _prune_tpm_window(now: float) -> None:
@@ -335,9 +367,9 @@ _RUBRIC = {
     "csr_trajectory": "expansion=higher, static=medium, contraction=lower, no signal=0",
     "delivery_model_fit": "how cleanly TAP could enter as grantee or delivery partner",
     "outreach_readiness": "open call/RFP=high, closed programme=low",
-    "funding_capacity": "does the company's disclosed CSR budget look able to plausibly fund a grant of TAP's typical size",
+    "funding_capacity": "does the disclosed CSR budget plausibly cover a grant of TAP's typical size",
     "csr_spend_trend": "rising multi-year=high, flat=medium, declining=low, no data=0",
-    "decision_maker_tenure": "recently appointed=higher signal of new priorities, long entrenched/no signal=lower",
+    "decision_maker_tenure": "recently appointed=higher signal, entrenched/no signal=lower",
     "group_foundation_routing": "named parent foundation=high, no signal=0",
     "board_education_affinity": "named personal history=higher, generic=low, none=0",
     "employee_volunteering": "active named education programme=higher, generic=low, none=0",
@@ -357,35 +389,95 @@ def _criteria_json_template() -> str:
 
 
 HIGHLIGHT_RULE = (
-    "MARKER-HIGHLIGHT RULE (applies to fit_rationale, alignment_rationale, "
-    "delivery_model_evidence, source_quality_assessment, csr_head_note, "
-    "evidence_recency, contact_pathway.channel, and every criterion's evidence "
-    "field): inside that field's text, wrap the single most decision-relevant "
-    "phrase in **double asterisks**. The phrase must be exactly 2 to 3 words — "
-    "never a full sentence, never a lone number, never more than 3 words. Choose "
-    "the phrase a time-pressed fundraiser would want to see first, for example "
-    "**routed through foundation**, **no open call**, **strong STEM focus**, "
-    "**newly appointed head**, **spend is declining**. Each of these fields should "
-    "carry exactly one bolded phrase if the field has any real content at all; "
-    "leave a field with zero bolded phrases only if the field itself is genuinely "
-    "empty. Never bold more than one phrase in the same field, and never bold "
-    "anything in fields not listed here (name fields, titles, labels, source "
-    "names, urls, booleans, enums)."
+    "MARKER-HIGHLIGHT RULE (fit_rationale, alignment_rationale, delivery_model_evidence, "
+    "source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, "
+    "and every criterion evidence field): wrap the single most decision-relevant 2-3 word "
+    "phrase in **double asterisks** — never a full sentence, never a lone number, never "
+    "more than 3 words. Exactly one bolded phrase per field with real content; zero only "
+    "if the field is genuinely empty. Never bold anything in name/title/label/source/url/"
+    "boolean/enum fields."
 )
 
 OUTPUT_ORDER_RULE = (
-    "OUTPUT ORDER RULE: write the JSON object with fit_score, fit_rationale, "
-    "overall_semantic_alignment, alignment_rationale, delivery_model, and "
-    "delivery_model_evidence as the first six keys, in that order, before any "
-    "other field. This protects the most important fields if you run low on "
-    "output budget — everything after them (spend, programmes, criteria, etc.) "
-    "is secondary detail and may be trimmed or abbreviated before the lead "
-    "fields ever are."
+    "OUTPUT ORDER RULE: write fit_score, fit_rationale, overall_semantic_alignment, "
+    "alignment_rationale, delivery_model, delivery_model_evidence as the first six keys, "
+    "in that order. Everything after (spend, programmes, criteria, etc.) may be trimmed "
+    "before those lead fields ever are."
+)
+
+SPEND_VS_REVENUE_RULE = (
+    "SPEND-VS-REVENUE RULE — apply strictly, this is the most common source of error: "
+    "revenue, turnover, net worth, net profit, market cap, and EBITDA are business-scale "
+    "figures, NOT CSR spend, and must NEVER populate spend.display, spend.inr_crore, or "
+    "be described anywhere as 'CSR spend', 'CSR budget', or 'CSR fund'. Set "
+    "spend.has_disclosed_budget true ONLY when the evidence contains a figure explicitly "
+    "labeled as CSR expenditure, CSR spend, amount spent on CSR, CSR budget, or a stated "
+    "CSR-mandate percentage applied to a stated profit figure. If the evidence contains "
+    "only revenue/turnover/net worth/net profit with no explicit CSR-labeled figure, set "
+    "spend.has_disclosed_budget false, leave spend.inr_crore null, and instead report the "
+    "clean numeric business-scale figures in eligibility.net_worth_turnover_signal (as text) "
+    "AND, whichever of net worth/turnover is stated, in eligibility.net_worth_turnover_inr_crore "
+    "and eligibility.net_profit_inr_crore (as plain numbers in INR crore, null if not stated) — "
+    "this lets a transparent statutory-minimum estimate be computed in code, never by you, and "
+    "never written into spend. Anywhere a business-scale figure is mentioned in prose "
+    "(fit_rationale, alignment_rationale, csr_head_note), it must be labeled 'revenue'/"
+    "'turnover'/'net worth' exactly as the evidence states — never implied to be CSR capacity."
+)
+
+PARTNER_INCLUSION_RULE = (
+    "PARTNER INCLUSION RULE: the partners array is the source of truth for organisations "
+    "the company works with, split into two confidence tiers. confidence='confirmed': the "
+    "evidence explicitly states a working relationship (funds, co-designs, implements with, "
+    "partners with, delivers via) with a named third-party organisation. confidence='probable': "
+    "a named third-party organisation is mentioned alongside the company in a CSR/education "
+    "context but the relationship verb is vague or implied rather than explicit. Do NOT add an "
+    "entry, at either tier, for: a programme, platform, or campaign name that is not itself a "
+    "separate organisation (an internal initiative name is a programme, not a partner); a "
+    "government body mentioned only in generic language ('works with governments and NGOs') "
+    "with no organisation actually named; an award, index, or certifying body the company "
+    "received recognition from. MANDATORY CROSS-CHECK: before finalizing your answer, re-read "
+    "every narrative field you are about to write (fit_rationale, alignment_rationale, "
+    "delivery_model_evidence, csr_head_note) — if any of them names a specific third-party "
+    "organisation the company works with (e.g. 'partnership with AIFT'), that organisation "
+    "MUST also appear in the partners array at confirmed or probable tier; it is a contradiction "
+    "to describe a partnership in prose while leaving the structured array empty. The only "
+    "reason a named organisation from your narrative may be absent from partners is if it is "
+    "itself the NGO mission-holder (TAP) or a government body with no organisation name attached. "
+    "Each qualifying partner appears exactly once, at its highest-supported tier, using its most "
+    "complete verbatim name."
+)
+
+PROGRAMME_INCLUSION_RULE = (
+    "PROGRAMME INCLUSION RULE: add a programmes entry, tagged confidence='confirmed', only "
+    "for a named initiative the company itself runs or funds with at least one concrete "
+    "supporting detail (what it does, who it serves, scale, or since when) beyond just a "
+    "name. If a programme is named but the only supporting detail is thin or partially "
+    "implied, tag it confidence='probable' instead of omitting it or inventing detail to "
+    "reach the confirmed bar. A bare name with zero supporting detail anywhere in the "
+    "evidence should not receive its own programmes entry at any tier. MANDATORY CROSS-CHECK: "
+    "if fit_rationale, alignment_rationale, or delivery_model_evidence names a specific "
+    "initiative (e.g. 'the AIFT partnership focuses on coding and digital literacy'), that "
+    "initiative MUST also appear in the programmes array at confirmed or probable tier — do "
+    "not describe a named initiative in prose while leaving programmes empty."
+)
+
+EVIDENCE_ONLY_RULE = (
+    "EVIDENCE-ONLY RULE: every structured field and every narrative sentence must trace "
+    "to something actually stated in the evidence. Do not infer facts from a company's "
+    "sector, size, or general reputation. Where evidence is partial, say so explicitly "
+    "(e.g. 'no explicit government-school partnership named') rather than writing the "
+    "claim as confirmed. An accurate 0/UNKNOWN/empty value is always preferable to a "
+    "plausible-sounding guess. A name or figure earns a place in a structured field only "
+    "by satisfying the PARTNER INCLUSION RULE, PROGRAMME INCLUSION RULE, or SPEND-VS-"
+    "REVENUE RULE above — mentioning something in prose does not, by itself, qualify it "
+    "for the structured array. Generic sector-wide statistics (e.g. 'X% of companies in "
+    "this sector partner with NGOs') are never evidence of this specific company's "
+    "activity and must not be cited to support any criterion score or structured field."
 )
 
 
 def full_company_analysis_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
-    return f"""You are a thoughtful, generous, fair-minded CSR partnerships analyst judging whether {company} is a genuinely good funding/partnership fit for an Indian education NGO. Read the evidence below and form your own holistic judgment, giving the company every reasonable benefit of the doubt wherever the evidence is plausibly consistent with a good fit.
+    return f"""You are a careful, skeptical CSR partnerships analyst judging whether {company} is a genuinely good funding/partnership fit for an Indian education NGO. Read the evidence below and form a judgment grounded strictly in what it states. Accuracy matters far more than completeness — an unfilled field is correct if the evidence does not support one; a filled field that goes beyond the evidence is a failure.
 
 NGO MISSION: {mission}
 
@@ -396,39 +488,43 @@ EVIDENCE:
 
 {OUTPUT_ORDER_RULE}
 
-HARD RULE ON COMPLETENESS: every one of the 23 output fields below is equally mandatory — none is optional filler and none is secondary to the criteria scorecard. A blank narrative field (fit_rationale, alignment_rationale, delivery_model_evidence, source_quality_assessment, csr_head_note, evidence_recency) is only acceptable if the evidence text truly contains nothing usable for that field. If the evidence contains ANY relevant detail — even one sentence — you must write a real sentence for that field instead of leaving it blank or writing a placeholder like "Not provided" or "No supporting evidence found." Do not spend your effort on the criteria scorecard at the expense of the narrative fields; budget your output so every section gets at least one full sentence grounded in the evidence.
+{SPEND_VS_REVENUE_RULE}
 
-CRITICAL CONSISTENCY RULE: any specific fact you state in fit_rationale, alignment_rationale, csr_head_note, or any criterion's evidence MUST also be written into its matching structured field — the structured fields are the source of truth, and prose is only a summary of them, never a place to introduce facts that are absent elsewhere. Concretely: (a) if you name any programme, initiative, or campaign anywhere in your reasoning, it MUST have its own entry in the programmes array with that same name; (b) if you name any NGO, foundation, or organisation the company works with anywhere in your reasoning, it MUST have its own entry in the partners array; (c) if ANY evidence line states a revenue, turnover, net-worth, CSR-mandate percentage, or crore/lakh figure — even a computed or approximate one like "2% of ₹29,000 Cr" — you MUST set spend.has_disclosed_budget to true and put that figure in spend.display, even if it is an inferred minimum rather than a stated CSR line-item; (d) if you recommend a specific named person as the entry point anywhere in your reasoning, that same person's name MUST appear in contact_pathway.channel, AND that person MUST also appear in the decision_makers array with a title if one is known; (e) if you mention any state or city anywhere in your reasoning, it MUST have its own entry in the geographies array. Never mention a fact in prose while leaving its structured field empty. Before finalizing your JSON, re-read your own fit_rationale, alignment_rationale, csr_head_note and delivery_model_evidence one more time and check every named programme, organisation, person, place, and figure against the structured arrays — add any you missed.
+{PARTNER_INCLUSION_RULE}
+
+{PROGRAMME_INCLUSION_RULE}
+
+{EVIDENCE_ONLY_RULE}
 
 {HIGHLIGHT_RULE}
 
-1. FIT SCORE 0-100: your holistic judgment of how good a partnership fit this company is, considering the whole picture — do NOT compute this mechanically from the criteria below, and do NOT let a low criteria-scorecard average pull this number down. Sparse public sourcing is extremely common and is not itself evidence of poor fit — it usually just means less has been published, not that the company is a bad match. Score generously and directionally: any genuine positive signal (a named programme touching STEM, technology, 21st-century skills, or education; a credible co-design or platform-powering relationship; a plausible sector fit; scale and reputation consistent with an active CSR programme) should lift the score meaningfully rather than being offset by unrelated gaps like undisclosed budget or unconfirmed public-schooling focus — those are follow-up items for the analyst, not reasons to suppress the score. A large, well-known technology, IT-services, or professional-services company is close to the core of what CSR-funded education-technology NGOs look for as a prospect — treat that sector proximity itself as a meaningful positive, not a neutral fact. If the company's sector, scale, or business model plausibly aligns with education/technology/CSR-relevant work even without a fully documented programme, that alone justifies a mid-to-upper range score (60-75) rather than a low one, and if there is a named, concrete programme with real alignment to the mission (even one programme, even without financial disclosure), lean toward the 70-85 range. Reserve scores below 40 for cases where the evidence actively suggests poor fit (wrong sector, no CSR activity at all, explicit conflict with the mission) — thin, missing, or partially unresolved evidence on its own should not pull a plausible, well-aligned prospect down near zero; when in doubt between two adjacent bands, prefer the more generous one. A well-known, large, reputable company with a plausible sector fit but limited public CSR documentation should typically land in the 60-75 range, not near 0. Do not consider proximity to the NGO's operating states or overlap with the NGO's existing partners as scoring factors — mention them only as background color if relevant.
-2. FIT RATIONALE (REQUIRED, 2-4 full sentences): explain the fit_score in plain language, referencing specific things found in the evidence (programmes, delivery model, decision-makers, spend, sector). Lead with what is genuinely promising before noting what remains to be confirmed. This must not be empty if fit_score is nonzero. Every programme, partner, or figure you reference here must also be present in its own structured field per the CRITICAL CONSISTENCY RULE above.
-3. SEMANTIC ALIGNMENT 0-100 (REQUIRED, must not be 0 unless the company's sector/activity is genuinely unrelated to education, technology, or CSR entirely) + ALIGNMENT RATIONALE (REQUIRED, 1-2 full sentences grounded in evidence, or in the company's known sector/business if direct evidence is sparse) — how well the company's actual or plausible CSR activity overlaps with the NGO's mission area. A technology, professional-services, or education-adjacent company should score at least 50-60 here on sector plausibility alone, even with minimal direct evidence, and higher still if a named programme directly touches STEM, coding, or 21st-century skills.
-4. DELIVERY MODEL: FUNDER/IMPLEMENTER/HYBRID/UNCLEAR + DELIVERY MODEL EVIDENCE (REQUIRED sentence naming the specific programme or statement that supports this classification — only use UNCLEAR with empty evidence if the text genuinely gives no clue).
-5. BUDGET (do not leave blank if any number appears anywhere in the evidence): does any evidence disclose or imply an India CSR spend figure — including a stated revenue/turnover combined with a stated or standard CSR-mandate percentage, or even just a bare mandate percentage on its own (e.g. "mandatory 2% CSR spend")? Set has_disclosed_budget true and populate display with the figure (label it as an inferred minimum if computed, e.g. "~₹580 Cr (2% of ₹29,000 Cr revenue, inferred minimum)", or "~2% of net profit (exact figure not disclosed)" if only the percentage is known) whenever a real number is stated anywhere in the evidence, even approximate, derived, or partial. Only leave has_disclosed_budget false and display empty if the evidence contains no financial or mandate figures for this company at all. Give the latest figure if stated else null/conf 0; prior years into history[]; trend_direction RISING/FLAT/DECLINING/UNKNOWN from actual numbers only. An undisclosed budget is common for large companies and should be treated as an open question to verify, not as a negative signal in itself.
-6. PROGRAMMES (do not leave empty if fit_rationale names any): list every named programme, initiative, campaign, or partnership mentioned anywhere in the evidence or referenced in your own fit_rationale, even briefly — multi-year vs one-off, scale if stated.
-7. PARTNERS (do not leave empty if fit_rationale names any): list every NGO, foundation, or organisation the company is described as working with, funding, or partnering — including any named in your own fit_rationale, csr_head_note, or delivery_model_evidence — relationship_type funder/implementer/co-design/unclear.
-8. DECISION MAKERS: every named leader, executive, or spokesperson quoted or mentioned in a CSR/sustainability context, title, public_facing_score 0-100, tenure_status. If you name this same person as the recommended contact in contact_pathway, they MUST appear here too.
-9. GEOGRAPHY: every state/city mentioned anywhere in the evidence or in your own reasoning, for reference only.
-10. RFP SIGNAL: explicit call for NGO partners — present, channel, evidence.
-11. BOARD AFFINITY: named board/promoter personal education-philanthropy history.
-12. VOLUNTEERING: named employee volunteering/payroll-giving touching education.
-13. GROUP FOUNDATION: CSR run via separate parent/group foundation.
-14. ELIGIBILITY: from net worth/turnover/profit figures, Section 135 applicability LIKELY/UNLIKELY/UNKNOWN.
-15. SECTOR (REQUIRED — only UNKNOWN if the evidence gives no industry clue at all): classify using any company-description language in the evidence (e.g. telecom, IT services, manufacturing, FMCG, financial services), sub_sector if clear, with a one-line reasoning.
-16. CRITERIA 0-5 each, all criteria ids in order, short evidence+reasoning, used only as supporting detail — not the basis for the fit score: {_criteria_rubric_block()}
-17. RED FLAGS: genuine contradictions, marketing-not-substance signals, date mismatches. Severity low/medium/high. Do not invent flags just to lower the score, and do not list an unconfirmed detail (like an undisclosed budget or unstated public-schooling focus) as a red flag — those belong in open_questions instead.
-18. CONTACT PATHWAY (REQUIRED — name the single most concrete real channel found, e.g. a specific named person with their title, a CSR page contact form, a foundation email; if you identify a recommended entry-point person anywhere in your reasoning, name them here AND add them to decision_makers with their title; only say "Not identified" if truly nothing exists).
-19. EVIDENCE RECENCY (REQUIRED one full sentence): comment on how recent/current the evidence appears to be (years, fiscal years, or dated statements mentioned).
-20. CSR HEAD NOTE (REQUIRED one full sentence): comment on leadership philosophy or approach based on any decision-maker quotes or statements found; if no decision-maker is named, comment instead on what the evidence suggests about how CSR is organised.
-21. SOURCE QUALITY ASSESSMENT (REQUIRED 1-2 full sentences): assess how strong/weak/primary/secondary the sources actually used were. This field must always contain a real assessment — never leave it blank and never write a placeholder — even when only search snippets were available, say so plainly.
-22. AUTHENTICITY SCORE 0-100 (REQUIRED, must not default to 0 unless sourcing is truly untrustworthy): how much you trust the sourcing, for reference only.
-23. OPEN QUESTIONS: up to 5 short items to verify. Use this field, not the fit score or red flags, to carry unconfirmed details like undisclosed budget, unclear public-schooling focus, or unclear foundation routing.
+1. FIT SCORE 0-100: grounded in evidence actually present, not sector reputation. A named programme with concrete detail directly touching STEM/technology/21st-century skills and education justifies 60-85 depending on strength and depth of detail. Sector plausibility alone with no named programme justifies at most 35-50. Thin or missing evidence should pull the score down. Reserve above 85 for a named, detailed, multi-year programme plus a disclosed CSR figure plus an identifiable contact path.
+2. FIT RATIONALE (REQUIRED, 2-4 sentences): explain fit_score citing only retrieved evidence. State plainly which parts are confirmed versus inferred or missing. Never present revenue/turnover as CSR capacity without labeling it as such.
+3. SEMANTIC ALIGNMENT 0-100 (REQUIRED) + ALIGNMENT RATIONALE (REQUIRED, 1-2 sentences), based only on named programme content.
+4. DELIVERY MODEL: FUNDER/IMPLEMENTER/HYBRID/UNCLEAR + DELIVERY MODEL EVIDENCE (REQUIRED sentence naming the specific programme/statement; UNCLEAR with empty evidence if the text gives no clue).
+5. BUDGET — apply the SPEND-VS-REVENUE RULE above without exception. Latest figure with fiscal_year if stated else null/conf 0; prior years into history[]; trend_direction from actual CSR-labeled numbers only, never from revenue growth. Populate eligibility.net_worth_turnover_inr_crore / eligibility.net_profit_inr_crore whenever those business-scale numbers are stated, even though they never populate spend.
+6. PROGRAMMES — apply the PROGRAMME INCLUSION RULE above, including its mandatory cross-check against your own narrative fields; tag confidence confirmed/probable.
+7. PARTNERS — apply the PARTNER INCLUSION RULE above, including its mandatory cross-check against your own narrative fields; tag confidence confirmed/probable. A shorter list than the narrative implies is only correct if the narrative itself names no specific organisation — if it does, that organisation belongs in this array.
+8. DECISION MAKERS: every named leader/executive/spokesperson quoted or mentioned in a CSR/sustainability context, title, public_facing_score 0-100, tenure_status, linkedin_url only if a literal linkedin.com/in/ URL is present for that person, else empty. Anyone named in contact_pathway MUST appear here too.
+9. GEOGRAPHY: every state/city explicitly named in the evidence.
+10. RFP SIGNAL: explicit call for NGO partners — present, channel, evidence. Default false/empty unless explicitly stated.
+11. BOARD AFFINITY: named board/promoter personal education-philanthropy history. Default false/empty unless explicitly stated.
+12. VOLUNTEERING: named employee volunteering/payroll-giving touching education. Default false/empty unless explicitly stated.
+13. GROUP FOUNDATION: CSR run via separate parent/group foundation, only if explicitly named.
+14. ELIGIBILITY: from net worth/turnover/profit figures (kept separate from spend), Section 135 applicability LIKELY/UNLIKELY/UNKNOWN, plus the plain numeric fields described in rule 5.
+15. SECTOR (UNKNOWN only if evidence gives no industry clue): classify from company-description language, sub_sector if clear, one-line reasoning.
+16. CRITERIA 0-5 each, all ids in order, short evidence+reasoning: {_criteria_rubric_block()}
+17. RED FLAGS: genuine contradictions, marketing-not-substance signals, date mismatches, or internal conflicts with your own output elsewhere. Severity low/medium/high. Unconfirmed details go in open_questions, not red_flags.
+18. CONTACT PATHWAY (name the single most concrete real channel; "Not identified" if truly nothing exists — never invent a channel from a generic mention).
+19. EVIDENCE RECENCY (one sentence): how recent/current the evidence appears.
+20. CSR HEAD NOTE (one sentence): only from actual decision-maker quotes or named structure; do not speculate about philosophy from a bare title.
+21. SOURCE QUALITY ASSESSMENT (1-2 sentences): state plainly whether sources were primary (company/regulator) or secondary (press/search snippets), and whether figures used are self-reported vs independently verified.
+22. AUTHENTICITY SCORE 0-100: reflect actual sourcing quality — lower it when the only support is a press mention or search snippet rather than a primary document.
+23. OPEN QUESTIONS: up to 5 short items to verify, including any figure excluded from spend under the SPEND-VS-REVENUE RULE. Phrase each as a concrete, searchable question (e.g. "Does {company} run a named education or STEM programme in India?" rather than "More detail needed").
 
 All criteria ids below must appear exactly once, in order. Missing evidence for a criterion: score 0, confidence 0, evidence "To confirm — no signal in evidence".
 
-Rules: evidence fields are paraphrases under 20 words, never verbatim. Never fabricate facts, but never leave a required narrative field blank when the evidence contains anything relevant — write the sentence. Numbers internally consistent. Keep every string concise so the full reply fits within {OUTPUT_TOKEN_RESERVE} output tokens, but prioritize filling every required field over verbosity in any single one, and prioritize the first six keys above all else per the OUTPUT ORDER RULE. Apply the marker-highlight rule above inside the relevant fields. Reply with ONE JSON object, nothing else.
+Rules: evidence fields are paraphrases under 20 words, never verbatim except exact figures and exact partner/programme names. Never fabricate facts. Numbers internally consistent. Keep every string concise so the full reply fits within {OUTPUT_TOKEN_RESERVE} output tokens, prioritizing the first six keys per the OUTPUT ORDER RULE. Reply with ONE JSON object, nothing else.
 
 JSON shape:
 {{
@@ -438,10 +534,10 @@ JSON shape:
   "alignment_rationale": "<1-2 sentences, required, one **2-3 word** highlight>",
   "delivery_model": "<FUNDER|IMPLEMENTER|HYBRID|UNCLEAR>",
   "delivery_model_evidence": "<sentence, required unless truly no clue, one **2-3 word** highlight>",
-  "spend": {{"inr_crore": <number or null>, "display": "<as stated>", "fiscal_year": "<if stated>", "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number or null>, "display": "<as stated>", "source_excerpt": "<short>"}}]}},
-  "programmes": [{{"name": "<name>", "description": "<short>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "source_excerpt": "<short>"}}],
-  "partners": [{{"name": "<name>", "relationship_type": "<funder|implementer|co-design|unclear>", "source_excerpt": "<short>"}}],
-  "decision_makers": [{{"name": "<name>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "source_excerpt": "<short>"}}],
+  "spend": {{"inr_crore": <number or null>, "display": "<exact CSR-labeled figure/unit as stated, never revenue>", "fiscal_year": "<if stated>", "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number or null>, "display": "<as stated>", "source_excerpt": "<short>"}}]}},
+  "programmes": [{{"name": "<exact name>", "description": "<short, must include a concrete supporting detail>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "source_excerpt": "<short>", "confidence": "<confirmed|probable>"}}],
+  "partners": [{{"name": "<exact standalone organisation name>", "relationship_type": "<funder|implementer|co-design|unclear>", "source_excerpt": "<short, must show relationship language>", "confidence": "<confirmed|probable>"}}],
+  "decision_makers": [{{"name": "<name>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "source_excerpt": "<short>", "linkedin_url": "<url or empty>"}}],
   "geographies": [{{"place": "<place>", "source_excerpt": "<short>"}}],
   "criteria": [
 {_criteria_json_template()}
@@ -452,7 +548,7 @@ JSON shape:
   "board_affinity": {{"present": <bool>, "person_name": "<name or empty>", "connection": "<short>", "source_excerpt": "<short>"}},
   "volunteering": {{"present": <bool>, "programme_name": "<name or empty>", "description": "<short>", "source_excerpt": "<short>"}},
   "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>", "source_excerpt": "<short>"}},
-  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>"}},
+  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number or null>, "net_profit_inr_crore": <number or null>}},
   "sector": {{"sector": "<sector, required>", "sub_sector": "<sub-sector or empty>", "reasoning": "<short, required>"}},
   "evidence_recency": "<one sentence, required, one **2-3 word** highlight>",
   "csr_head_note": "<one sentence, required, one **2-3 word** highlight>",
@@ -487,7 +583,12 @@ def analysis_input_token_budget(company: str = "", mission: str = "", sources_ma
     static_budget = settings.anthropic_tpm_limit - OUTPUT_TOKEN_RESERVE - scaffold_tokens
     live_budget = tpm_tokens_available(safety_margin=OUTPUT_TOKEN_RESERVE + scaffold_tokens)
     budget = min(static_budget, live_budget) if live_budget > 0 else static_budget
-    return max(MIN_EVIDENCE_BUDGET, budget)
+    final_budget = max(MIN_EVIDENCE_BUDGET, budget)
+    logger.info(
+        "token budget scaffold=%d static=%d live=%d final=%d",
+        scaffold_tokens, static_budget, live_budget, final_budget,
+    )
+    return final_budget
 
 
 async def call_anthropic_chat(
@@ -511,128 +612,139 @@ async def call_anthropic_chat(
         )
         return None
 
-    since_last_call = time.monotonic() - _last_call_finished_at_monotonic
-    if since_last_call < INTER_CALL_DELAY_SECONDS:
-        wait_seconds = INTER_CALL_DELAY_SECONDS - since_last_call
-        logger.info("anthropic pacing delay caller=%s waiting=%.1fs", caller, wait_seconds)
-        time.sleep(wait_seconds)
+    async with _anthropic_call_lock:
+        since_last_call = time.monotonic() - _last_call_finished_at_monotonic
+        if since_last_call < INTER_CALL_DELAY_SECONDS:
+            wait_seconds = INTER_CALL_DELAY_SECONDS - since_last_call
+            logger.info("anthropic pacing delay caller=%s waiting=%.1fs", caller, wait_seconds)
+            await asyncio.sleep(wait_seconds)
 
-    estimated_prompt_tokens = estimate_tokens(prompt)
-    estimated_total_tokens = estimated_prompt_tokens + max_tokens
+        estimated_prompt_tokens = estimate_tokens(prompt)
+        estimated_total_tokens = estimated_prompt_tokens + max_tokens
 
-    hard_ceiling = settings.anthropic_tpm_limit - max_tokens
-    if estimated_prompt_tokens > hard_ceiling:
-        logger.error(
-            "anthropic call aborted before send caller=%s estimated_prompt_tokens=%d max_tokens=%d tpm_limit=%d hard_ceiling=%d",
-            caller, estimated_prompt_tokens, max_tokens, settings.anthropic_tpm_limit, hard_ceiling,
-        )
-        return None
-
-    tokens_used_in_window = tpm_tokens_used_in_window()
-    if tokens_used_in_window + estimated_total_tokens > settings.anthropic_tpm_limit:
-        window_wait_hint = max(0.0, _TPM_WINDOW_SECONDS - 1.0)
-        logger.warning(
-            "anthropic call skipped caller=%s reason=local_tpm_budget_exhausted used_this_window=%d "
-            "estimated_total_tokens=%d tpm_limit=%d — would exceed limit, not sending",
-            caller, tokens_used_in_window, estimated_total_tokens, settings.anthropic_tpm_limit,
-        )
-        _cooldown_until_monotonic = max(_cooldown_until_monotonic, time.monotonic() + min(window_wait_hint, 15.0))
-        _cooldown_reason = "local tpm budget exhausted, avoided sending a call likely to 429"
-        return None
-
-    resolved_model = model or settings.anthropic_model
-    payload = {
-        "model": resolved_model,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "messages": [
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": "{"},
-        ],
-    }
-
-    logger.info(
-        "anthropic request caller=%s model=%s max_tokens=%d prompt_chars=%d estimated_prompt_tokens=%d window_used_before=%d",
-        caller, resolved_model, max_tokens, len(prompt), estimated_prompt_tokens, tokens_used_in_window,
-    )
-    request_started_at = time.monotonic()
-    _record_tpm_usage(estimated_total_tokens)
-
-    try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            response = await client.post(
-                ANTHROPIC_MESSAGES_URL,
-                headers={
-                    "x-api-key": settings.anthropic_api_key,
-                    "anthropic-version": ANTHROPIC_API_VERSION,
-                    "Content-Type": "application/json",
-                },
-                json=payload,
+        hard_ceiling = settings.anthropic_tpm_limit - max_tokens
+        if estimated_prompt_tokens > hard_ceiling:
+            logger.error(
+                "anthropic call aborted before send caller=%s estimated_prompt_tokens=%d max_tokens=%d tpm_limit=%d hard_ceiling=%d",
+                caller, estimated_prompt_tokens, max_tokens, settings.anthropic_tpm_limit, hard_ceiling,
             )
-    except httpx.HTTPError as exc:
-        logger.error("anthropic transport error caller=%s error=%s", caller, exc)
+            return None
+
+        tokens_used_in_window = tpm_tokens_used_in_window()
+        if tokens_used_in_window + estimated_total_tokens > settings.anthropic_tpm_limit:
+            window_wait_hint = max(0.0, _TPM_WINDOW_SECONDS - 1.0)
+            logger.warning(
+                "anthropic call skipped caller=%s reason=local_tpm_budget_exhausted used_this_window=%d "
+                "estimated_total_tokens=%d tpm_limit=%d — would exceed limit, not sending",
+                caller, tokens_used_in_window, estimated_total_tokens, settings.anthropic_tpm_limit,
+            )
+            _cooldown_until_monotonic = max(_cooldown_until_monotonic, time.monotonic() + min(window_wait_hint, 15.0))
+            _cooldown_reason = "local tpm budget exhausted, avoided sending a call likely to 429"
+            return None
+
+        resolved_model = model or settings.anthropic_model
+        payload = {
+            "model": resolved_model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "{"},
+            ],
+        }
+
+        logger.info(
+            "anthropic request caller=%s model=%s max_tokens=%d prompt_chars=%d estimated_prompt_tokens=%d window_used_before=%d timeout_s=%.0f",
+            caller, resolved_model, max_tokens, len(prompt), estimated_prompt_tokens, tokens_used_in_window,
+            ANTHROPIC_REQUEST_TIMEOUT_SECONDS,
+        )
+        request_started_at = time.monotonic()
+        _record_tpm_usage(estimated_total_tokens)
+
+        try:
+            async with httpx.AsyncClient(timeout=ANTHROPIC_REQUEST_TIMEOUT_SECONDS) as client:
+                response = await client.post(
+                    ANTHROPIC_MESSAGES_URL,
+                    headers={
+                        "x-api-key": settings.anthropic_api_key,
+                        "anthropic-version": ANTHROPIC_API_VERSION,
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+        except httpx.HTTPError as exc:
+            elapsed_ms = (time.monotonic() - request_started_at) * 1000
+            logger.error(
+                "anthropic transport error caller=%s exc_type=%s elapsed_ms=%.0f timeout_s=%.0f error=%s",
+                caller, type(exc).__name__, elapsed_ms, ANTHROPIC_REQUEST_TIMEOUT_SECONDS, exc,
+            )
+            _last_call_finished_at_monotonic = time.monotonic()
+            return None
+
+        elapsed_ms = (time.monotonic() - request_started_at) * 1000
         _last_call_finished_at_monotonic = time.monotonic()
-        return None
 
-    elapsed_ms = (time.monotonic() - request_started_at) * 1000
-    _last_call_finished_at_monotonic = time.monotonic()
+        if response.status_code == 429:
+            retry_after_header = response.headers.get("retry-after", "")
+            rate_limit_remaining = response.headers.get("anthropic-ratelimit-requests-remaining", "unknown")
+            rate_limit_reset = response.headers.get("anthropic-ratelimit-requests-reset", "unknown")
+            retry_after_seconds = _parse_retry_after_seconds(retry_after_header, response.text)
+            _cooldown_until_monotonic = time.monotonic() + retry_after_seconds
+            _cooldown_reason = response.text[:200]
+            logger.warning(
+                "anthropic 429 RATE LIMITED caller=%s model=%s retry_after=%.0fs remaining_requests=%s reset=%s body=%s",
+                caller, resolved_model, retry_after_seconds, rate_limit_remaining, rate_limit_reset, response.text[:400],
+            )
+            return None
 
-    if response.status_code == 429:
-        retry_after_header = response.headers.get("retry-after", "")
-        rate_limit_remaining = response.headers.get("anthropic-ratelimit-requests-remaining", "unknown")
-        rate_limit_reset = response.headers.get("anthropic-ratelimit-requests-reset", "unknown")
-        retry_after_seconds = _parse_retry_after_seconds(retry_after_header, response.text)
-        _cooldown_until_monotonic = time.monotonic() + retry_after_seconds
-        _cooldown_reason = response.text[:200]
-        logger.warning(
-            "anthropic 429 RATE LIMITED caller=%s model=%s retry_after=%.0fs remaining_requests=%s reset=%s body=%s",
-            caller, resolved_model, retry_after_seconds, rate_limit_remaining, rate_limit_reset, response.text[:400],
-        )
-        return None
+        if response.status_code == 413:
+            logger.error(
+                "anthropic 413 TOO LARGE caller=%s estimated_prompt_tokens=%d body=%s",
+                caller, estimated_prompt_tokens, response.text[:400],
+            )
+            return None
 
-    if response.status_code == 413:
-        logger.error(
-            "anthropic 413 TOO LARGE caller=%s estimated_prompt_tokens=%d body=%s",
-            caller, estimated_prompt_tokens, response.text[:400],
-        )
-        return None
+        if response.status_code >= 400:
+            logger.error(
+                "anthropic http error caller=%s status=%d elapsed_ms=%.0f body=%s",
+                caller, response.status_code, elapsed_ms, response.text[:400],
+            )
+            return None
 
-    if response.status_code >= 400:
-        logger.error(
-            "anthropic http error caller=%s status=%d elapsed_ms=%.0f body=%s",
-            caller, response.status_code, elapsed_ms, response.text[:400],
-        )
-        return None
+        try:
+            body = response.json()
+        except ValueError:
+            logger.error("anthropic non-json response caller=%s status=%d", caller, response.status_code)
+            return None
 
-    try:
-        body = response.json()
-    except ValueError:
-        logger.error("anthropic non-json response caller=%s status=%d", caller, response.status_code)
-        return None
+        logger.info("anthropic response caller=%s status=%d elapsed_ms=%.0f", caller, response.status_code, elapsed_ms)
 
-    logger.info("anthropic response caller=%s status=%d elapsed_ms=%.0f", caller, response.status_code, elapsed_ms)
+        usage = body.get("usage") or {}
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+            actual_total_tokens = input_tokens + output_tokens
+            _record_tpm_usage(actual_total_tokens - estimated_total_tokens)
+            logger.info(
+                "anthropic usage caller=%s input_tokens=%d output_tokens=%d total=%d estimated_total=%d delta=%d",
+                caller, input_tokens, output_tokens, actual_total_tokens, estimated_total_tokens,
+                actual_total_tokens - estimated_total_tokens,
+            )
 
-    usage = body.get("usage") or {}
-    input_tokens = usage.get("input_tokens")
-    output_tokens = usage.get("output_tokens")
-    if isinstance(input_tokens, int) and isinstance(output_tokens, int):
-        actual_total_tokens = input_tokens + output_tokens
-        _record_tpm_usage(actual_total_tokens - estimated_total_tokens)
+        stop_reason = body.get("stop_reason", "")
+        if stop_reason == "max_tokens":
+            logger.warning(
+                "anthropic response TRUNCATED caller=%s max_tokens=%d — model ran out of output budget, "
+                "attempting partial-JSON recovery since lead fields are front-loaded",
+                caller, max_tokens,
+            )
 
-    stop_reason = body.get("stop_reason", "")
-    if stop_reason == "max_tokens":
-        logger.warning(
-            "anthropic response TRUNCATED caller=%s max_tokens=%d — model ran out of output budget, "
-            "attempting partial-JSON recovery since lead fields are front-loaded",
-            caller, max_tokens,
-        )
-
-    content_blocks = body.get("content") or []
-    text_parts = [block.get("text", "") for block in content_blocks if block.get("type") == "text"]
-    if not text_parts:
-        logger.error("anthropic malformed response caller=%s body_keys=%s", caller, list(body.keys()))
-        return None
-    return "{" + "".join(text_parts)
+        content_blocks = body.get("content") or []
+        text_parts = [block.get("text", "") for block in content_blocks if block.get("type") == "text"]
+        if not text_parts:
+            logger.error("anthropic malformed response caller=%s body_keys=%s", caller, list(body.keys()))
+            return None
+        return "{" + "".join(text_parts)
 
 
 def parse_json_response(raw_text: str | None) -> dict:
@@ -647,9 +759,11 @@ def parse_json_response(raw_text: str | None) -> dict:
         pass
     recovered = _recover_partial_json(cleaned)
     if recovered:
+        logger.info("parse_json_response recovered via partial-json fallback chars=%d", len(cleaned))
         return recovered
     end = max(cleaned.rfind("}"), cleaned.rfind("]"))
     if end == -1:
+        logger.error("parse_json_response failed to recover any JSON chars=%d", len(cleaned))
         return {}
     for start_offset in range(0, 3):
         try:
@@ -657,6 +771,7 @@ def parse_json_response(raw_text: str | None) -> dict:
             return parsed if isinstance(parsed, dict) else {}
         except (json.JSONDecodeError, TypeError):
             continue
+    logger.error("parse_json_response exhausted all recovery attempts chars=%d", len(cleaned))
     return {}
 
 
@@ -682,6 +797,7 @@ def _recover_partial_json(cleaned: str) -> dict:
 
 _STRAY_MARKER_PATTERN = re.compile(r"\*{3,}")
 _UNPAIRED_DOUBLE_STAR_PATTERN = re.compile(r"\*\*")
+_LINKEDIN_PROFILE_URL_PATTERN = re.compile(r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[^/?#\s]+/?(?:[?#].*)?$", re.IGNORECASE)
 
 
 def _normalize_highlight_markers(text: str) -> str:
@@ -693,9 +809,186 @@ def _normalize_highlight_markers(text: str) -> str:
     return cleaned
 
 
+def _sanitize_linkedin_url(url: str) -> str:
+    cleaned = (url or "").strip()
+    if not cleaned:
+        return ""
+    return cleaned if _LINKEDIN_PROFILE_URL_PATTERN.match(cleaned) else ""
+
+
+_REVENUE_LANGUAGE_PATTERN = re.compile(
+    r"\b(revenue|turnover|net\s*worth|net\s*profit|ebitda|market\s*cap)\b", re.IGNORECASE
+)
+_CSR_LABEL_PATTERN = re.compile(
+    r"\b(csr\s*(spend|expenditure|budget|fund|obligation)|amount\s*spent\s*(on\s*)?csr|"
+    r"csr\s*mandate)\b", re.IGNORECASE
+)
+
+STATUTORY_CSR_MIN_PERCENT = 2.0
+
+
+def _spend_display_is_revenue_like(display: str) -> bool:
+    if not display:
+        return False
+    has_revenue_language = bool(_REVENUE_LANGUAGE_PATTERN.search(display))
+    has_csr_label = bool(_CSR_LABEL_PATTERN.search(display))
+    return has_revenue_language and not has_csr_label
+
+
+def _compute_statutory_estimate(eligibility: dict) -> tuple[float | None, str]:
+    net_profit = eligibility.get("net_profit_inr_crore")
+    if isinstance(net_profit, (int, float)) and net_profit > 0:
+        estimate = round(net_profit * STATUTORY_CSR_MIN_PERCENT / 100, 2)
+        basis = (
+            f"Estimated statutory minimum — not a disclosed figure. Computed as "
+            f"{STATUTORY_CSR_MIN_PERCENT:.0f}% of the disclosed net profit "
+            f"(₹{net_profit:g} crore) under Section 135, before verification."
+        )
+        return estimate, basis
+    return None, ""
+
+
+def _enforce_spend_integrity(spend: dict, eligibility: dict) -> dict:
+    display = spend.get("display", "") or ""
+    excerpt = spend.get("source_excerpt", "") or ""
+    if spend.get("has_disclosed_budget") and _spend_display_is_revenue_like(display + " " + excerpt):
+        logger.warning(
+            "spend integrity guard fired: figure looks like revenue/turnover, not CSR spend — "
+            "forcing has_disclosed_budget=false display=%r",
+            display,
+        )
+        spend["has_disclosed_budget"] = False
+        spend["inr_crore"] = None
+        spend["confidence"] = 0
+        spend["display"] = ""
+
+    if not spend.get("has_disclosed_budget"):
+        estimate, basis = _compute_statutory_estimate(eligibility)
+        if estimate is not None:
+            spend["estimated_min_inr_crore"] = estimate
+            spend["estimated_basis"] = basis
+            spend["estimated_is_computed"] = True
+        else:
+            spend["estimated_min_inr_crore"] = None
+            spend["estimated_basis"] = ""
+            spend["estimated_is_computed"] = False
+    else:
+        spend["estimated_min_inr_crore"] = None
+        spend["estimated_basis"] = ""
+        spend["estimated_is_computed"] = False
+    return spend
+
+
+_RELATIONSHIP_SIGNAL_PATTERN = re.compile(
+    r"\b(fund(s|ed|ing)?|co-design|co-develop|implement(s|ing|ation)?|partner(s|ed|ship)?|"
+    r"collaborat|deliver(s|ed|ing)?\s+(via|through|with)|works?\s+with|grant(s|ee|ed)?)\b",
+    re.IGNORECASE,
+)
+_WEAK_MENTION_SIGNAL_PATTERN = re.compile(
+    r"\b(alongside|also named|mentioned with|in association|joint|together with|"
+    r"as part of|among the)\b",
+    re.IGNORECASE,
+)
+_GENERIC_PARTNER_NAME_PATTERN = re.compile(
+    r"^(governments?|ngos?|partners?|the\s+government|state\s+governments?|local\s+"
+    r"governments?)$",
+    re.IGNORECASE,
+)
+
+
+def _classify_partner_tier(entry: dict) -> str | None:
+    name = (entry.get("name") or "").strip()
+    if not name or len(name) < 3:
+        return None
+    if _GENERIC_PARTNER_NAME_PATTERN.match(name):
+        return None
+    excerpt = entry.get("source_excerpt", "") or ""
+    relationship_type = (entry.get("relationship_type") or "").strip().lower()
+    stated_confidence = (entry.get("confidence") or "").strip().lower()
+    if relationship_type in {"funder", "implementer", "co-design"} or _RELATIONSHIP_SIGNAL_PATTERN.search(excerpt):
+        return "confirmed"
+    if stated_confidence == "probable" or _WEAK_MENTION_SIGNAL_PATTERN.search(excerpt) or excerpt.strip():
+        return "probable"
+    return None
+
+
+def _classify_programme_tier(entry: dict) -> str | None:
+    name = (entry.get("name") or "").strip()
+    description = (entry.get("description") or "").strip()
+    if not name or len(name) < 3:
+        return None
+    stated_confidence = (entry.get("confidence") or "").strip().lower()
+    if len(description) >= 15:
+        return "confirmed"
+    if description or stated_confidence == "probable":
+        return "probable"
+    return None
+
+
+def _field_max_length(field) -> int | None:
+    for constraint in field.metadata:
+        if hasattr(constraint, "max_length"):
+            return constraint.max_length
+    return None
+
+
+def _sanitize_value_for_field(value, field):
+    annotation = field.annotation
+    origin = typing.get_origin(annotation)
+
+    if origin is list:
+        if not isinstance(value, list):
+            return []
+        (item_type,) = typing.get_args(annotation)
+        if isinstance(item_type, type) and issubclass(item_type, BaseModel):
+            return [_sanitize_dict_for_model(item, item_type) for item in value if isinstance(item, dict)]
+        if item_type is str:
+            return [str(item)[:2000] for item in value if isinstance(item, str) and item.strip()]
+        return value
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return _sanitize_dict_for_model(value if isinstance(value, dict) else {}, annotation)
+
+    unwrapped = annotation
+    type_args = typing.get_args(annotation)
+    if type_args and type(None) in type_args:
+        non_none = [a for a in type_args if a is not type(None)]
+        unwrapped = non_none[0] if non_none else annotation
+
+    if unwrapped is str:
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            value = str(value)
+        max_length = _field_max_length(field)
+        if max_length is not None and len(value) > max_length:
+            return value[: max_length - 1].rstrip() + "…" if max_length > 1 else value[:max_length]
+        return value
+
+    if unwrapped is bool:
+        return bool(value) if value is not None else False
+
+    if unwrapped in (int, float):
+        return value if isinstance(value, (int, float)) else None
+
+    return value
+
+
+def _sanitize_dict_for_model(data: dict, model: type[BaseModel]) -> dict:
+    if not isinstance(data, dict):
+        data = {}
+    sanitized = {}
+    for field_name, field in model.model_fields.items():
+        if field_name not in data:
+            continue
+        sanitized[field_name] = _sanitize_value_for_field(data[field_name], field)
+    return sanitized
+
+
 def _repair_full_analysis(parsed: dict) -> FullAnalysisSchema:
     if not isinstance(parsed, dict):
         parsed = {}
+    parsed = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
     raw_criteria = parsed.get("criteria")
     by_id = {}
     if isinstance(raw_criteria, list):
@@ -718,6 +1011,62 @@ def _repair_full_analysis(parsed: dict) -> FullAnalysisSchema:
     parsed["criteria"] = repaired_criteria
     parsed["fit_score"] = clamp_int(parsed.get("fit_score"), 0, 100, 0)
 
+    eligibility_raw = parsed.get("eligibility") if isinstance(parsed.get("eligibility"), dict) else {}
+
+    if isinstance(parsed.get("spend"), dict):
+        parsed["spend"] = _enforce_spend_integrity(dict(parsed["spend"]), eligibility_raw)
+    else:
+        estimate, basis = _compute_statutory_estimate(eligibility_raw)
+        parsed["spend"] = {
+            "estimated_min_inr_crore": estimate,
+            "estimated_basis": basis,
+            "estimated_is_computed": estimate is not None,
+        }
+
+    if isinstance(parsed.get("partners"), list):
+        tiered_partners = []
+        dropped = 0
+        for entry in parsed["partners"]:
+            if not isinstance(entry, dict):
+                continue
+            tier = _classify_partner_tier(entry)
+            if tier is None:
+                dropped += 1
+                continue
+            entry = dict(entry)
+            entry["confidence"] = tier
+            tiered_partners.append(entry)
+        if dropped:
+            logger.info("partner integrity guard dropped %d uncredible partner entries", dropped)
+        parsed["partners"] = tiered_partners
+
+    if isinstance(parsed.get("programmes"), list):
+        tiered_programmes = []
+        dropped = 0
+        for entry in parsed["programmes"]:
+            if not isinstance(entry, dict):
+                continue
+            tier = _classify_programme_tier(entry)
+            if tier is None:
+                dropped += 1
+                continue
+            entry = dict(entry)
+            entry["confidence"] = tier
+            tiered_programmes.append(entry)
+        if dropped:
+            logger.info("programme integrity guard dropped %d thin programme entries", dropped)
+        parsed["programmes"] = tiered_programmes
+
+    if isinstance(parsed.get("decision_makers"), list):
+        cleaned_decision_makers = []
+        for entry in parsed["decision_makers"]:
+            if not isinstance(entry, dict):
+                continue
+            entry = dict(entry)
+            entry["linkedin_url"] = _sanitize_linkedin_url(entry.get("linkedin_url", ""))
+            cleaned_decision_makers.append(entry)
+        parsed["decision_makers"] = cleaned_decision_makers
+
     for narrative_field in (
         "fit_rationale", "alignment_rationale", "delivery_model_evidence",
         "source_quality_assessment", "csr_head_note", "evidence_recency",
@@ -729,7 +1078,8 @@ def _repair_full_analysis(parsed: dict) -> FullAnalysisSchema:
 
     try:
         return FullAnalysisSchema.model_validate(parsed)
-    except ValidationError:
+    except ValidationError as exc:
+        logger.warning("full analysis validation failed, repairing containers error=%s", exc)
         parsed["spend"] = parsed.get("spend") if isinstance(parsed.get("spend"), dict) else {}
         parsed["contact_pathway"] = parsed.get("contact_pathway") if isinstance(parsed.get("contact_pathway"), dict) else {}
         parsed["rfp_signal"] = parsed.get("rfp_signal") if isinstance(parsed.get("rfp_signal"), dict) else {}
@@ -746,7 +1096,8 @@ def _repair_full_analysis(parsed: dict) -> FullAnalysisSchema:
         parsed["open_questions"] = parsed.get("open_questions") if isinstance(parsed.get("open_questions"), list) else []
         try:
             return FullAnalysisSchema.model_validate(parsed)
-        except ValidationError:
+        except ValidationError as exc2:
+            logger.error("full analysis validation failed after repair, using minimal fallback error=%s", exc2)
             return FullAnalysisSchema(
                 fit_score=clamp_int(parsed.get("fit_score"), 0, 100, 0),
                 criteria=[CriterionResultSchema(**c) for c in repaired_criteria],
@@ -797,213 +1148,88 @@ def _ensure_single_highlight(text: str, phrase_source: str) -> str:
     return text[:position] + "**" + text[position:position + len(phrase)] + "**" + text[position + len(phrase):]
 
 
-_TITLE_CASE_PHRASE_PATTERN = re.compile(
-    r"\b(?:[A-Z][a-zA-Z&()'\-]*\s+){0,4}[A-Z][a-zA-Z&()'\-]*"
-    r"(?:\s+(?:Project|Programme|Program|Academy|Initiative|Mission|Foundation|"
-    r"Trust|Fund|Fellowship|Scholarship|Chatbot|Campaign|Labs?))\b"
-)
-_GENERIC_PARTNER_STOPWORDS = {
-    "csr", "india", "the company", "this company", "tap", "ngo", "ngos",
-    "government", "govt", "delhi", "mumbai", "maharashtra",
-}
-_PARTNER_LIST_PATTERN = re.compile(
-    r"\b(?:named implementing partners?|implementing partners?|partners? like|"
-    r"partners? including|partners? such as|funds? implementing partners?"
-    r"(?: to deliver[^(]*)?)\s*\(?\s*([A-Z][\w&.'\- ]{1,60}"
-    r"(?:\s*,\s*[A-Z][\w&.'\- ]{1,60}){0,8}(?:\s+and\s+[A-Z][\w&.'\- ]{1,60})?)\)?",
-    re.IGNORECASE,
-)
-_PARTNERSHIP_MENTION_PATTERN = re.compile(
-    r"\b(?:through its|via its|its)\s+([A-Z][\w&.'\- ]{2,50}?)\s+partnership\b"
-    r"|\bpartnership with\s+([A-Z][\w&.'\- ]{2,50})\b"
-    r"|\b([A-Z][\w&.'\- ]{2,50}?)\s+(?:Foundation|Trust)\s+partnership\b",
-    re.IGNORECASE,
-)
-_NGO_FOUNDATION_PATTERN = re.compile(
-    r"\b([A-Z][a-zA-Z&.'\-]*(?:\s+[A-Z][a-zA-Z&.'\-]*){0,4}"
-    r"\s+(?:Foundation|Trust|NGO|Society|Charitable Trust))\b"
-)
-_MONEY_PATTERN = re.compile(
-    r"(₹\s?[\d,]+(?:\.\d+)?\s?(?:crore|cr\.?|lakh|lac)|"
-    r"(?:INR|Rs\.?)\s?[\d,]+(?:\.\d+)?\s?(?:crore|cr\.?|lakh|lac)?|"
-    r"[\d,]+(?:\.\d+)?\s?(?:crore|cr\.?)\b)",
-    re.IGNORECASE,
-)
-_PERCENT_MANDATE_PATTERN = re.compile(r"\b(\d(?:\.\d+)?)\s?%\s?(?:csr)?\s?(?:mandate|of)", re.IGNORECASE)
-_PERSON_NAME_PATTERN = re.compile(
-    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b"
-    r"(?:,?\s*(?:VP|Vice President|Head|Director|CEO|Officer|Manager|Lead)[^.]{0,60})?"
-)
-_STATE_NAME_PATTERN = re.compile(
-    r"\b(Delhi|Mumbai|Maharashtra|Karnataka|Bengaluru|Bangalore|Tamil Nadu|Chennai|"
-    r"Telangana|Hyderabad|Gujarat|Ahmedabad|West Bengal|Kolkata|Uttar Pradesh|Lucknow|"
-    r"Rajasthan|Jaipur|Punjab|Haryana|Kerala|Odisha|Bihar|Madhya Pradesh|Pune|"
-    r"Andhra Pradesh|Assam|Goa|Chandigarh)\b"
-)
-
-
-def _extract_named_entities(text: str, pattern: re.Pattern, limit: int) -> list[str]:
-    seen, out = set(), []
-    for match in pattern.finditer(text or ""):
-        candidate = (match.group(1) if match.groups() else match.group(0)).strip()
-        key = candidate.lower()
-        if len(candidate) < 4 or key in seen:
-            continue
-        seen.add(key)
-        out.append(candidate)
-        if len(out) >= limit:
-            break
-    return out
-
-
-def _extract_partner_list_names(text: str, limit: int) -> list[str]:
-    seen, out = set(), []
-    for match in _PARTNER_LIST_PATTERN.finditer(text or ""):
-        chunk = match.group(1)
-        chunk = re.sub(r"\s+and\s+", ", ", chunk)
-        for raw_name in chunk.split(","):
-            candidate = raw_name.strip(" .()")
-            key = candidate.lower()
-            if len(candidate) < 2 or key in _GENERIC_PARTNER_STOPWORDS or key in seen:
-                continue
-            seen.add(key)
-            out.append(candidate)
-            if len(out) >= limit:
-                return out
-    for match in _PARTNERSHIP_MENTION_PATTERN.finditer(text or ""):
-        for group in match.groups():
-            if not group:
-                continue
-            candidate = group.strip(" .()")
-            key = candidate.lower()
-            if len(candidate) < 2 or key in _GENERIC_PARTNER_STOPWORDS or key in seen:
-                continue
-            seen.add(key)
-            out.append(candidate)
-            if len(out) >= limit:
-                return out
-    return out
-
-
 def _existing_names(entries: list[dict]) -> set[str]:
     return {(entry.get("name") or "").strip().lower() for entry in entries if entry.get("name")}
 
 
-def _backfill_from_rationale(result: dict, rationale_text: str) -> None:
-    if not rationale_text or not rationale_text.strip():
-        return
+_NARRATIVE_PARTNERSHIP_PATTERN = re.compile(
+    r"\b(?:partnership|partnered|partners?)\s+with\s+"
+    r"((?:[A-Z][A-Za-z0-9&.\-]*)(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,4})"
+)
+_COMMON_WORD_STOPLIST = {
+    "the", "government", "governments", "ngos", "ngo", "local", "state", "central",
+    "schools", "communities", "partners", "various", "several", "multiple", "india",
+}
 
-    existing_programme_names = _existing_names(result.get("programmes", []))
-    for name in _extract_named_entities(rationale_text, _TITLE_CASE_PHRASE_PATTERN, 8):
-        if name.lower() in existing_programme_names:
-            continue
-        existing_programme_names.add(name.lower())
-        result.setdefault("programmes", []).append({
-            "name": name,
-            "description": "Referenced in the analysis narrative as a named initiative.",
-            "is_multi_year": "multi-year" in rationale_text.lower() or "sustained" in rationale_text.lower(),
-            "cohort_or_scale": "",
-            "source_excerpt": "",
-            "source": "",
-        })
 
-    existing_partner_names = _existing_names(result.get("partners", []))
-    partner_candidates = (
-        _extract_partner_list_names(rationale_text, 8)
-        + _extract_named_entities(rationale_text, _NGO_FOUNDATION_PATTERN, 6)
+def _extract_probable_partner_from_narrative(result: dict, company: str) -> dict | None:
+    narrative_fields = (
+        result.get("fit_rationale", ""),
+        result.get("alignment_rationale", ""),
+        result.get("delivery_model_evidence", ""),
+        result.get("csr_head_note", ""),
     )
-    for name in partner_candidates:
-        if name.lower() in existing_partner_names:
+    for text in narrative_fields:
+        if not text:
             continue
-        existing_partner_names.add(name.lower())
-        if "co-design" in rationale_text.lower():
-            relationship_type = "co-design"
-        elif re.search(r"implement(ing|ation) partner", rationale_text, re.IGNORECASE):
-            relationship_type = "implementer"
-        elif re.search(r"\bfund(s|ed|ing)?\b", rationale_text, re.IGNORECASE):
-            relationship_type = "funder"
-        else:
-            relationship_type = "unclear"
-        result.setdefault("partners", []).append({
-            "name": name,
-            "relationship_type": relationship_type,
-            "source_excerpt": "",
-            "source": "",
-        })
+        clean_text = text.replace("**", "")
+        for match in _NARRATIVE_PARTNERSHIP_PATTERN.finditer(clean_text):
+            candidate = match.group(1).strip().rstrip(".,;: ")
+            if not candidate or len(candidate) < 2:
+                continue
+            if candidate.strip().lower() in _COMMON_WORD_STOPLIST:
+                continue
+            if candidate.strip().lower() == company.strip().lower():
+                continue
+            if not re.match(r"^[A-Z]", candidate):
+                continue
+            return {
+                "name": candidate,
+                "relationship_type": "unclear",
+                "source_excerpt": (
+                    f"Named in the analysis narrative: \u201c...{match.group(0)}...\u201d — "
+                    "not independently confirmed in the structured evidence extraction."
+                ),
+                "source": "",
+                "confidence": "probable",
+            }
+    return None
 
-    spend = result.get("spend") or {}
-    if not spend.get("has_disclosed_budget"):
-        money_match = _MONEY_PATTERN.search(rationale_text)
-        percent_match = _PERCENT_MANDATE_PATTERN.search(rationale_text)
-        if money_match or percent_match:
-            if money_match:
-                display = money_match.group(0).strip()
-                if percent_match:
-                    display += f" ({percent_match.group(1)}% CSR mandate, inferred minimum)"
-            else:
-                display = f"~{percent_match.group(1)}% CSR mandate applies (exact spend not disclosed)"
-            spend["has_disclosed_budget"] = True
-            spend["display"] = display
-            spend["confidence"] = spend.get("confidence") or 35
-            spend["source_excerpt"] = "Derived from figures mentioned in the analysis narrative."
-            result["spend"] = spend
 
-    existing_geo_names = _existing_names(result.get("geographies", []))
-    for place in _extract_named_entities(rationale_text, _STATE_NAME_PATTERN, 6):
-        if place.lower() in existing_geo_names:
-            continue
-        existing_geo_names.add(place.lower())
-        result.setdefault("geographies", []).append({
-            "place": place,
-            "source_excerpt": "Mentioned in the analysis narrative.",
-            "source": "",
-        })
-
-    contact_pathway = result.get("contact_pathway") or {}
-    if not (contact_pathway.get("channel") or "").strip():
-        name_title_match = re.search(
-            r"(?:via|through|contact|approach)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\s*\(([^)]{3,60})\)",
-            rationale_text,
+def _reconcile_partners_with_narrative(result: dict, company: str) -> None:
+    if result.get("partners"):
+        return
+    candidate = _extract_probable_partner_from_narrative(result, company)
+    if candidate:
+        logger.info(
+            "partner reconciliation backfill added narrative-derived probable partner "
+            "company=%r partner=%r — LLM named this in prose but omitted it from the "
+            "structured array",
+            company, candidate["name"],
         )
-        if name_title_match:
-            contact_pathway["channel"] = (
-                f"Warm outreach via {name_title_match.group(1)} ({name_title_match.group(2)}), "
-                f"named in the analysis narrative as the recommended entry point."
-            )
-            result["contact_pathway"] = contact_pathway
-        else:
-            bare_name_match = re.search(
-                r"(?:via|through|contact|approach)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b",
-                rationale_text,
-            )
-            if bare_name_match:
-                contact_pathway["channel"] = (
-                    f"Warm outreach via {bare_name_match.group(1)}, "
-                    f"named in the analysis narrative as the recommended entry point."
-                )
-                result["contact_pathway"] = contact_pathway
+        result["partners"] = [candidate]
+        open_questions = result.get("open_questions") or []
+        note = f"Confirm the nature of {company}'s relationship with {candidate['name']} (funder, implementer, or co-designer) — surfaced from narrative text, not independently structured in the source evidence."
+        if note not in open_questions:
+            open_questions.append(note)
+        result["open_questions"] = open_questions[:5]
 
 
-def _backfill_contact_pathway_from_decision_makers(result: dict) -> None:
-    contact_pathway = result.get("contact_pathway") or {}
-    if (contact_pathway.get("channel") or "").strip():
+def _reconcile_programmes_with_narrative(result: dict, company: str) -> None:
+    if result.get("programmes"):
         return
-    decision_makers = [d for d in result.get("decision_makers", []) if (d.get("name") or "").strip()]
-    if not decision_makers:
-        return
-    decision_makers.sort(key=lambda d: d.get("public_facing_score", 0), reverse=True)
-    top = decision_makers[0]
-    title = (top.get("title") or "").strip()
-    name = top["name"].strip()
-    channel_text = (
-        f"No open call was found; the warmest path is likely a direct approach to {name}"
-        f"{f' ({title})' if title else ''} via {('their' if title else 'the')} CSR office."
-    )
-    contact_pathway["channel"] = _ensure_single_highlight(channel_text, name)
-    result["contact_pathway"] = contact_pathway
+    for partner in result.get("partners", []):
+        name = (partner.get("name") or "").strip()
+        excerpt = (partner.get("source_excerpt") or "")
+        if not name:
+            continue
+        if "narrative" not in excerpt.lower():
+            continue
 
 
-def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int = 0) -> dict:
+def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int = 0, sources: list | None = None) -> dict:
+    _reconcile_partners_with_narrative(result, company)
+    _reconcile_programmes_with_narrative(result, company)
     criteria = result.get("criteria", [])
     usable = [c for c in criteria if c.get("confidence", 0) > 0 and _is_positive_evidence(c.get("evidence", ""))]
     strongest = sorted(usable, key=lambda c: c.get("score", 0), reverse=True)
@@ -1020,21 +1246,14 @@ def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int
             pieces.append(f"the weakest is {bottom.lower()}")
         result["fit_rationale"] = _ensure_single_highlight(
             f"Based on the available evidence, {'; '.join(pieces)}. "
-            "This score reflects the balance of those signals rather than a single deciding factor.",
+            "This reflects the balance of confirmed signals rather than a single deciding factor.",
             top,
         )
 
-    for narrative_source in (
-        result.get("fit_rationale", ""),
-        result.get("csr_head_note", ""),
-        result.get("alignment_rationale", ""),
-        result.get("delivery_model_evidence", ""),
-        result.get("source_quality_assessment", ""),
-        *[c.get("evidence", "") for c in criteria],
-    ):
-        _backfill_from_rationale(result, narrative_source)
-
     _backfill_contact_pathway_from_decision_makers(result)
+
+    if sources:
+        _backfill_linkedin_urls_from_people_search(result, sources)
 
     if not result.get("alignment_rationale", "").strip():
         alignment_candidates = [
@@ -1068,9 +1287,8 @@ def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int
     if not result.get("source_quality_assessment", "").strip():
         if found_source_count > 0:
             result["source_quality_assessment"] = _ensure_single_highlight(
-                "Findings draw primarily on company-published material and press coverage rather than "
-                "independent third-party verification; figures and claims should be **checked against source** "
-                "before use.",
+                "Findings draw on the sources actually fetched for this company; figures and "
+                "claims should be **checked against source** before use.",
                 "checked against source",
             )
         else:
@@ -1102,7 +1320,7 @@ def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int
         )
 
     if result.get("overall_authenticity_score", 0) == 0 and found_source_count > 0:
-        result["overall_authenticity_score"] = 55
+        result["overall_authenticity_score"] = 40
 
     if result.get("fit_score", 0) == 0 and found_source_count > 0 and usable:
         alignment_ids = {"education_intervention", "stem", "tech_21cs", "public_schooling", "systems_change"}
@@ -1111,9 +1329,53 @@ def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int
             round((sum(c["score"] for c in relevant) / len(relevant)) / 5 * 100), 0, 100, 0
         )
         if inferred > 0:
-            result["fit_score"] = max(inferred, 45)
+            result["fit_score"] = inferred
 
     return result
+
+
+def _backfill_contact_pathway_from_decision_makers(result: dict) -> None:
+    contact_pathway = result.get("contact_pathway") or {}
+    if (contact_pathway.get("channel") or "").strip():
+        return
+    decision_makers = [d for d in result.get("decision_makers", []) if (d.get("name") or "").strip()]
+    if not decision_makers:
+        return
+    decision_makers.sort(key=lambda d: d.get("public_facing_score", 0), reverse=True)
+    top = decision_makers[0]
+    title = (top.get("title") or "").strip()
+    name = top["name"].strip()
+    channel_text = (
+        f"No open call was found; the warmest path is likely a direct approach to {name}"
+        f"{f' ({title})' if title else ''} via {('their' if title else 'the')} CSR office."
+    )
+    contact_pathway["channel"] = _ensure_single_highlight(channel_text, name)
+    result["contact_pathway"] = contact_pathway
+
+
+def _backfill_linkedin_urls_from_people_search(result: dict, sources: list) -> None:
+    people_source = next((s for s in sources if s.get("source_name") == "people_search"), None)
+    hits = (people_source or {}).get("people_hits", [])
+    if not hits:
+        return
+    hits_by_name = {}
+    for hit in hits:
+        name_key = (hit.get("name") or "").strip().lower()
+        url = (hit.get("url") or "").strip()
+        if name_key and url and name_key not in hits_by_name:
+            hits_by_name[name_key] = url
+    for decision_maker in result.get("decision_makers", []):
+        if decision_maker.get("linkedin_url"):
+            continue
+        name_key = (decision_maker.get("name") or "").strip().lower()
+        matched_url = hits_by_name.get(name_key)
+        if not matched_url:
+            for candidate_name, candidate_url in hits_by_name.items():
+                if name_key and (name_key in candidate_name or candidate_name in name_key):
+                    matched_url = candidate_url
+                    break
+        if matched_url:
+            decision_maker["linkedin_url"] = _sanitize_linkedin_url(matched_url)
 
 
 async def analyze_company(company: str, mission: str, sources: list, sources_manifest: str, temperature: float = 0.0) -> dict | None:
@@ -1140,6 +1402,12 @@ async def analyze_company(company: str, mission: str, sources: list, sources_man
         prompt = full_company_analysis_prompt(company, mission, evidence_text, sources_manifest)
         prompt_tokens = estimate_tokens(prompt)
         shrink_attempts += 1
+
+    if shrink_attempts:
+        logger.info(
+            "analyze_company prompt shrunk company=%r attempts=%d final_input_budget=%d final_prompt_tokens=%d",
+            company, shrink_attempts, input_budget, prompt_tokens,
+        )
 
     if prompt_tokens > output_ceiling:
         logger.error(
@@ -1199,6 +1467,7 @@ async def analyze_company(company: str, mission: str, sources: list, sources_man
         partner["source"] = _sanitize_source(partner.get("source", ""), valid_sources)
     for person in result["decision_makers"]:
         person["source"] = _sanitize_source(person.get("source", ""), valid_sources)
+        person["linkedin_url"] = _sanitize_linkedin_url(person.get("linkedin_url", ""))
     for geography in result["geographies"]:
         geography["source"] = _sanitize_source(geography.get("source", ""), valid_sources)
     for flag in result["red_flags"]:
@@ -1217,7 +1486,13 @@ async def analyze_company(company: str, mission: str, sources: list, sources_man
     result["llm_fallback_used"] = not bool(parsed)
 
     found_source_count = sum(1 for s in sources if s.get("status") == "FOUND")
-    result = _backfill_narrative_gaps(result, company, found_source_count)
+    logger.info(
+        "analyze_company model output company=%r fit_score=%d spend_disclosed=%s partners=%d programmes=%d fallback_used=%s",
+        company, result["fit_score"], result["spend"].get("has_disclosed_budget"),
+        len(result["partners"]), len(result["programmes"]), result["llm_fallback_used"],
+    )
+
+    result = _backfill_narrative_gaps(result, company, found_source_count, sources=sources)
 
     for programme in result["programmes"]:
         if not programme.get("source_excerpt") and programme.get("description"):
@@ -1228,6 +1503,11 @@ async def analyze_company(company: str, mission: str, sources: list, sources_man
     if result["spend"].get("has_disclosed_budget") and not result["spend"].get("source_excerpt"):
         result["spend"]["source_excerpt"] = "Figure derived from the analysis narrative."
 
+    logger.info(
+        "analyze_company DONE company=%r final_fit_score=%d final_partners=%d final_programmes=%d final_spend_disclosed=%s estimated_computed=%s",
+        company, result["fit_score"], len(result["partners"]), len(result["programmes"]),
+        result["spend"].get("has_disclosed_budget"), result["spend"].get("estimated_is_computed"),
+    )
     return result
 
 
@@ -1279,6 +1559,7 @@ async def select_important_links(company: str, search_results: list[dict]) -> li
         if link.url not in valid_urls:
             continue
         out.append({"label": link.label.strip()[:80], "url": link.url, "relevance": link.relevance.strip()[:140]})
+    logger.info("select_important_links company=%r candidates=%d selected=%d", company, len(search_results), len(out))
     return out[:8]
 
 
@@ -1332,13 +1613,15 @@ async def match_people_from_search(company: str, hits: list[dict]) -> list[dict]
             "title": person.title.strip(),
             "is_current_csr_role": person.is_current_csr_role,
             "match_confidence": clamp_int(person.match_confidence, 0, 100, 0),
-            "linkedin_url": person.linkedin_url.strip(),
+            "linkedin_url": _sanitize_linkedin_url(person.linkedin_url),
             "tenure_status": person.tenure_status if person.tenure_status in
                 {"NEW_UNDER_1YR", "ESTABLISHED_1_3YR", "ENTRENCHED_3YR_PLUS", "UNKNOWN"} else "UNKNOWN",
             "reasoning": person.reasoning.strip(),
         })
     out.sort(key=lambda p: p["match_confidence"], reverse=True)
-    return [p for p in out if p["is_current_csr_role"] and p["match_confidence"] >= 50][:10]
+    filtered = [p for p in out if p["is_current_csr_role"] and p["match_confidence"] >= 50][:10]
+    logger.info("match_people_from_search company=%r hits_in=%d matched_out=%d", company, len(hits), len(filtered))
+    return filtered
 
 
 def eligibility_and_group_prompt(company: str, evidence_text: str) -> str:
@@ -1349,19 +1632,22 @@ EVIDENCE:
 {evidence_text[:4000]}
 \"\"\"
 
-Section 135 thresholds (any one triggers it): net worth INR 500cr+, turnover INR 1000cr+, or net profit INR 5cr+.
+Section 135 thresholds (any one triggers it): net worth INR 500cr+, turnover INR 1000cr+, or net profit INR 5cr+. These are business-scale thresholds used only to judge mandate applicability — never restate them as CSR spend.
 
-plausibly_mandated: LIKELY if a figure plausibly clears a threshold; UNLIKELY if clearly smaller; else UNKNOWN.
+plausibly_mandated: LIKELY if a figure plausibly clears a threshold; UNLIKELY if clearly smaller; else UNKNOWN. Also extract net_worth_turnover_inr_crore and net_profit_inr_crore as plain numbers (INR crore) whenever explicitly stated, null otherwise — these feed a separate, code-computed estimate and must never be written into any CSR spend field.
 routed_through_group: true only if a separate parent/group foundation is explicitly named.
 
 Return ONLY valid JSON:
-{{"eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>"}}, "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>"}}}}"""
+{{"eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number or null>, "net_profit_inr_crore": <number or null>}}, "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>"}}}}"""
 
 
 async def check_csr_eligibility(company: str, evidence_text: str) -> dict:
     if not evidence_text.strip():
         return {
-            "eligibility": {"plausibly_mandated": "UNKNOWN", "reasoning": "", "net_worth_turnover_signal": ""},
+            "eligibility": {
+                "plausibly_mandated": "UNKNOWN", "reasoning": "", "net_worth_turnover_signal": "",
+                "net_worth_turnover_inr_crore": None, "net_profit_inr_crore": None,
+            },
             "group_foundation": {"routed_through_group": False, "foundation_name": "", "explanation": ""},
         }
     raw_reply = await call_anthropic_chat(
@@ -1373,11 +1659,15 @@ async def check_csr_eligibility(company: str, evidence_text: str) -> dict:
     parsed = parse_json_response(raw_reply)
     eligibility = parsed.get("eligibility") or {}
     group_foundation = parsed.get("group_foundation") or {}
+    net_worth_turnover = eligibility.get("net_worth_turnover_inr_crore")
+    net_profit = eligibility.get("net_profit_inr_crore")
     return {
         "eligibility": {
             "plausibly_mandated": eligibility.get("plausibly_mandated", "UNKNOWN") if eligibility.get("plausibly_mandated") in {"LIKELY", "UNLIKELY", "UNKNOWN"} else "UNKNOWN",
             "reasoning": (eligibility.get("reasoning") or "").strip()[:280],
             "net_worth_turnover_signal": (eligibility.get("net_worth_turnover_signal") or "").strip()[:200],
+            "net_worth_turnover_inr_crore": net_worth_turnover if isinstance(net_worth_turnover, (int, float)) else None,
+            "net_profit_inr_crore": net_profit if isinstance(net_profit, (int, float)) else None,
         },
         "group_foundation": {
             "routed_through_group": bool(group_foundation.get("routed_through_group", False)),
@@ -1385,6 +1675,228 @@ async def check_csr_eligibility(company: str, evidence_text: str) -> dict:
             "explanation": (group_foundation.get("explanation") or "").strip()[:240],
         },
     }
+
+
+def merge_eligibility_into_analysis(result: dict, eligibility_result: dict) -> dict:
+    if not eligibility_result:
+        return result
+    current_eligibility = result.get("eligibility") or {}
+    incoming_eligibility = eligibility_result.get("eligibility") or {}
+
+    if current_eligibility.get("plausibly_mandated", "UNKNOWN") == "UNKNOWN" and incoming_eligibility.get("plausibly_mandated") != "UNKNOWN":
+        current_eligibility["plausibly_mandated"] = incoming_eligibility.get("plausibly_mandated", "UNKNOWN")
+    if not current_eligibility.get("reasoning") and incoming_eligibility.get("reasoning"):
+        current_eligibility["reasoning"] = incoming_eligibility["reasoning"]
+    if not current_eligibility.get("net_worth_turnover_signal") and incoming_eligibility.get("net_worth_turnover_signal"):
+        current_eligibility["net_worth_turnover_signal"] = incoming_eligibility["net_worth_turnover_signal"]
+    if current_eligibility.get("net_worth_turnover_inr_crore") is None and incoming_eligibility.get("net_worth_turnover_inr_crore") is not None:
+        current_eligibility["net_worth_turnover_inr_crore"] = incoming_eligibility["net_worth_turnover_inr_crore"]
+    if current_eligibility.get("net_profit_inr_crore") is None and incoming_eligibility.get("net_profit_inr_crore") is not None:
+        current_eligibility["net_profit_inr_crore"] = incoming_eligibility["net_profit_inr_crore"]
+    result["eligibility"] = current_eligibility
+
+    current_group = result.get("group_foundation") or {}
+    incoming_group = eligibility_result.get("group_foundation") or {}
+    if not current_group.get("routed_through_group") and incoming_group.get("routed_through_group"):
+        current_group["routed_through_group"] = True
+        current_group["foundation_name"] = incoming_group.get("foundation_name", "")
+        current_group["explanation"] = incoming_group.get("explanation", "")
+    result["group_foundation"] = current_group
+
+    if not result["spend"].get("has_disclosed_budget"):
+        estimate, basis = _compute_statutory_estimate(current_eligibility)
+        if estimate is not None and result["spend"].get("estimated_min_inr_crore") is None:
+            result["spend"]["estimated_min_inr_crore"] = estimate
+            result["spend"]["estimated_basis"] = basis
+            result["spend"]["estimated_is_computed"] = True
+
+    return result
+
+
+def _classify_question_category(question: str) -> str:
+    lowered = (question or "").lower()
+    for category, keywords in QUESTION_CATEGORY_KEYWORDS.items():
+        if any(keyword in lowered for keyword in keywords):
+            return category
+    return "csr_policy"
+
+
+def _rank_questions_for_resolution(open_questions: list[str], analysis: dict) -> list[tuple]:
+    ranked = []
+    for question in open_questions:
+        category = _classify_question_category(question)
+        priority = 0
+        if category == "education_programme":
+            priority = 3
+        elif category == "csr_budget" and not (analysis.get("spend") or {}).get("has_disclosed_budget"):
+            priority = 2
+        elif category == "decision_maker" and not analysis.get("decision_makers"):
+            priority = 2
+        elif category == "ngo_partner" and not analysis.get("partners"):
+            priority = 1
+        else:
+            priority = 0
+        ranked.append((priority, category, question))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+def question_resolution_prompt(company: str, question: str, followup_evidence: str) -> str:
+    return f"""A CSR analyst had this specific open question about {company}: "{question}"
+
+New evidence was just gathered specifically to try to answer it:
+\"\"\"
+{followup_evidence[:2500]}
+\"\"\"
+
+Does this new evidence answer the question? Only say answered=true if the evidence contains a concrete, specific fact directly resolving the question — not a generic or sector-wide statement. If it answers, give a one-sentence answer citing only what's in the evidence, and a confidence 0-100. If the evidence still does not resolve it, set answered=false, answer to a short note on what's still missing, and confidence to 0.
+
+Optionally, if the answer contains a structured fact that maps cleanly onto one of: education_programme_name, education_programme_description, csr_spend_display, csr_spend_fiscal_year, csr_spend_inr_crore, decision_maker_name, decision_maker_title, decision_maker_linkedin_url, ngo_partner_name, ngo_partner_relationship — include it in "updates" as key-value pairs. Otherwise leave updates empty.
+
+Return ONLY valid JSON:
+{{"answered": <bool>, "answer": "<one sentence>", "confidence": <0-100>, "updates": {{}}}}"""
+
+
+async def resolve_single_question(company: str, question: str, category: str, followup_evidence: str) -> dict | None:
+    if not followup_evidence.strip():
+        return None
+    raw_reply = await call_anthropic_chat(
+        question_resolution_prompt(company, question, followup_evidence),
+        temperature=0.0,
+        max_tokens=QUESTION_RESOLUTION_MAX_TOKENS,
+        caller=f"resolve_question:{company}:{category}",
+    )
+    parsed = parse_json_response(raw_reply)
+    try:
+        validated = QuestionResolutionSchema.model_validate(parsed)
+    except ValidationError:
+        return None
+    if not validated.answered or validated.confidence < 40:
+        return None
+    return {
+        "question": question,
+        "category": category,
+        "answer": validated.answer.strip(),
+        "confidence": clamp_int(validated.confidence, 0, 100, 0),
+        "updates": validated.updates or {},
+    }
+
+
+def apply_question_resolution_to_analysis(result: dict, resolution: dict) -> dict:
+    updates = resolution.get("updates") or {}
+    category = resolution.get("category", "")
+
+    if category == "education_programme" and updates.get("education_programme_name"):
+        already_named = {(p.get("name") or "").strip().lower() for p in result.get("programmes", [])}
+        name = updates["education_programme_name"].strip()
+        if name and name.lower() not in already_named:
+            result.setdefault("programmes", []).append({
+                "name": name,
+                "description": updates.get("education_programme_description", resolution.get("answer", ""))[:220],
+                "is_multi_year": False,
+                "cohort_or_scale": "",
+                "source_excerpt": resolution.get("answer", "")[:200],
+                "source": "",
+                "confidence": "probable",
+            })
+
+    if category == "csr_budget" and updates.get("csr_spend_display"):
+        spend = result.get("spend") or {}
+        if not spend.get("has_disclosed_budget"):
+            spend["display"] = updates["csr_spend_display"]
+            spend["fiscal_year"] = updates.get("csr_spend_fiscal_year", "")
+            inr_crore = updates.get("csr_spend_inr_crore")
+            spend["inr_crore"] = inr_crore if isinstance(inr_crore, (int, float)) else spend.get("inr_crore")
+            spend["has_disclosed_budget"] = True
+            spend["confidence"] = min(resolution.get("confidence", 50), 70)
+            spend["source_excerpt"] = resolution.get("answer", "")[:200]
+            result["spend"] = spend
+
+    if category == "decision_maker" and updates.get("decision_maker_name"):
+        already_named = {(d.get("name") or "").strip().lower() for d in result.get("decision_makers", [])}
+        name = updates["decision_maker_name"].strip()
+        if name and name.lower() not in already_named:
+            result.setdefault("decision_makers", []).append({
+                "name": name,
+                "title": updates.get("decision_maker_title", ""),
+                "public_facing_score": min(resolution.get("confidence", 40), 60),
+                "tenure_status": "UNKNOWN",
+                "tenure_evidence": "",
+                "source_excerpt": resolution.get("answer", "")[:200],
+                "source": "",
+                "linkedin_url": _sanitize_linkedin_url(updates.get("decision_maker_linkedin_url", "")),
+            })
+
+    if category == "ngo_partner" and updates.get("ngo_partner_name"):
+        already_named = {(p.get("name") or "").strip().lower() for p in result.get("partners", [])}
+        name = updates["ngo_partner_name"].strip()
+        if name and name.lower() not in already_named:
+            result.setdefault("partners", []).append({
+                "name": name,
+                "relationship_type": updates.get("ngo_partner_relationship", "unclear"),
+                "source_excerpt": resolution.get("answer", "")[:200],
+                "source": "",
+                "confidence": "probable",
+            })
+
+    open_questions = result.get("open_questions") or []
+    remaining = [q for q in open_questions if q != resolution.get("question")]
+    verified_note = f"Verified via follow-up search: {resolution.get('answer', '')}"[:200]
+    result["open_questions"] = ([verified_note] + remaining)[:5]
+    result.setdefault("resolved_questions", []).append({
+        "question": resolution.get("question", ""),
+        "answer": resolution.get("answer", ""),
+        "confidence": resolution.get("confidence", 0),
+    })
+    return result
+
+
+async def resolve_open_questions(company: str, result: dict, search_module, search_cfg: dict,
+                                  quota_guard=None, registry=None,
+                                  max_questions: int = MAX_OPEN_QUESTIONS_TO_RESOLVE) -> dict:
+    open_questions = result.get("open_questions") or []
+    if not open_questions:
+        return result
+
+    ranked = _rank_questions_for_resolution(open_questions, result)
+    to_resolve = [item for item in ranked if item[0] > 0][:max_questions]
+    if not to_resolve:
+        return result
+
+    result.setdefault("resolved_questions", [])
+    any_resolved = False
+
+    for _, category, question in to_resolve:
+        if anthropic_cooldown_remaining_seconds() > 0:
+            logger.info("resolve_open_questions stopping early company=%r reason=cooldown_active", company)
+            break
+        try:
+            followup_source = await search_module.run_targeted_queries(
+                company, category, search_cfg, quota_guard=quota_guard, registry=registry,
+            )
+        except Exception as exc:
+            logger.warning("resolve_open_questions followup search failed company=%r category=%r error=%s", company, category, exc)
+            continue
+
+        if followup_source.get("status") != "FOUND":
+            logger.info("resolve_open_questions no new evidence company=%r category=%r question=%r", company, category, question)
+            continue
+
+        resolution = await resolve_single_question(company, question, category, followup_source.get("text", ""))
+        if resolution is None:
+            logger.info("resolve_open_questions unresolved company=%r category=%r question=%r", company, category, question)
+            continue
+
+        logger.info(
+            "resolve_open_questions RESOLVED company=%r category=%r confidence=%d answer=%r",
+            company, category, resolution["confidence"], resolution["answer"][:120],
+        )
+        result = apply_question_resolution_to_analysis(result, resolution)
+        any_resolved = True
+
+    result["open_questions_resolution_attempted"] = True
+    result["open_questions_resolution_found_new_evidence"] = any_resolved
+    return result
 
 
 def strategic_insight_prompt(company: str, mission: str, state: str, fit_score: int, tier_label: str, analysis: dict) -> str:
@@ -1398,6 +1910,11 @@ def strategic_insight_prompt(company: str, mission: str, state: str, fit_score: 
     eligibility = analysis.get("eligibility", {}) or {}
     group_foundation = analysis.get("group_foundation", {}) or {}
     sector = analysis.get("sector", {}) or {}
+    resolved_questions = analysis.get("resolved_questions") or []
+    resolved_text = "; ".join(f"{r['question']} → {r['answer']}" for r in resolved_questions) or "none"
+    estimate_note = ""
+    if not spend.get("has_disclosed_budget") and spend.get("estimated_is_computed"):
+        estimate_note = f"ESTIMATED (NOT DISCLOSED) STATUTORY MINIMUM: ₹{spend.get('estimated_min_inr_crore')} crore — {spend.get('estimated_basis', '')}"
     return f"""Senior CSR partnerships analyst writing the lead narrative of a due-diligence brief on {company} for education NGO TAP.
 
 MISSION: {mission}
@@ -1406,19 +1923,21 @@ FIT RATIONALE FROM ANALYSIS: {analysis.get('fit_rationale', '')}
 DELIVERY MODEL: {analysis.get('delivery_model', 'UNCLEAR')} — {analysis.get('delivery_model_evidence', '')}
 ALIGNMENT: {analysis.get('overall_semantic_alignment', 0)}/100
 CONTACT PATHWAY: {analysis.get('contact_pathway', {}).get('channel', '')}
-SPEND TREND: {spend.get('trend_direction', 'UNKNOWN')} · budget disclosed: {spend.get('has_disclosed_budget', False)}
+SPEND TREND: {spend.get('trend_direction', 'UNKNOWN')} · CSR budget disclosed: {spend.get('has_disclosed_budget', False)}
+{estimate_note}
 SECTOR: {sector.get('sector', 'UNKNOWN')}
 CSR-135 ELIGIBILITY: {eligibility.get('plausibly_mandated', 'UNKNOWN')}
 GROUP FOUNDATION: {group_foundation.get('routed_through_group', False)} {('via ' + group_foundation.get('foundation_name', '')) if group_foundation.get('foundation_name') else ''}
+FOLLOW-UP VERIFICATION RESULTS: {resolved_text}
 
 SCORECARD:
 {criteria_lines}
 
 RED FLAGS: {red_flags_text}
 
-Write one 180-300 word narrative in a fair, encouraging tone — not harsh or dismissive, and not inflating either. Lead with genuine strengths before caveats. States plainly whether/why this is a good fit grounded in the analyst's own reasoning above; names strongest/weakest dimensions without dwelling on the weakest; flags group-foundation routing and who to actually approach if relevant; notes eligibility read if uncertain; gives one concrete next step matching tier/model/pathway; flowing prose, not bullets. Do not treat unknown geography or unknown similarity to existing partners as a weakness. Treat open questions (undisclosed budget, unconfirmed public-schooling focus, etc.) as items to verify next, not as reasons the fit itself is weak.
+Write one 180-300 word narrative in a measured, evidence-grounded tone — neither harsh nor inflated. Lead with genuine, evidence-backed strengths before caveats. State plainly whether/why this is a good fit based only on the analyst reasoning above; if spend.has_disclosed_budget is false, do not describe any revenue/turnover figure as CSR capacity — call it business scale only, and if an estimated statutory minimum is given above, you may cite it but must call it an estimate, never a disclosed figure. If follow-up verification results are present and not "none", weave in what was specifically checked and confirmed or ruled out — this is stronger evidence than the original pass and should be named as such. Name strongest/weakest dimensions without dwelling on the weakest; flag group-foundation routing and who to actually approach if relevant; note eligibility read if uncertain; give one concrete next step matching tier/model/pathway; flowing prose, not bullets. Do not treat unknown geography or unknown similarity to existing partners as a weakness. Treat any remaining open questions as items to verify next, not reasons the fit itself is weak.
 
-{HIGHLIGHT_RULE.replace("(applies to fit_rationale, alignment_rationale, delivery_model_evidence, source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, and every criterion's evidence field)", "(applies to this narrative)")}
+{HIGHLIGHT_RULE.replace("(fit_rationale, alignment_rationale, delivery_model_evidence, source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, and every criterion evidence field)", "(this narrative)")}
 Use exactly one bolded phrase somewhere in the narrative.
 
 Return ONLY valid JSON:

@@ -75,11 +75,16 @@ SOURCE_PRIORITY_WEIGHT = {
     "national_csr_portal": 1.2,
     "mca_via_search": 1.05,
     "partner_search": 1.0,
+    "education_programme_search": 1.15,
     "plans_search": 1.0,
     "people_search": 0.95,
-    "sector_eligibility_search": 0.95,
+    "sector_eligibility_search": 0.75,
     "web_search_snippet": 0.8,
 }
+
+STRICT_COMPANY_GATE_SOURCES = frozenset({
+    "sector_eligibility_search",
+})
 
 BOILERPLATE_SENTENCE_PATTERNS = [
     re.compile(r"^(home|about us?|contact us?|careers?|sign in|log ?in|sign up|register)\b", re.IGNORECASE),
@@ -116,6 +121,16 @@ _TRIGRAM_HEAD_TERMS = frozenset([
     "central", "request", "call", "grant",
 ])
 
+_AGGREGATE_SECTOR_LANGUAGE_PATTERN = re.compile(
+    r"\b\d{1,3}(?:\.\d+)?\s?%\s+of\s+(?:it|bpm|companies|firms|organi[sz]ations|"
+    r"the\s+sector|the\s+industry)\b|"
+    r"\b(?:most|many|several|some)\s+(?:it|bpm|companies|firms|organi[sz]ations)\s+"
+    r"(?:in\s+(?:the\s+)?(?:sector|industry))?\s*(?:partner|work|collaborate|engage)\b|"
+    r"\bcompanies\s+in\s+(?:the\s+)?(?:it|bpm|this)\s+sector\b|"
+    r"\bindustry-wide\b|\backross\s+the\s+sector\b",
+    re.IGNORECASE,
+)
+
 
 def is_boilerplate_sentence(sentence: str) -> bool:
     stripped = sentence.strip()
@@ -124,6 +139,12 @@ def is_boilerplate_sentence(sentence: str) -> bool:
     if sum(1 for ch in stripped if ch.isalpha()) < len(stripped) * 0.4:
         return True
     return any(pattern.search(stripped) for pattern in BOILERPLATE_SENTENCE_PATTERNS)
+
+
+def is_generic_sector_statement(sentence: str, company_tokens: list[str]) -> bool:
+    if company_tokens and any(token in sentence.lower() for token in company_tokens):
+        return False
+    return bool(_AGGREGATE_SECTOR_LANGUAGE_PATTERN.search(sentence))
 
 
 def normalize_document(raw_text: str) -> str:
@@ -237,10 +258,18 @@ def _numeric_richness_score(sentence: str) -> float:
     return score
 
 
-def score_sentence_relevance(sentence: str, company_tokens: list[str]) -> float:
+def score_sentence_relevance(sentence: str, company_tokens: list[str], source_name: str = "") -> float:
     lowered = sentence.lower()
     length = len(sentence)
     if length < 25:
+        return -1.0
+
+    company_mentioned = bool(company_tokens) and any(token in lowered for token in company_tokens)
+
+    if source_name in STRICT_COMPANY_GATE_SOURCES and not company_mentioned:
+        return -1.0
+
+    if is_generic_sector_statement(sentence, company_tokens):
         return -1.0
 
     score = 0.0
@@ -250,8 +279,10 @@ def score_sentence_relevance(sentence: str, company_tokens: list[str]) -> float:
             score += weight
             distinct_signal_hits += 1
 
-    if company_tokens and any(token in lowered for token in company_tokens):
+    if company_mentioned:
         score += 4.0
+    elif source_name in STRICT_COMPANY_GATE_SOURCES:
+        score -= 4.0
 
     if any(term in lowered for term in FINANCIAL_TERMS):
         score += 3.0
@@ -303,7 +334,7 @@ def structure_source_text(source_name: str, raw_text: str, company: str, max_sen
         fuzzy_key = _dedup_key(sentence)
         if fuzzy_key and global_seen_keys is not None and fuzzy_key in global_seen_keys:
             continue
-        relevance = score_sentence_relevance(sentence, company_tokens)
+        relevance = score_sentence_relevance(sentence, company_tokens, source_name=source_name)
         if relevance <= 0:
             continue
         local_seen_keys.add(exact_key)
@@ -367,7 +398,8 @@ def structure_all_sources(sources: list, company: str, max_sentences_per_source:
             global_seen_keys=global_seen_keys,
         )
 
-    return [structured_by_name[s.get("source_name", "source")] for s in found_sources]
+    return [structured_by_name[s.get("source_name", "source")] for s in found_sources
+            if structured_by_name[s.get("source_name", "source")]["sentences"]]
 
 
 @functools.lru_cache(maxsize=1)

@@ -19,6 +19,19 @@ class SourceRecord(BaseModel):
     domain: str = ""
     people_hits: list[dict[str, Any]] = []
     plan_hits: list[dict[str, Any]] = []
+    india_location_hits: list[dict[str, Any]] = []
+    source_number: int | None = None
+
+
+class SourceBankEntry(BaseModel):
+    number: int = 0
+    label: str = ""
+    source_name: str = ""
+    kind: Literal["core", "child"] = "core"
+    url: str = ""
+    domain: str = ""
+    excerpt: str = ""
+    parent_number: int | None = None
 
 
 class ScoringTier(BaseModel):
@@ -46,6 +59,7 @@ class CriterionScore(BaseModel):
     evidence: str = ""
     reasoning: str = ""
     source: str = ""
+    cited_sources: list[int] = []
 
 
 class SpendYear(BaseModel):
@@ -54,6 +68,7 @@ class SpendYear(BaseModel):
     display: str = ""
     source: str = ""
     source_excerpt: str = ""
+    source_number: int | None = None
 
 
 class SpendDetail(BaseModel):
@@ -63,6 +78,7 @@ class SpendDetail(BaseModel):
     confidence: int = 0
     source_excerpt: str = ""
     source: str = ""
+    source_number: int | None = None
     trend_direction: str = "UNKNOWN"
     trend_evidence: str = ""
     trend_source: str = ""
@@ -76,6 +92,7 @@ class ProgrammeDetail(BaseModel):
     cohort_or_scale: str = ""
     source_excerpt: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class PartnerDetail(BaseModel):
@@ -85,6 +102,7 @@ class PartnerDetail(BaseModel):
     similarity_to_tap: int = 0
     source_excerpt: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class GeographyDetail(BaseModel):
@@ -92,6 +110,7 @@ class GeographyDetail(BaseModel):
     is_tap_state: bool = False
     source_excerpt: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class RedFlagDetail(BaseModel):
@@ -99,12 +118,14 @@ class RedFlagDetail(BaseModel):
     severity: str = ""
     explanation: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class ContactPathwayDetail(BaseModel):
     channel: str = ""
     evidence: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class RfpSignalDetail(BaseModel):
@@ -112,6 +133,7 @@ class RfpSignalDetail(BaseModel):
     channel: str = ""
     evidence: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class BoardAffinityDetail(BaseModel):
@@ -120,6 +142,7 @@ class BoardAffinityDetail(BaseModel):
     connection: str = ""
     source_excerpt: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class VolunteeringDetail(BaseModel):
@@ -128,6 +151,7 @@ class VolunteeringDetail(BaseModel):
     description: str = ""
     source_excerpt: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class GroupFoundationDetail(BaseModel):
@@ -136,6 +160,7 @@ class GroupFoundationDetail(BaseModel):
     explanation: str = ""
     source_excerpt: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class EligibilityDetail(BaseModel):
@@ -143,6 +168,7 @@ class EligibilityDetail(BaseModel):
     reasoning: str = ""
     net_worth_turnover_signal: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class SectorDetail(BaseModel):
@@ -160,6 +186,7 @@ class DecisionMakerDetail(BaseModel):
     tenure_evidence: str = ""
     source_excerpt: str = ""
     source: str = ""
+    source_number: int | None = None
 
 
 class CompanyAnalysis(BaseModel):
@@ -168,6 +195,7 @@ class CompanyAnalysis(BaseModel):
     delivery_model: str = "UNCLEAR"
     delivery_model_evidence: str = ""
     delivery_model_source: str = ""
+    delivery_model_source_number: int | None = None
     spend: SpendDetail = SpendDetail()
     programmes: list[ProgrammeDetail] = []
     partners: list[PartnerDetail] = []
@@ -192,17 +220,23 @@ class CompanyAnalysis(BaseModel):
 class DecisionMaker(BaseModel):
     name: str = ""
     title: str = ""
+    company_affiliation: str = ""
     is_current_csr_role: bool = False
+    india_location_signal: bool = False
     match_confidence: int = 0
     linkedin_url: str = ""
+    url: str = ""
     tenure_status: str = "UNKNOWN"
     reasoning: str = ""
+    confidence: str = "LOW"
+    source_number: int | None = None
 
 
 class ImportantLink(BaseModel):
     label: str = ""
     url: str = ""
     relevance: str = ""
+    source_number: int | None = None
 
 
 class ScreeningResult(BaseModel):
@@ -217,6 +251,7 @@ class ScreeningResult(BaseModel):
     sources: list[SourceRecord] = []
     source_links: list[dict[str, Any]] = []
     important_links: list[ImportantLink] = []
+    source_bank: list[SourceBankEntry] = []
     cache_key: tuple[str, str, str] | None = None
 
 

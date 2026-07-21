@@ -1,8 +1,26 @@
-{% macro cite(source_name) %}
-  {%- if source_name and source_urls.get(source_name) -%}
-    <a class="cite" href="{{ source_urls[source_name] }}" target="_blank" rel="noopener">{{ source_labels.get(source_name, source_name) }}</a>
-  {%- elif source_name -%}
-    <span class="cite-plain">{{ source_labels.get(source_name, source_name) }}</span>
+{% macro resolve_ref(source_ref) %}
+  {%- if source_ref is number or (source_ref is string and source_ref.isdigit()) -%}
+    {%- set entry = source_bank.get(source_ref | int) -%}
+    {%- if entry -%}{{ entry.url }}|{{ entry.number }}|{{ entry.label }}{%- endif -%}
+  {%- elif source_ref and source_bank_by_name.get(source_ref) -%}
+    {%- set entry = source_bank_by_name.get(source_ref) -%}
+    {{ entry.url }}|{{ entry.number }}|{{ entry.label }}
+  {%- elif source_ref and source_urls.get(source_ref) -%}
+    {{ source_urls[source_ref] }}||{{ source_labels.get(source_ref, source_ref) }}
+  {%- elif source_ref -%}
+    ||{{ source_labels.get(source_ref, source_ref) }}
+  {%- endif -%}
+{% endmacro %}
+
+{% macro cite(source_ref) %}
+  {%- set resolved = resolve_ref(source_ref) | trim -%}
+  {%- if resolved -%}
+    {%- set url, number, label = resolved.split('|') -%}
+    {%- if url -%}
+      <a class="cite" href="{{ url }}" target="_blank" rel="noopener">{{ '[' + number + ']' if number else '' }} {{ label }}</a>
+    {%- else -%}
+      <span class="cite-plain">{{ '[' + number + ']' if number else '' }} {{ label }}</span>
+    {%- endif -%}
   {%- endif -%}
 {% endmacro %}
 
@@ -11,6 +29,35 @@
   {%- for part in parts -%}
     {%- if loop.index is odd -%}{{ part }}{%- else -%}<span class="hl">{{ part }}</span>{%- endif -%}
   {%- endfor -%}
+{% endmacro %}
+
+{% macro evidence_line(text, source_ref) %}
+  {%- set resolved = resolve_ref(source_ref) | trim -%}
+  {%- set resolved_url = resolved.split('|')[0] if resolved else '' -%}
+  {%- if resolved_url -%}
+    <a class="evidence-link" href="{{ resolved_url }}" target="_blank" rel="noopener" title="Open source">{{ mark(text) }}</a>
+  {%- else -%}
+    {{ mark(text) }}
+  {%- endif -%}
+{% endmacro %}
+
+{% macro confidence_tag(tier) %}
+  {%- if tier == 'probable' -%}
+    <span class="tag tag-probable" title="Named in the evidence but without an explicit relationship statement — verify before relying on this.">Probable</span>
+  {%- else -%}
+    <span class="tag tag-confirmed" title="Explicit relationship or detail stated in the evidence.">Confirmed</span>
+  {%- endif -%}
+{% endmacro %}
+
+{% macro person_name(person) %}
+  {%- if person.linkedin_url -%}
+    <a class="person-name-link" href="{{ person.linkedin_url }}" target="_blank" rel="noopener" title="Open LinkedIn profile">
+      {{ person.name }}
+      <svg class="link-arrow" width="10" height="10" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M7 17L17 7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M8 7H17V16" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </a>
+  {%- else -%}
+    {{ person.name }}
+  {%- endif -%}
 {% endmacro %}
 
 <div class="report">
@@ -80,7 +127,7 @@
     {% for flag in analysis.red_flags %}
       <div class="note note-{{ 'bad' if flag.severity == 'high' else 'warn' }}">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 9V13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 17H12.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/></svg>
-        <span><b>{{ flag.flag }}</b> ({{ flag.severity }}) — {{ flag.explanation }} {{ cite(flag.source) }}</span>
+        <span><b>{{ flag.flag }}</b> ({{ flag.severity }}) — {{ evidence_line(flag.explanation, flag.source) }}</span>
       </div>
     {% endfor %}
   {% endif %}
@@ -88,21 +135,21 @@
   {% if eligibility and eligibility.plausibly_mandated == 'UNLIKELY' %}
     <div class="note note-warn">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 9V13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 17H12.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/></svg>
-      <span>Section 135 CSR mandate looks unlikely to apply — {{ eligibility.reasoning }} {{ cite(eligibility.source) }}</span>
+      <span>Section 135 CSR mandate looks unlikely to apply — {{ evidence_line(eligibility.reasoning, eligibility.source) }}</span>
     </div>
   {% endif %}
 
   {% if group_foundation and group_foundation.routed_through_group %}
     <div class="note note-warn">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 9V13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 17H12.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/></svg>
-      <span>CSR is likely routed through {{ group_foundation.foundation_name or 'a separate group foundation' }} rather than this entity's own CSR team — {{ group_foundation.explanation }} {{ cite(group_foundation.source) }}</span>
+      <span>CSR is likely routed through {{ group_foundation.foundation_name or 'a separate group foundation' }} rather than this entity's own CSR team — {{ evidence_line(group_foundation.explanation, group_foundation.source) }}</span>
     </div>
   {% endif %}
 
   {% if rfp_signal and rfp_signal.present %}
     <div class="note note-good">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M20 6L9 17L4 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <span>Open outreach signal detected via {{ rfp_signal.channel }} — {{ rfp_signal.evidence }} {{ cite(rfp_signal.source) }}</span>
+      <span>Open outreach signal detected via {{ rfp_signal.channel }} — {{ evidence_line(rfp_signal.evidence, rfp_signal.source) }}</span>
     </div>
   {% endif %}
 
@@ -130,7 +177,7 @@
               </div>
               <div class="bar-meta">
                 <span class="conf-pill">confidence {{ c.confidence }}%</span>
-                <span class="evidence-line">{{ mark(c.evidence) }} {{ cite(c.source) }}</span>
+                <span class="evidence-line">{{ evidence_line(c.evidence, c.source) }}</span>
               </div>
             </div>
           {% else %}
@@ -149,7 +196,7 @@
       <section class="section">
         <h2>Delivery model</h2>
         <div class="panel">
-          <p><b>{{ analysis.delivery_model }}</b> — {{ mark(analysis.delivery_model_evidence) if analysis.delivery_model_evidence else 'The evidence gathered did not clearly indicate whether this company funds partners or runs programmes directly.' }} {{ cite(analysis.delivery_model_source) }}</p>
+          <p><b>{{ analysis.delivery_model }}</b> — {{ evidence_line(analysis.delivery_model_evidence, analysis.delivery_model_source) if analysis.delivery_model_evidence else 'The evidence gathered did not clearly indicate whether this company funds partners or runs programmes directly.' }}</p>
         </div>
       </section>
 
@@ -164,7 +211,7 @@
           {% endif %}
           <p class="mt-14"><b>Section 135 mandate:</b> {{ eligibility.plausibly_mandated if eligibility and eligibility.plausibly_mandated else 'UNKNOWN' }}</p>
           {% if eligibility and eligibility.reasoning %}
-            <p class="panel-footnote">{{ eligibility.reasoning }}{% if eligibility.net_worth_turnover_signal %} — {{ eligibility.net_worth_turnover_signal }}{% endif %} {{ cite(eligibility.source) }}</p>
+            <p class="panel-footnote">{{ evidence_line(eligibility.reasoning, eligibility.source) }}{% if eligibility.net_worth_turnover_signal %} — {{ eligibility.net_worth_turnover_signal }}{% endif %}</p>
           {% endif %}
         </div>
       </section>
@@ -174,13 +221,23 @@
         <div class="panel">
           {% if spend and spend.has_disclosed_budget %}
             <p><b>{{ spend.display }}</b>{% if spend.fiscal_year %} · {{ spend.fiscal_year }}{% endif %} <span class="conf-pill">confidence {{ spend.confidence }}%</span></p>
-            <p class="panel-footnote">{{ spend.source_excerpt }} {{ cite(spend.source) }}</p>
-          {% else %}
+            <p class="panel-footnote">{{ evidence_line(spend.source_excerpt, spend.source) }}</p>
+          {% elif spend and spend.estimated_is_computed and spend.estimated_min_inr_crore %}
+            <p>
+              <span class="tag tag-estimate">Estimated</span>
+              <b>~₹{{ spend.estimated_min_inr_crore }} crore</b>
+              <span class="panel-footnote-inline">statutory minimum, not a disclosed figure</span>
+            </p>
+            <p class="panel-footnote">{{ spend.estimated_basis }}</p>
+          {% elif eligibility and eligibility.net_worth_turnover_signal %}
             <p class="none">No disclosed CSR budget figure found in the sources fetched.</p>
+            <p class="panel-footnote">Business scale is known ({{ eligibility.net_worth_turnover_signal }}), but a statutory-minimum estimate needs a disclosed <b>net profit</b> figure specifically — revenue/turnover alone isn't a valid input to the 2% Section 135 formula, so no estimate is shown. See Sector &amp; eligibility above for the business-scale figure on record.</p>
+          {% else %}
+            <p class="none">No disclosed CSR budget figure found in the sources fetched, and no net profit or business-scale figure was available to estimate a statutory minimum.</p>
           {% endif %}
           {% if spend and spend.trend_direction and spend.trend_direction != 'UNKNOWN' %}
             <p class="mt-12"><b>Trend: {{ spend.trend_direction }}</b></p>
-            <p class="panel-footnote">{{ spend.trend_evidence }} {{ cite(spend.trend_source) }}</p>
+            <p class="panel-footnote">{{ evidence_line(spend.trend_evidence, spend.trend_source) }}</p>
           {% endif %}
           {% if spend and spend.history %}
             <div class="table-scroll">
@@ -188,7 +245,7 @@
                 <thead><tr><th>Fiscal year</th><th>Amount</th><th>Source</th></tr></thead>
                 <tbody>
                   {% for h in spend.history %}
-                    <tr><td>{{ h.fiscal_year }}</td><td>{{ h.display }}</td><td>{{ cite(h.source) }}</td></tr>
+                    <tr><td>{{ h.fiscal_year }}</td><td>{{ evidence_line(h.display, h.source) }}</td><td>{{ cite(h.source) }}</td></tr>
                   {% endfor %}
                 </tbody>
               </table>
@@ -204,12 +261,17 @@
             <ul>
               {% for p in analysis.programmes %}
                 <li>
-                  <b>{{ p.name }}</b>{% if p.is_multi_year %} <span class="pill-green">multi-year</span>{% endif %}
+                  <b>{{ p.name }}</b>
+                  {{ confidence_tag(p.confidence) }}
+                  {% if p.is_multi_year %} <span class="pill-green">multi-year</span>{% endif %}
                   {% if p.cohort_or_scale %}<span class="pill">{{ p.cohort_or_scale }}</span>{% endif %}
-                  <div class="evidence">{{ p.description }}{% if p.source_excerpt %} — {{ p.source_excerpt }}{% endif %} {{ cite(p.source) }}</div>
+                  <div class="evidence">{{ evidence_line(p.description, p.source) }}{% if p.source_excerpt %} — {{ evidence_line(p.source_excerpt, p.source) }}{% endif %}</div>
                 </li>
               {% endfor %}
             </ul>
+            {% if analysis.programmes | selectattr('confidence', 'equalto', 'probable') | list %}
+              <p class="panel-footnote">Programmes tagged <b>Probable</b> are named in the evidence without a fully confirmed supporting detail — verify before citing.</p>
+            {% endif %}
           {% else %}
             <p class="none">No named programmes found in sources.</p>
           {% endif %}
@@ -224,11 +286,15 @@
               {% for p in analysis.partners %}
                 <li>
                   <b>{{ p.name }}</b>
+                  {{ confidence_tag(p.confidence) }}
                   <span class="pill">{{ p.relationship_type }}</span>
-                  <div class="evidence">{{ p.source_excerpt }} {{ cite(p.source) }}</div>
+                  <div class="evidence">{{ evidence_line(p.source_excerpt, p.source) }}</div>
                 </li>
               {% endfor %}
             </ul>
+            {% if analysis.partners | selectattr('confidence', 'equalto', 'probable') | list %}
+              <p class="panel-footnote">Partners tagged <b>Probable</b> are named alongside {{ company }} in the evidence without an explicit funder/implementer statement — verify the relationship before outreach.</p>
+            {% endif %}
           {% else %}
             <p class="none">No named partners found in sources.</p>
           {% endif %}
@@ -240,14 +306,14 @@
         <div class="panel">
           <p><b>Board / promoter education affinity:</b>
             {% if board_affinity and board_affinity.present %}
-              {{ board_affinity.person_name }} — {{ board_affinity.connection }} {{ cite(board_affinity.source) }}
+              {{ board_affinity.person_name }} — {{ evidence_line(board_affinity.connection, board_affinity.source) }}
             {% else %}
               <span class="none">No named board or promoter affinity found.</span>
             {% endif %}
           </p>
           <p class="mt-12"><b>Employee volunteering / payroll giving:</b>
             {% if volunteering and volunteering.present %}
-              {{ volunteering.programme_name }} — {{ volunteering.description }} {{ cite(volunteering.source) }}
+              {{ volunteering.programme_name }} — {{ evidence_line(volunteering.description, volunteering.source) }}
             {% else %}
               <span class="none">No named volunteering programme found.</span>
             {% endif %}
@@ -272,9 +338,9 @@
       <section class="section">
         <h2>Contact pathway</h2>
         <div class="panel">
-          <p>{{ mark(contact_pathway.channel) if contact_pathway and contact_pathway.channel else 'No concrete outreach channel was identified in the fetched sources — a named decision-maker, if any appear below, is the next best option.' }}</p>
+          <p>{{ evidence_line(contact_pathway.channel, contact_pathway.source) if contact_pathway and contact_pathway.channel else 'No concrete outreach channel was identified in the fetched sources — a named decision-maker, if any appear below, is the next best option.' }}</p>
           {% if contact_pathway and contact_pathway.evidence %}
-            <p class="panel-footnote">{{ contact_pathway.evidence }} {{ cite(contact_pathway.source) }}</p>
+            <p class="panel-footnote">{{ evidence_line(contact_pathway.evidence, contact_pathway.source) }}</p>
           {% endif %}
         </div>
       </section>
@@ -329,11 +395,22 @@
           <h2>CSR decision-makers</h2>
           <div class="panel links">
             {% for person in decision_makers %}
-              <a class="link-item" href="{{ person.url or ('https://www.linkedin.com/search/results/people/?keywords=' + person.name) }}" target="_blank" rel="noopener">
-                <span class="link-label">{{ person.name }}{% if person.title %} — {{ person.title }}{% endif %}</span>
-              </a>
+              <div class="person-card">
+                <div class="person-card-top">
+                  <span class="link-label">{{ person_name(person) }}{% if person.title %} — {{ person.title }}{% endif %}</span>
+                </div>
+                {% if person.company_affiliation %}
+                  <span class="link-relevance">{{ person.company_affiliation }}</span>
+                {% endif %}
+                {% if person.tenure_status and person.tenure_status != 'UNKNOWN' %}
+                  <span class="pill">{{ person.tenure_status | replace('_', ' ') | title }}</span>
+                {% endif %}
+                {% if person.source_excerpt %}
+                  <div class="link-relevance">{{ evidence_line(person.source_excerpt, person.source) }}</div>
+                {% endif %}
+              </div>
             {% endfor %}
-            <p class="panel-footnote">Shown directly from search results — not filtered by AI. Always verify before outreach.</p>
+            <p class="panel-footnote">Names and roles are drawn from search results and the analysis model — not filtered by hand. Always verify before outreach. Click a name to open their LinkedIn profile.</p>
           </div>
         </section>
       {% endif %}
@@ -355,20 +432,14 @@
 
       {% set tried_source_links = source_links | rejectattr('status', 'equalto', 'NOT_TRIED') | list %}
       {% set found_source_links = tried_source_links | selectattr('status', 'equalto', 'FOUND') | list %}
-      {% if tried_source_links %}
+      {% if found_source_links %}
         <section class="section">
-          <h2>Sources checked</h2>
-          <div class="panel links">
-            {% for s in tried_source_links %}
-              <a class="link-item source-link source-link-{{ 'found' if s.status == 'FOUND' else 'missing' }}" href="{{ s.url }}" target="_blank" rel="noopener" {% if not s.url %}data-no-url{% endif %}>
-                <span class="link-label">
-                  <span class="source-dot"></span>
-                  {{ s.label }}
-                  {% if s.is_pdf %}<span class="pill">PDF</span>{% endif %}
-                </span>
-                <span class="link-relevance">{{ 'Found' if s.status == 'FOUND' else 'Not found' }}{% if s.url %} · {{ s.url }}{% endif %}</span>
-              </a>
+          <h2>Sources</h2>
+          <div class="panel links panel-simple-list">
+            {% for s in found_source_links %}
+              <a class="source-row" href="{{ s.url }}" target="_blank" rel="noopener">{{ s.label }}</a>
             {% endfor %}
+            <p class="panel-footnote">Every source fetched for this run. Citations throughout this report link back to these same sources — click any evidence line, citation, or source below to open it.</p>
           </div>
         </section>
       {% endif %}
@@ -400,6 +471,44 @@
 
   <p class="footnote">FundFinder · fundraising@theapprenticeproject.org · Every score, figure, and claim above is generated by AI analysis of publicly fetched sources — verify before outreach.</p>
 </div>
+
+<style>
+  .tag {
+    display: inline-block;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    padding: 1px 7px;
+    border-radius: 999px;
+    margin-left: 6px;
+    vertical-align: middle;
+    cursor: default;
+  }
+  .tag-confirmed {
+    background: #E6F5F3;
+    color: #146B65;
+    border: 1px solid #B7E4DF;
+  }
+  .tag-probable {
+    background: #FEF7DC;
+    color: #8A6200;
+    border: 1px solid #F1DFA0;
+  }
+  .tag-estimate {
+    background: #FEF3E7;
+    color: #B4530A;
+    border: 1px solid #F2CFA6;
+    margin-left: 0;
+    margin-right: 6px;
+  }
+  .panel-footnote-inline {
+    font-size: 0.8rem;
+    color: #6B7280;
+    font-style: italic;
+    margin-left: 6px;
+  }
+</style>
 
 <script>
   document.querySelectorAll('.bar-fill[data-pct]').forEach(function (el) {

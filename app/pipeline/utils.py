@@ -228,8 +228,26 @@ def build_sources_manifest(sources: list) -> str:
     for source in sources:
         if source.get("status") == "NOT_TRIED":
             continue
-        lines.append(f"{source.get('source_name', '')} | {source.get('status', '')} | {source.get('url', '')}")
+        number = source.get("source_number")
+        prefix = f"[{number}] " if number else ""
+        lines.append(
+            f"{prefix}{source.get('source_name', '')} | {source.get('status', '')} | {source.get('url', '')}"
+        )
     return "\n".join(lines)
+
+
+def merge_manifest_with_registry(sources_manifest: str, registry) -> str:
+    manifest_lines = registry.as_manifest_lines()
+    if not manifest_lines:
+        return sources_manifest
+    registry_block = (
+        "NUMBERED SOURCE INDEX — cite facts using the bracketed number exactly as shown, "
+        "e.g. [3], and never invent a number that is not listed here:\n"
+        + "\n".join(manifest_lines)
+    )
+    if not sources_manifest:
+        return registry_block
+    return sources_manifest + "\n\n" + registry_block
 
 
 def to_json(value) -> str:

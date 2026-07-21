@@ -20,15 +20,22 @@ FLAG_FILL_HIGH = PatternFill("solid", fgColor="FBEAEA")
 FLAG_FILL_MEDIUM = PatternFill("solid", fgColor="FEF7DC")
 UNAVAILABLE_FILL = PatternFill("solid", fgColor="FBEAEA")
 LOW_CONF_FILL = PatternFill("solid", fgColor="FEF7DC")
+ESTIMATE_FILL = PatternFill("solid", fgColor="FEF3E7")
+PROBABLE_FILL = PatternFill("solid", fgColor="FEF7DC")
 BANNER_FILL = PatternFill("solid", fgColor="0F3D3E")
+LINK_FONT_COLOR = "0A66C2"
+
 WHITE_BOLD = Font(name=ARIAL, bold=True, color="FFFFFF", size=11)
 BANNER_TITLE = Font(name=ARIAL, bold=True, color="F5C518", size=14)
 BANNER_SUB = Font(name=ARIAL, color="B8E3E0", size=9)
 TEAL_BOLD = Font(name=ARIAL, bold=True, color="0F3D3E", size=10)
 YELLOW_BOLD = Font(name=ARIAL, bold=True, color="8A6200", size=10)
+AMBER_BOLD = Font(name=ARIAL, bold=True, color="B4530A", size=10)
 BOLD = Font(name=ARIAL, bold=True, size=10)
 BODY = Font(name=ARIAL, size=10)
 SMALL = Font(name=ARIAL, size=9, color="666666")
+LINK_FONT = Font(name=ARIAL, size=10, color=LINK_FONT_COLOR, underline="single", bold=True)
+
 WRAP = Alignment(wrap_text=True, vertical="top")
 WRAP_CENTER = Alignment(wrap_text=True, vertical="center", horizontal="center")
 LEFT_TOP = Alignment(wrap_text=True, vertical="top", horizontal="left")
@@ -94,7 +101,7 @@ def _banner(ws, title_text, subtitle_text, col_span):
     return 4
 
 
-def _header(ws, row, texts, col_widths=None):
+def _header(ws, row, texts):
     ws.row_dimensions[row].height = 30
     for col, t in enumerate(texts, 1):
         c = ws.cell(row=row, column=col, value=t)
@@ -120,6 +127,27 @@ def _row(ws, row, values, fonts=None, fill=None, highlight_col_indices=None, ali
     return row + 1
 
 
+def _row_with_link(ws, row, values, url, link_col_index, fonts=None, fill=None, alignments=None):
+    for col, v in enumerate(values, 1):
+        display_value = _strip_highlight_markers(v) if isinstance(v, str) else v
+        c = ws.cell(row=row, column=col, value=display_value)
+        c.alignment = (alignments or [WRAP] * len(values))[col - 1]
+        c.border = THIN
+        if col - 1 == link_col_index and url:
+            c.hyperlink = url
+            c.font = LINK_FONT
+        else:
+            c.font = (fonts or [BODY] * len(values))[col - 1]
+        if fill:
+            c.fill = fill
+        elif isinstance(v, str) and v == LLM_UNAVAILABLE_EVIDENCE:
+            c.fill = UNAVAILABLE_FILL
+        elif isinstance(v, str) and _HIGHLIGHT_PATTERN.search(v):
+            match = _HIGHLIGHT_PATTERN.search(v)
+            c.comment = Comment(f"Highlighted in report: {match.group(1)}", "FundFinder")
+    return row + 1
+
+
 def _source_hierarchy_note(source_name: str) -> str:
     hierarchy = {
         "india_csr_page": "1 — company's own filings (the spine)",
@@ -137,6 +165,30 @@ def _source_hierarchy_note(source_name: str) -> str:
     return hierarchy.get(source_name, "")
 
 
+def _source_url_lookup(sources: list) -> dict:
+    lookup = {}
+    for source in sources:
+        name = source.get("source_name", "")
+        url = source.get("url", "")
+        if name and url and name not in lookup:
+            lookup[name] = url
+    return lookup
+
+
+def _resolve_evidence_url(source_ref, source_url_lookup: dict) -> str:
+    if not source_ref:
+        return ""
+    return source_url_lookup.get(source_ref, "")
+
+
+def _confidence_display(confidence: str) -> str:
+    return "Probable" if (confidence or "").strip().lower() == "probable" else "Confirmed"
+
+
+def _confidence_fill(confidence: str):
+    return PROBABLE_FILL if (confidence or "").strip().lower() == "probable" else None
+
+
 async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> bytes:
     analysis = result.get("analysis") or {}
     breakdown = result.get("score_breakdown", {}) or {}
@@ -148,6 +200,7 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
     state = result.get("state", "")
     now = datetime.datetime.now().strftime("%d %B %Y")
     has_analysis = bool(analysis)
+    source_url_lookup = _source_url_lookup(sources)
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -210,10 +263,16 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
     if has_analysis:
         for cri in analysis.get("criteria", []):
             row_start = r
-            r = _row(ws, r, [
+            evidence_url = _resolve_evidence_url(cri.get("source", ""), source_url_lookup)
+            values = [
                 cri["name"], cri["score"], f"{cri.get('confidence', 0)}%",
                 cri.get("evidence", ""), cri.get("reasoning", ""),
-            ], alignments=[LEFT_TOP, WRAP_CENTER, WRAP_CENTER, WRAP, WRAP], highlight_col_indices={3})
+            ]
+            alignments = [LEFT_TOP, WRAP_CENTER, WRAP_CENTER, WRAP, WRAP]
+            if evidence_url:
+                r = _row_with_link(ws, r, values, evidence_url, link_col_index=3, alignments=alignments)
+            else:
+                r = _row(ws, r, values, alignments=alignments, highlight_col_indices={3})
             if cri.get("confidence", 100) < 50:
                 ws.cell(row=row_start, column=3).fill = LOW_CONF_FILL
         avg_conf = breakdown.get("average_confidence_pct", "")
@@ -237,13 +296,41 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
     r = _header(ws, r, ["Figure / fact", "Value", "Source / confidence", "Evidence excerpt"])
     if has_analysis:
         spend = analysis.get("spend", {}) or {}
-        spend_display = spend.get("display") or "Not publicly disclosed"
-        r = _row(ws, r, [
-            "Latest-year India CSR spend",
-            f"{spend_display} ({spend.get('fiscal_year', '')})".strip(),
-            f"confidence {spend.get('confidence', 0)}%",
-            spend.get("source_excerpt", ""),
-        ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP])
+        eligibility = analysis.get("eligibility", {}) or {}
+        if spend.get("has_disclosed_budget"):
+            spend_display = spend.get("display") or "Not publicly disclosed"
+            spend_url = _resolve_evidence_url(spend.get("source", ""), source_url_lookup)
+            spend_values = [
+                "Latest-year India CSR spend",
+                f"{spend_display} ({spend.get('fiscal_year', '')})".strip(),
+                f"confidence {spend.get('confidence', 0)}%",
+                spend.get("source_excerpt", ""),
+            ]
+            spend_alignments = [LEFT_TOP, WRAP, WRAP_CENTER, WRAP]
+            if spend_url:
+                r = _row_with_link(ws, r, spend_values, spend_url, link_col_index=3, alignments=spend_alignments)
+            else:
+                r = _row(ws, r, spend_values, alignments=spend_alignments)
+        elif spend.get("estimated_is_computed") and spend.get("estimated_min_inr_crore") is not None:
+            r = _row(ws, r, [
+                "Latest-year India CSR spend",
+                f"~₹{spend['estimated_min_inr_crore']:g} crore (ESTIMATED, not disclosed)",
+                "statutory minimum",
+                spend.get("estimated_basis", ""),
+            ], fonts=[TEAL_BOLD, AMBER_BOLD, SMALL, SMALL], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP], fill=ESTIMATE_FILL)
+        elif eligibility.get("net_worth_turnover_signal"):
+            r = _row(ws, r, [
+                "Latest-year India CSR spend",
+                "Not publicly disclosed",
+                "—",
+                f"Business scale is known ({eligibility['net_worth_turnover_signal']}), but no net profit figure was "
+                "available to compute a statutory-minimum estimate — the 2% rule applies to profit, not revenue/turnover.",
+            ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP])
+        else:
+            r = _row(ws, r, [
+                "Latest-year India CSR spend", "Not publicly disclosed", "—",
+                "No CSR figure, net profit, or business-scale figure found to support an estimate.",
+            ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP])
         if spend.get("trend_direction") and spend.get("trend_direction") != "UNKNOWN":
             r = _row(ws, r, [
                 "CSR spend trend", spend.get("trend_direction", ""), "—", spend.get("trend_evidence", ""),
@@ -253,7 +340,6 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
                 f"CSR spend — {entry.get('fiscal_year', '')}", entry.get("display", ""),
                 "—", entry.get("source_excerpt", ""),
             ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP])
-        eligibility = analysis.get("eligibility", {}) or {}
         r = _row(ws, r, [
             "Section 135 mandate", eligibility.get("plausibly_mandated", "UNKNOWN"),
             eligibility.get("net_worth_turnover_signal", ""), eligibility.get("reasoning", ""),
@@ -275,45 +361,69 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
     ws.row_dimensions[r + 1].height = 24
     note_cell = ws.cell(
         row=r + 1, column=1,
-        value="Every figure above must trace to a primary source. Double-verify before use; no proxy or assumed data.",
+        value="Every figure above must trace to a primary source. Double-verify before use; no proxy or assumed data. Amber rows are code-computed statutory-minimum estimates, not disclosed figures.",
     )
     note_cell.font = SMALL
     ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=4)
     ws.freeze_panes = "A5"
 
-    ws = _sheet(wb, "4. Programmes & Partners", [38, 15, 13, 20, 62])
-    r = _banner(ws, "Programmes & Partners", "Named programmes and funded implementation partners", 5)
-    r = _header(ws, r, ["Programme / partner", "Type", "Multi-year?", "Scale / relationship", "Evidence"])
+    ws = _sheet(wb, "4. Programmes & Partners", [36, 13, 13, 20, 58])
+    r = _banner(ws, "Programmes & Partners", "Named programmes and partners, tagged Confirmed or Probable", 5)
+    r = _header(ws, r, ["Programme / partner", "Type", "Confidence", "Scale / relationship", "Evidence"])
     if has_analysis:
         for programme in analysis.get("programmes", []) or []:
+            row_start = r
             r = _row(ws, r, [
                 programme.get("name", ""), "Programme",
-                "Yes" if programme.get("is_multi_year") else "One-off / unclear",
-                programme.get("cohort_or_scale", ""),
+                _confidence_display(programme.get("confidence", "confirmed")),
+                ("Multi-year · " if programme.get("is_multi_year") else "") + programme.get("cohort_or_scale", ""),
                 f"{programme.get('description', '')} — {programme.get('source_excerpt', '')}".strip(" —"),
             ], alignments=[LEFT_TOP, WRAP_CENTER, WRAP_CENTER, WRAP, WRAP])
+            fill = _confidence_fill(programme.get("confidence"))
+            if fill:
+                ws.cell(row=row_start, column=3).fill = fill
+                ws.cell(row=row_start, column=3).font = YELLOW_BOLD
         for partner in analysis.get("partners", []) or []:
+            row_start = r
             r = _row(ws, r, [
                 partner.get("name", ""), "Partner",
-                "—", partner.get("relationship_type", ""), partner.get("source_excerpt", ""),
+                _confidence_display(partner.get("confidence", "confirmed")),
+                partner.get("relationship_type", ""), partner.get("source_excerpt", ""),
             ], alignments=[LEFT_TOP, WRAP_CENTER, WRAP_CENTER, WRAP, WRAP])
+            fill = _confidence_fill(partner.get("confidence"))
+            if fill:
+                ws.cell(row=row_start, column=3).fill = fill
+                ws.cell(row=row_start, column=3).font = YELLOW_BOLD
         if not (analysis.get("programmes") or analysis.get("partners")):
             r = _row(ws, r, ["No programmes or partners found in fetched sources", "", "", "", ""])
     else:
         r = _row(ws, r, ["All programmes/partners", "", "", "", LLM_UNAVAILABLE_EVIDENCE], fill=UNAVAILABLE_FILL)
+    ws.row_dimensions[r + 1].height = 24
+    tier_note_cell = ws.cell(
+        row=r + 1, column=1,
+        value="Confirmed = explicit relationship/detail stated in evidence. Probable = named but not independently confirmed — verify before outreach.",
+    )
+    tier_note_cell.font = SMALL
+    ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=5)
     ws.freeze_panes = "A5"
 
     ws = _sheet(wb, "5. Decision-Makers", [26, 32, 18, 56, 30])
     r = _banner(ws, "Decision-Makers", "Named CSR contacts and tenure signals — verify before outreach", 5)
-    r = _header(ws, r, ["Name", "Title", "Tenure status", "Evidence", "Source"])
+    r = _header(ws, r, ["Name", "Title", "Tenure status", "Evidence", "Profile"])
     if decision_makers:
         for person in decision_makers:
             tenure_display = str(person.get("tenure_status", "UNKNOWN")).replace("_", " ").title()
             row_start = r
-            r = _row(ws, r, [
+            linkedin_url = person.get("url") or person.get("linkedin_url", "")
+            values = [
                 person.get("name", ""), person.get("title", ""), tenure_display,
-                person.get("source_excerpt", ""), SOURCE_LABELS.get(person.get("source", ""), person.get("source", "")),
-            ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP, WRAP])
+                person.get("source_excerpt", ""), "View profile" if linkedin_url else "—",
+            ]
+            alignments = [LEFT_TOP, WRAP, WRAP_CENTER, WRAP, WRAP_CENTER]
+            if linkedin_url:
+                r = _row_with_link(ws, r, values, linkedin_url, link_col_index=4, alignments=alignments)
+            else:
+                r = _row(ws, r, values, alignments=alignments)
             if person.get("tenure_status") == "NEW_UNDER_1YR":
                 ws.cell(row=row_start, column=3).fill = HIGHLIGHT_FILL
                 ws.cell(row=row_start, column=3).font = YELLOW_BOLD
@@ -384,31 +494,41 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
     r = _row(ws, r, ["Strategic insight", result.get("strategic_insight", "")], highlight_col_indices={1})
     ws.freeze_panes = "A5"
 
-    ws = _sheet(wb, "9. Sources & Links", [32, 16, 52, 26])
+    ws = _sheet(wb, "9. Sources & Links", [32, 16, 40, 26])
     r = _banner(ws, "Sources & Links", "Every source fetched for this specific company run", 4)
-    r = _header(ws, r, ["Source", "Status", "URL", "Hierarchy note"])
+    r = _header(ws, r, ["Source", "Status", "Open", "Hierarchy note"])
     for source in sources:
         if source.get("status") == "NOT_TRIED":
             continue
         row_start = r
-        r = _row(ws, r, [
-            SOURCE_LABELS.get(source.get("source_name", ""), source.get("source_name", "")),
-            source.get("status", ""),
-            source.get("url", ""), _source_hierarchy_note(source.get("source_name", "")),
-        ], alignments=[LEFT_TOP, WRAP_CENTER, WRAP, WRAP])
+        url = source.get("url", "")
+        label = SOURCE_LABELS.get(source.get("source_name", ""), source.get("source_name", ""))
+        values = [label, source.get("status", ""), "Open source" if url else "—",
+                  _source_hierarchy_note(source.get("source_name", ""))]
+        alignments = [LEFT_TOP, WRAP_CENTER, WRAP_CENTER, WRAP]
+        if url:
+            r = _row_with_link(ws, r, values, url, link_col_index=2, alignments=alignments)
+        else:
+            r = _row(ws, r, values, alignments=alignments)
         if source.get("status") == "FOUND":
             ws.cell(row=row_start, column=2).fill = SUB_FILL
-            ws.cell(row=row_start, column=2).font = TEAL_BOLD
+            if not ws.cell(row=row_start, column=2).hyperlink:
+                ws.cell(row=row_start, column=2).font = TEAL_BOLD
     if important_links:
         r += 1
-        r = _header(ws, r, ["Important link (triaged)", "Relevance", "URL", ""])
+        r = _header(ws, r, ["Important link (triaged)", "Relevance", "Open", ""])
         for link in important_links:
-            r = _row(ws, r, [link.get("label", ""), link.get("relevance", ""), link.get("url", ""), ""],
-                      alignments=[LEFT_TOP, WRAP, WRAP, WRAP])
+            url = link.get("url", "")
+            values = [link.get("label", ""), link.get("relevance", ""), "Open link" if url else "—", ""]
+            alignments = [LEFT_TOP, WRAP, WRAP_CENTER, WRAP]
+            if url:
+                r = _row_with_link(ws, r, values, url, link_col_index=2, alignments=alignments)
+            else:
+                r = _row(ws, r, values, alignments=alignments)
     ws.row_dimensions[r + 1].height = 24
     tail_cell = ws.cell(
         row=r + 1, column=1,
-        value="Every source listed was fetched specifically for this company — cross-check the URL domain matches this company before citing.",
+        value="Every source listed was fetched specifically for this company — click Open to verify the domain before citing.",
     )
     tail_cell.font = SMALL
     ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=4)
@@ -417,4 +537,3 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
-
