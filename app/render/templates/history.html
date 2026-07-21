@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="history-section">
+  <h1>History</h1>
+  <p class="subtitle">Every company screened by anyone on this workspace.</p>
+
+  <div class="history-search-field">
+    <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/>
+      <path d="M21 21L16.65 16.65" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <input type="text" id="history-filter" placeholder="Search history" autocomplete="off">
+  </div>
+
+  <div class="history-list" id="history-list">
+    {% for row in screenings %}
+      <a class="history-row" href="/results/{{ row.id }}" data-company="{{ row.company | lower }}">
+        {% if row.logo_url %}
+          <img class="history-logo" src="{{ row.logo_url }}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
+        {% else %}
+          <span class="history-logo history-logo-placeholder">{{ row.company[0] | upper }}</span>
+        {% endif %}
+        <div class="history-row-main">
+          <span class="history-row-name">{{ row.company }}</span>
+          <span class="history-row-meta">
+            {{ 'Deep research' if row.mode == 'deep' else 'Screen' }}
+            {% if row.status == 'error' %} · failed{% elif row.status == 'running' %} · running{% endif %}
+            · {{ row.created_at[:10] if row.created_at else '' }}
+          </span>
+        </div>
+        {% if row.tier_label %}
+          <span class="history-row-tier" style="--tier-color: {{ row.tier_color or '#999' }}">{{ row.tier_label }}</span>
+        {% endif %}
+        {% if row.fit_score is not none %}
+          <span class="history-row-score">{{ row.fit_score }}/100</span>
+        {% endif %}
+      </a>
+    {% else %}
+      <p class="none">No screenings yet — run a search from the home page to build history.</p>
+    {% endfor %}
+  </div>
+</section>
+
+<script>
+  (function () {
+    var filterInput = document.getElementById('history-filter');
+    var rows = document.querySelectorAll('.history-row');
+    filterInput.addEventListener('input', function () {
+      var q = filterInput.value.trim().toLowerCase();
+      rows.forEach(function (row) {
+        var match = row.getAttribute('data-company').indexOf(q) !== -1;
+        row.style.display = match ? '' : 'none';
+      });
+    });
+  })();
+</script>
+{% endblock %}

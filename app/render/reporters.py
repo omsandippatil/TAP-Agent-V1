@@ -189,3 +189,8 @@ def build_context(request, company: str, mode: str, result: dict, files: dict) -
 def render_results(request, company: str, mode: str, result: dict, files: dict):
     context = build_context(request, company, mode, result, files)
     return templates.TemplateResponse("results.html", context)
+
+
+def render_results_page(request, company: str, mode: str, result: dict, files: dict):
+    context = build_context(request, company, mode, result, files)
+    return templates.TemplateResponse("results_page.html", context)
