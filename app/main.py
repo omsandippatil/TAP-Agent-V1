@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import auth, db
-from app.pipeline import google_search, scorer, scraper
+from app.pipeline import scorer, scraper
 from app.pipeline.config_loader import load_config
 from app.pipeline.source_registry import SourceRegistry
 from app.render.xlsx_reporter import generate_deep_dive_xlsx
@@ -145,42 +145,6 @@ def _find_reusable_screening(company: str, mode: str) -> dict | None:
             if row.get("mode") == "deep" and _is_fresh_enough(row, "deep"):
                 return row
     return None
-
-
-async def _web_fallback_results(query: str, user_id: str | None) -> list[dict]:
-    try:
-        hits = await google_search.google_search_web(query, max_results=HISTORY_SEARCH_RESULT_LIMIT)
-    except Exception as exc:
-        logger.warning("history_search web fallback failed query=%r error=%s", query, exc)
-        return []
-
-    if not hits:
-        return []
-
-    results = []
-    seen_companies: set[str] = set()
-    for hit in hits:
-        company_name = (hit.get("title") or "").strip() or query
-        company_key = company_name.strip().lower()
-        if not company_name or company_key in seen_companies:
-            continue
-        seen_companies.add(company_key)
-
-        results.append({
-            "id": None,
-            "company": company_name,
-            "logo_url": None,
-            "fit_score": None,
-            "tier_label": None,
-            "tier_color": None,
-            "mode": None,
-            "created_at": None,
-            "source": "web",
-            "url": hit.get("href", ""),
-        })
-        if len(results) >= HISTORY_SEARCH_RESULT_LIMIT:
-            break
-    return results
 
 
 async def _run_screen_job(job_id: str, company: str, mode: str, user_id: str | None):
@@ -380,14 +344,7 @@ async def history_search(request: Request, q: str = ""):
         return JSONResponse({"results": []})
 
     rows = db.search_screenings(query, limit=HISTORY_SEARCH_RESULT_LIMIT)
-    if rows:
-        return JSONResponse({"results": _rows_to_history_results(rows)})
-
-    logger.info("history_search no db rows, falling back to web search query=%r", query)
-    user = _current_user(request)
-    user_id = user["user_id"] if user else None
-    results = await _web_fallback_results(query, user_id)
-    return JSONResponse({"results": results})
+    return JSONResponse({"results": _rows_to_history_results(rows)})
 
 
 @app.get("/results/{screening_id}")
