@@ -64,6 +64,11 @@ NON_INDIA_LOCATION_TOKENS = frozenset([
     "italy", "switzerland", "sweden", "norway", "denmark", "brazil", "mexico",
 ])
 
+COMPANY_STOPWORDS = frozenset([
+    "the", "and", "inc", "ltd", "llc", "co", "corp", "corporation", "company",
+    "limited", "group", "pvt", "private", "plc", "llp",
+])
+
 
 def strip_linkedin_suffix(raw_title: str) -> str:
     return LINKEDIN_BOILERPLATE_SUFFIX_PATTERN.sub("", raw_title or "").strip()
@@ -97,12 +102,17 @@ def extract_job_title(raw_title: str, snippet: str, parts: list[str] | None = No
     return match.group(0).strip() if match else ""
 
 
+def _company_tokens(company: str) -> list[str]:
+    return [t for t in re.sub(r"[^a-z0-9 ]", " ", company.lower()).split()
+            if len(t) > 2 and t not in COMPANY_STOPWORDS]
+
+
 def extract_company_affiliation(raw_title: str, snippet: str, parts: list[str] | None = None,
                                  company: str = "") -> str:
     parts = parts if parts is not None else split_linkedin_title(raw_title)
 
     if company:
-        tokens = [t for t in re.sub(r"[^a-z0-9 ]", " ", company.lower()).split() if len(t) > 2]
+        tokens = _company_tokens(company)
         for part in parts[1:]:
             lowered_part = part.lower()
             if tokens and any(token in lowered_part for token in tokens):
@@ -155,6 +165,34 @@ def is_current_csr_role(raw_title: str, snippet: str) -> bool:
     return not FORMER_ROLE_KEYWORD_PATTERN.search(haystack)
 
 
+def is_currently_at_company(raw_title: str, snippet: str, affiliation: str, company: str) -> bool:
+    if not company:
+        return False
+    tokens = _company_tokens(company)
+    if not tokens:
+        return False
+
+    affiliation_lower = (affiliation or "").lower()
+    if affiliation_lower and any(token in affiliation_lower for token in tokens):
+        pass
+    elif not affiliation_lower:
+        return False
+    else:
+        return False
+
+    haystack = f"{raw_title} {snippet}"
+    if FORMER_ROLE_KEYWORD_PATTERN.search(haystack):
+        return False
+
+    sentences = re.split(r"(?<=[.!?])\s+", snippet or "")
+    for sentence in sentences:
+        sentence_lower = sentence.lower()
+        if any(token in sentence_lower for token in tokens) and FORMER_ROLE_KEYWORD_PATTERN.search(sentence):
+            return False
+
+    return True
+
+
 def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> dict:
     parts = split_linkedin_title(raw_title)
     name = extract_person_name(raw_title, parts)
@@ -163,11 +201,14 @@ def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> 
     india_signal = location_mentions_india(raw_title, snippet, url)
     current_role = is_current_csr_role(raw_title, snippet)
     has_csr_signal = bool(CSR_ROLE_KEYWORD_PATTERN.search(f"{raw_title} {snippet}"))
+    company_match = is_currently_at_company(raw_title, snippet, affiliation, company)
 
-    if current_role and india_signal:
+    if current_role and company_match and india_signal:
         confidence = "HIGH"
-    elif current_role or (has_csr_signal and india_signal):
+    elif company_match and (current_role or has_csr_signal) :
         confidence = "MEDIUM"
+    elif current_role and india_signal:
+        confidence = "LOW"
     else:
         confidence = "LOW"
 
@@ -181,5 +222,6 @@ def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> 
         "india_location_signal": india_signal,
         "is_current_csr_role": current_role,
         "has_csr_signal": has_csr_signal,
+        "is_current_company_match": company_match,
         "confidence": confidence,
     }

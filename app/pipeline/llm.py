@@ -32,6 +32,9 @@ ANTHROPIC_REQUEST_TIMEOUT_SECONDS = 120.0
 
 MAX_OPEN_QUESTIONS_TO_RESOLVE = 3
 
+AUTHENTICITY_FIT_SCORE_CAP_THRESHOLD = 40
+AUTHENTICITY_FIT_SCORE_CAP_VALUE = 55
+
 DEFAULT_MISSION = (
     "The Apprentice Project (TAP) develops 21st-century skills (critical thinking, "
     "creativity, confidence, communication, problem-solving, self-awareness, "
@@ -474,6 +477,27 @@ NAMED_ENTITIES_SUMMARY_RULE = (
     "decision_makers and partners/programmes are all empty."
 )
 
+FIT_SCORE_BAND_RULE = (
+    "1. fit_score 0-100, evidence-bound only (never adjusted for the labeled-inference clause), "
+    "use these bands:\n"
+    "   - 0-20: no relevant education/CSR activity found, or evidence is entirely "
+    "business-scale/marketing with no programme substance.\n"
+    "   - 21-40: sector plausibility or a single thinly-described programme/partner mention, no "
+    "concrete scale/depth detail, no disclosed spend.\n"
+    "   - 41-60: at least one named programme OR named partner with a concrete supporting detail "
+    "(scale, cohort, duration, or named beneficiary group), even if spend is undisclosed and "
+    "depth is moderate.\n"
+    "   - 61-80: named, detailed, multi-year programme(s) touching STEM/tech/21st-century-skills "
+    "AND education, with at least one credible partner or contact pathway.\n"
+    "   - 81-100: all of the above plus a disclosed CSR spend figure and an identifiable "
+    "decision-maker or open contact pathway.\n"
+    "   Move up one band if 2+ independent named programmes/partners meet the band's bar; move "
+    "down one band if evidence is stale, single-sourced, or self-reported only. If "
+    "overall_authenticity_score will be below 40, cap fit_score at 55 regardless of programme "
+    "detail — thin sourcing should not support a strong fit claim even if the activity described "
+    "sounds credible."
+)
+
 
 def full_company_analysis_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
     return f"""You are a careful, skeptical CSR partnerships analyst judging whether {company} is a genuinely good funding/partnership fit for an Indian education NGO. Ground every judgment strictly in the evidence below. Accuracy beats completeness — an unfilled field is correct when evidence doesn't support one; a filled field that goes beyond evidence is a failure.
@@ -502,7 +526,7 @@ EVIDENCE:
 {HIGHLIGHT_RULE}
 
 Produce, in order:
-1. fit_score 0-100, evidence-bound only (never adjusted for the labeled-inference clause): named+detailed multi-year programme touching STEM/tech/21st-c-skills+education → 60-85 depending on strength/depth. Sector plausibility alone, no named programme → 35-50 max. Thin/missing evidence pulls it down. >85 reserved for named+detailed+multi-year programme plus disclosed CSR figure plus identifiable contact path.
+{FIT_SCORE_BAND_RULE}
 2. fit_rationale (2-4 sentences, required): justify fit_score from retrieved evidence only, state plainly what's confirmed vs inferred vs missing, never present revenue/turnover as CSR capacity — then apply REASONED_OPPORTUNITY_RULE and NAMED_ENTITIES_SUMMARY_RULE above.
 3. overall_semantic_alignment 0-100 + alignment_rationale (1-2 sentences), from named programme content only.
 4. delivery_model FUNDER/IMPLEMENTER/HYBRID/UNCLEAR + delivery_model_evidence naming the specific programme/statement (UNCLEAR + empty evidence if no clue).
@@ -1081,6 +1105,15 @@ def _repair_full_analysis(parsed: dict) -> FullAnalysisSchema:
     if isinstance(parsed.get("contact_pathway"), dict) and isinstance(parsed["contact_pathway"].get("channel"), str):
         parsed["contact_pathway"]["channel"] = _normalize_highlight_markers(parsed["contact_pathway"]["channel"])
 
+    fit_score = parsed.get("fit_score", 0)
+    authenticity_score = clamp_int(parsed.get("overall_authenticity_score"), 0, 100, 0)
+    if authenticity_score < AUTHENTICITY_FIT_SCORE_CAP_THRESHOLD and fit_score > AUTHENTICITY_FIT_SCORE_CAP_VALUE:
+        logger.info(
+            "fit_score capped by low authenticity original=%d authenticity=%d cap=%d",
+            fit_score, authenticity_score, AUTHENTICITY_FIT_SCORE_CAP_VALUE,
+        )
+        parsed["fit_score"] = AUTHENTICITY_FIT_SCORE_CAP_VALUE
+
     try:
         return FullAnalysisSchema.model_validate(parsed)
     except ValidationError as exc:
@@ -1512,6 +1545,10 @@ async def analyze_company(company: str, mission: str, sources: list, sources_man
         "analyze_company model output company=%r fit_score=%d spend_disclosed=%s partners=%d programmes=%d fallback_used=%s",
         company, result["fit_score"], result["spend"].get("has_disclosed_budget"),
         len(result["partners"]), len(result["programmes"]), result["llm_fallback_used"],
+    )
+    logger.info(
+        "analyze_company criteria breakdown company=%r %s",
+        company, {c["id"]: c["score"] for c in result["criteria"]},
     )
 
     result = _backfill_narrative_gaps(result, company, found_source_count, sources=sources)
@@ -2028,4 +2065,4 @@ async def api_health_check() -> dict:
             "configured": google_ok,
             "message": "Google Custom Search configured" if google_ok else "Google Search not configured — using DDGS fallback for all queries",
         },
-    }
+    } 
