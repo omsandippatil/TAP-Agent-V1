@@ -389,95 +389,94 @@ def _criteria_json_template() -> str:
 
 
 HIGHLIGHT_RULE = (
-    "MARKER-HIGHLIGHT RULE (fit_rationale, alignment_rationale, delivery_model_evidence, "
+    "HIGHLIGHT: in fit_rationale, alignment_rationale, delivery_model_evidence, "
     "source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, "
-    "and every criterion evidence field): wrap the single most decision-relevant 2-3 word "
-    "phrase in **double asterisks** — never a full sentence, never a lone number, never "
-    "more than 3 words. Exactly one bolded phrase per field with real content; zero only "
-    "if the field is genuinely empty. Never bold anything in name/title/label/source/url/"
-    "boolean/enum fields."
+    "and each criterion evidence — bold exactly one 2-3 word decision-relevant phrase with "
+    "**asterisks** (never a full sentence, a lone number, or >3 words; 0 bolds only if the "
+    "field is empty). Never bold name/title/label/source/url/boolean/enum fields."
 )
 
 OUTPUT_ORDER_RULE = (
-    "OUTPUT ORDER RULE: write fit_score, fit_rationale, overall_semantic_alignment, "
-    "alignment_rationale, delivery_model, delivery_model_evidence as the first six keys, "
-    "in that order. Everything after (spend, programmes, criteria, etc.) may be trimmed "
-    "before those lead fields ever are."
+    "ORDER: fit_score, fit_rationale, overall_semantic_alignment, alignment_rationale, "
+    "delivery_model, delivery_model_evidence must be the first six keys, in that order — "
+    "trim later fields (spend, programmes, criteria, etc.) before ever trimming these."
 )
 
 SPEND_VS_REVENUE_RULE = (
-    "SPEND-VS-REVENUE RULE — apply strictly, this is the most common source of error: "
-    "revenue, turnover, net worth, net profit, market cap, and EBITDA are business-scale "
-    "figures, NOT CSR spend, and must NEVER populate spend.display, spend.inr_crore, or "
-    "be described anywhere as 'CSR spend', 'CSR budget', or 'CSR fund'. Set "
-    "spend.has_disclosed_budget true ONLY when the evidence contains a figure explicitly "
-    "labeled as CSR expenditure, CSR spend, amount spent on CSR, CSR budget, or a stated "
-    "CSR-mandate percentage applied to a stated profit figure. If the evidence contains "
-    "only revenue/turnover/net worth/net profit with no explicit CSR-labeled figure, set "
-    "spend.has_disclosed_budget false, leave spend.inr_crore null, and instead report the "
-    "clean numeric business-scale figures in eligibility.net_worth_turnover_signal (as text) "
-    "AND, whichever of net worth/turnover is stated, in eligibility.net_worth_turnover_inr_crore "
-    "and eligibility.net_profit_inr_crore (as plain numbers in INR crore, null if not stated) — "
-    "this lets a transparent statutory-minimum estimate be computed in code, never by you, and "
-    "never written into spend. Anywhere a business-scale figure is mentioned in prose "
-    "(fit_rationale, alignment_rationale, csr_head_note), it must be labeled 'revenue'/"
-    "'turnover'/'net worth' exactly as the evidence states — never implied to be CSR capacity."
+    "SPEND-VS-REVENUE (most common error, apply strictly): revenue/turnover/net worth/net "
+    "profit/market cap/EBITDA are business-scale, NEVER CSR spend — never put them in "
+    "spend.display or spend.inr_crore, never call them 'CSR spend/budget/fund' anywhere. "
+    "spend.has_disclosed_budget=true ONLY for a figure explicitly labeled CSR expenditure/"
+    "spend/budget, or a stated CSR-mandate % applied to a stated profit. Otherwise: "
+    "has_disclosed_budget=false, inr_crore=null, and put clean business-scale numbers only "
+    "in eligibility.net_worth_turnover_signal (text) plus eligibility.net_worth_turnover_"
+    "inr_crore / eligibility.net_profit_inr_crore (plain numbers, null if unstated) so a "
+    "statutory-minimum estimate can be computed in code — never by you, never in spend. Any "
+    "business-scale figure in prose must be labeled 'revenue'/'turnover'/'net worth' exactly "
+    "as stated, never implied as CSR capacity."
 )
 
 PARTNER_INCLUSION_RULE = (
-    "PARTNER INCLUSION RULE: the partners array is the source of truth for organisations "
-    "the company works with, split into two confidence tiers. confidence='confirmed': the "
-    "evidence explicitly states a working relationship (funds, co-designs, implements with, "
-    "partners with, delivers via) with a named third-party organisation. confidence='probable': "
-    "a named third-party organisation is mentioned alongside the company in a CSR/education "
-    "context but the relationship verb is vague or implied rather than explicit. Do NOT add an "
-    "entry, at either tier, for: a programme, platform, or campaign name that is not itself a "
-    "separate organisation (an internal initiative name is a programme, not a partner); a "
-    "government body mentioned only in generic language ('works with governments and NGOs') "
-    "with no organisation actually named; an award, index, or certifying body the company "
-    "received recognition from. MANDATORY CROSS-CHECK: before finalizing your answer, re-read "
-    "every narrative field you are about to write (fit_rationale, alignment_rationale, "
-    "delivery_model_evidence, csr_head_note) — if any of them names a specific third-party "
-    "organisation the company works with (e.g. 'partnership with AIFT'), that organisation "
-    "MUST also appear in the partners array at confirmed or probable tier; it is a contradiction "
-    "to describe a partnership in prose while leaving the structured array empty. The only "
-    "reason a named organisation from your narrative may be absent from partners is if it is "
-    "itself the NGO mission-holder (TAP) or a government body with no organisation name attached. "
-    "Each qualifying partner appears exactly once, at its highest-supported tier, using its most "
-    "complete verbatim name."
+    "PARTNERS: two tiers. confirmed = evidence explicitly states a working relationship "
+    "(funds/co-designs/implements with/partners with/delivers via) with a named third-party "
+    "org. probable = a named org appears alongside the company in a CSR/education context but "
+    "the relationship verb is vague/implied. Exclude: internal initiative/programme/campaign "
+    "names (not orgs); generic government mentions with no org named; award/index/certifying "
+    "bodies. CROSS-CHECK (mandatory): if fit_rationale/alignment_rationale/delivery_model_"
+    "evidence/csr_head_note names a specific third-party org the company works with, that org "
+    "MUST also appear in partners (confirmed or probable) — never describe a partnership in "
+    "prose while leaving the array without it, unless that org is TAP itself or an unnamed "
+    "government body. Each qualifying partner appears once, at its best-supported tier, using "
+    "its fullest verbatim name."
 )
 
 PROGRAMME_INCLUSION_RULE = (
-    "PROGRAMME INCLUSION RULE: add a programmes entry, tagged confidence='confirmed', only "
-    "for a named initiative the company itself runs or funds with at least one concrete "
-    "supporting detail (what it does, who it serves, scale, or since when) beyond just a "
-    "name. If a programme is named but the only supporting detail is thin or partially "
-    "implied, tag it confidence='probable' instead of omitting it or inventing detail to "
-    "reach the confirmed bar. A bare name with zero supporting detail anywhere in the "
-    "evidence should not receive its own programmes entry at any tier. MANDATORY CROSS-CHECK: "
-    "if fit_rationale, alignment_rationale, or delivery_model_evidence names a specific "
-    "initiative (e.g. 'the AIFT partnership focuses on coding and digital literacy'), that "
-    "initiative MUST also appear in the programmes array at confirmed or probable tier — do "
-    "not describe a named initiative in prose while leaving programmes empty."
+    "PROGRAMMES: add an entry (confidence='confirmed') only for a named initiative the company "
+    "runs/funds with ≥1 concrete detail (what/who/scale/since-when) beyond just a name. Named "
+    "but thinly/partially supported → confidence='probable' instead of omitting or inventing "
+    "detail. A bare name with zero supporting detail gets no entry at any tier. CROSS-CHECK "
+    "(mandatory): if fit_rationale/alignment_rationale/delivery_model_evidence names a specific "
+    "initiative, it MUST also appear in programmes (confirmed or probable) — never leave "
+    "programmes empty while prose names one."
 )
 
 EVIDENCE_ONLY_RULE = (
-    "EVIDENCE-ONLY RULE: every structured field and every narrative sentence must trace "
-    "to something actually stated in the evidence. Do not infer facts from a company's "
-    "sector, size, or general reputation. Where evidence is partial, say so explicitly "
-    "(e.g. 'no explicit government-school partnership named') rather than writing the "
-    "claim as confirmed. An accurate 0/UNKNOWN/empty value is always preferable to a "
-    "plausible-sounding guess. A name or figure earns a place in a structured field only "
-    "by satisfying the PARTNER INCLUSION RULE, PROGRAMME INCLUSION RULE, or SPEND-VS-"
-    "REVENUE RULE above — mentioning something in prose does not, by itself, qualify it "
-    "for the structured array. Generic sector-wide statistics (e.g. 'X% of companies in "
-    "this sector partner with NGOs') are never evidence of this specific company's "
-    "activity and must not be cited to support any criterion score or structured field."
+    "EVIDENCE-ONLY: every structured field and every narrative sentence must trace to something "
+    "actually stated in the evidence — never infer facts from sector, size, or reputation. Where "
+    "evidence is partial, say so explicitly (e.g. 'no explicit government-school partnership "
+    "named') rather than stating it as confirmed. An accurate 0/UNKNOWN/empty beats a "
+    "plausible-sounding guess. A name/figure earns a structured-array slot only via the PARTNER/"
+    "PROGRAMME/SPEND-VS-REVENUE rules above — prose mention alone doesn't qualify it. Generic "
+    "sector-wide stats (e.g. 'X% of firms in this sector partner with NGOs') never count as "
+    "evidence of this specific company's activity and must not support any criterion or field. "
+    "This evidence-only bar governs every *score* (fit_score, criteria, alignment, authenticity) "
+    "without exception — scores are never adjusted for a plausible-sounding path that isn't "
+    "stated in the evidence."
+)
+
+REASONED_OPPORTUNITY_RULE = (
+    "LABELED INFERENCE (fit_rationale only, does not touch any score): after the evidence-bound "
+    "rationale, you may add ONE short clause naming a concrete, plausible path to fit that the "
+    "evidence itself suggests but does not confirm — e.g. entering as an implementation partner "
+    "to an existing named grantee/intermediary already in the partners/programmes arrays. This "
+    "clause MUST start with the literal words 'Inference (unconfirmed):' so it is never mistaken "
+    "for a stated fact, MUST name a real org/programme already present in this same JSON output "
+    "(never invent one), and MUST NOT change fit_score, criteria scores, or any other numeric "
+    "field. Omit this clause entirely if no such named org/programme exists in the evidence."
+)
+
+NAMED_ENTITIES_SUMMARY_RULE = (
+    "KEY NAMES CLAUSE (fit_rationale, required if any exist): end fit_rationale with one short "
+    "sentence starting 'Key contacts:' listing up to 3 real named people with title from "
+    "decision_makers (e.g. 'Key contacts: A (Title), B (Title)'), followed by '; Key partners:' "
+    "listing up to 4 real named orgs from partners/programmes. Use only names/orgs that also "
+    "appear elsewhere in this same JSON output — never invent one. Omit the whole clause if "
+    "decision_makers and partners/programmes are all empty."
 )
 
 
 def full_company_analysis_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
-    return f"""You are a careful, skeptical CSR partnerships analyst judging whether {company} is a genuinely good funding/partnership fit for an Indian education NGO. Read the evidence below and form a judgment grounded strictly in what it states. Accuracy matters far more than completeness — an unfilled field is correct if the evidence does not support one; a filled field that goes beyond the evidence is a failure.
+    return f"""You are a careful, skeptical CSR partnerships analyst judging whether {company} is a genuinely good funding/partnership fit for an Indian education NGO. Ground every judgment strictly in the evidence below. Accuracy beats completeness — an unfilled field is correct when evidence doesn't support one; a filled field that goes beyond evidence is a failure.
 
 NGO MISSION: {mission}
 
@@ -496,40 +495,46 @@ EVIDENCE:
 
 {EVIDENCE_ONLY_RULE}
 
+{REASONED_OPPORTUNITY_RULE}
+
+{NAMED_ENTITIES_SUMMARY_RULE}
+
 {HIGHLIGHT_RULE}
 
-1. FIT SCORE 0-100: grounded in evidence actually present, not sector reputation. A named programme with concrete detail directly touching STEM/technology/21st-century skills and education justifies 60-85 depending on strength and depth of detail. Sector plausibility alone with no named programme justifies at most 35-50. Thin or missing evidence should pull the score down. Reserve above 85 for a named, detailed, multi-year programme plus a disclosed CSR figure plus an identifiable contact path.
-2. FIT RATIONALE (REQUIRED, 2-4 sentences): explain fit_score citing only retrieved evidence. State plainly which parts are confirmed versus inferred or missing. Never present revenue/turnover as CSR capacity without labeling it as such.
-3. SEMANTIC ALIGNMENT 0-100 (REQUIRED) + ALIGNMENT RATIONALE (REQUIRED, 1-2 sentences), based only on named programme content.
-4. DELIVERY MODEL: FUNDER/IMPLEMENTER/HYBRID/UNCLEAR + DELIVERY MODEL EVIDENCE (REQUIRED sentence naming the specific programme/statement; UNCLEAR with empty evidence if the text gives no clue).
-5. BUDGET — apply the SPEND-VS-REVENUE RULE above without exception. Latest figure with fiscal_year if stated else null/conf 0; prior years into history[]; trend_direction from actual CSR-labeled numbers only, never from revenue growth. Populate eligibility.net_worth_turnover_inr_crore / eligibility.net_profit_inr_crore whenever those business-scale numbers are stated, even though they never populate spend.
-6. PROGRAMMES — apply the PROGRAMME INCLUSION RULE above, including its mandatory cross-check against your own narrative fields; tag confidence confirmed/probable.
-7. PARTNERS — apply the PARTNER INCLUSION RULE above, including its mandatory cross-check against your own narrative fields; tag confidence confirmed/probable. A shorter list than the narrative implies is only correct if the narrative itself names no specific organisation — if it does, that organisation belongs in this array.
-8. DECISION MAKERS: every named leader/executive/spokesperson quoted or mentioned in a CSR/sustainability context, title, public_facing_score 0-100, tenure_status, linkedin_url only if a literal linkedin.com/in/ URL is present for that person, else empty. Anyone named in contact_pathway MUST appear here too.
-9. GEOGRAPHY: every state/city explicitly named in the evidence.
-10. RFP SIGNAL: explicit call for NGO partners — present, channel, evidence. Default false/empty unless explicitly stated.
-11. BOARD AFFINITY: named board/promoter personal education-philanthropy history. Default false/empty unless explicitly stated.
-12. VOLUNTEERING: named employee volunteering/payroll-giving touching education. Default false/empty unless explicitly stated.
-13. GROUP FOUNDATION: CSR run via separate parent/group foundation, only if explicitly named.
-14. ELIGIBILITY: from net worth/turnover/profit figures (kept separate from spend), Section 135 applicability LIKELY/UNLIKELY/UNKNOWN, plus the plain numeric fields described in rule 5.
-15. SECTOR (UNKNOWN only if evidence gives no industry clue): classify from company-description language, sub_sector if clear, one-line reasoning.
-16. CRITERIA 0-5 each, all ids in order, short evidence+reasoning: {_criteria_rubric_block()}
-17. RED FLAGS: genuine contradictions, marketing-not-substance signals, date mismatches, or internal conflicts with your own output elsewhere. Severity low/medium/high. Unconfirmed details go in open_questions, not red_flags.
-18. CONTACT PATHWAY (name the single most concrete real channel; "Not identified" if truly nothing exists — never invent a channel from a generic mention).
-19. EVIDENCE RECENCY (one sentence): how recent/current the evidence appears.
-20. CSR HEAD NOTE (one sentence): only from actual decision-maker quotes or named structure; do not speculate about philosophy from a bare title.
-21. SOURCE QUALITY ASSESSMENT (1-2 sentences): state plainly whether sources were primary (company/regulator) or secondary (press/search snippets), and whether figures used are self-reported vs independently verified.
-22. AUTHENTICITY SCORE 0-100: reflect actual sourcing quality — lower it when the only support is a press mention or search snippet rather than a primary document.
-23. OPEN QUESTIONS: up to 5 short items to verify, including any figure excluded from spend under the SPEND-VS-REVENUE RULE. Phrase each as a concrete, searchable question (e.g. "Does {company} run a named education or STEM programme in India?" rather than "More detail needed").
+Produce, in order:
+1. fit_score 0-100, evidence-bound only (never adjusted for the labeled-inference clause): named+detailed multi-year programme touching STEM/tech/21st-c-skills+education → 60-85 depending on strength/depth. Sector plausibility alone, no named programme → 35-50 max. Thin/missing evidence pulls it down. >85 reserved for named+detailed+multi-year programme plus disclosed CSR figure plus identifiable contact path.
+2. fit_rationale (2-4 sentences, required): justify fit_score from retrieved evidence only, state plainly what's confirmed vs inferred vs missing, never present revenue/turnover as CSR capacity — then apply REASONED_OPPORTUNITY_RULE and NAMED_ENTITIES_SUMMARY_RULE above.
+3. overall_semantic_alignment 0-100 + alignment_rationale (1-2 sentences), from named programme content only.
+4. delivery_model FUNDER/IMPLEMENTER/HYBRID/UNCLEAR + delivery_model_evidence naming the specific programme/statement (UNCLEAR + empty evidence if no clue).
+5. spend — apply SPEND-VS-REVENUE strictly. Latest figure+fiscal_year if stated else null/conf 0; prior years in history[]; trend_direction from CSR-labeled numbers only, never revenue growth. Populate eligibility.net_worth_turnover_inr_crore / net_profit_inr_crore whenever those business-scale numbers are stated (never into spend).
+6. programmes — apply PROGRAMME rule incl. its cross-check; tag confirmed/probable.
+7. partners — apply PARTNER rule incl. its cross-check; tag confirmed/probable. A shorter list than the narrative implies is only correct if the narrative itself names no org.
+8. decision_makers: every named leader/exec/spokesperson in a CSR/sustainability context — title, public_facing_score 0-100, tenure_status, linkedin_url only if a literal linkedin.com/in/ URL is present else empty. Anyone in contact_pathway must appear here too.
+9. geographies: every state/city explicitly named.
+10. rfp_signal: explicit call for NGO partners — default false/empty unless stated.
+11. board_affinity: named board/promoter personal education-philanthropy history — default false/empty unless stated.
+12. volunteering: named employee volunteering/payroll-giving touching education — default false/empty unless stated.
+13. group_foundation: CSR run via separate parent/group foundation, only if explicitly named.
+14. eligibility: Section 135 applicability LIKELY/UNLIKELY/UNKNOWN from net worth/turnover/profit figures (kept out of spend), plus the plain numeric fields from step 5.
+15. sector (UNKNOWN only if no industry clue): from company-description language; sub_sector if clear; one-line reasoning.
+16. criteria 0-5 each, all ids below in order, short evidence+reasoning:
+{_criteria_rubric_block()}
+17. red_flags: genuine contradictions, marketing-not-substance signals, date mismatches, or conflicts with your own other output — severity low/medium/high. Unconfirmed details go in open_questions, not here.
+18. contact_pathway: single most concrete real channel; "Not identified" if nothing exists — never invent one from a generic mention.
+19. evidence_recency (one sentence): how recent/current the evidence appears.
+20. csr_head_note (one sentence): only from actual decision-maker quotes/named structure, never speculate from a bare title.
+21. source_quality_assessment (1-2 sentences): primary (company/regulator) vs secondary (press/snippets); self-reported vs independently verified figures.
+22. overall_authenticity_score 0-100: reflect real sourcing quality — lower it if support is only a press mention/search snippet, not a primary document.
+23. open_questions: up to 5 short, concrete, searchable items to verify (e.g. "Does {company} run a named education or STEM programme in India?"), including any figure excluded from spend under SPEND-VS-REVENUE.
 
-All criteria ids below must appear exactly once, in order. Missing evidence for a criterion: score 0, confidence 0, evidence "To confirm — no signal in evidence".
+All criteria ids must appear exactly once, in order. Missing evidence for one: score 0, confidence 0, evidence "To confirm — no signal in evidence".
 
-Rules: evidence fields are paraphrases under 20 words, never verbatim except exact figures and exact partner/programme names. Never fabricate facts. Numbers internally consistent. Keep every string concise so the full reply fits within {OUTPUT_TOKEN_RESERVE} output tokens, prioritizing the first six keys per the OUTPUT ORDER RULE. Reply with ONE JSON object, nothing else.
+Rules: evidence fields are paraphrases under 20 words, never verbatim except exact figures/partner/programme names. Never fabricate facts. Numbers internally consistent. Keep every string concise so the reply fits {OUTPUT_TOKEN_RESERVE} output tokens, prioritizing the first six keys. Reply with ONE JSON object, nothing else.
 
 JSON shape:
 {{
   "fit_score": <int 0-100>,
-  "fit_rationale": "<2-4 sentences, required, one **2-3 word** highlight>",
+  "fit_rationale": "<2-4 sentences, required, one **2-3 word** highlight, optional trailing Inference (unconfirmed): clause, optional trailing Key contacts/Key partners clause>",
   "overall_semantic_alignment": <int 0-100>,
   "alignment_rationale": "<1-2 sentences, required, one **2-3 word** highlight>",
   "delivery_model": "<FUNDER|IMPLEMENTER|HYBRID|UNCLEAR>",
@@ -1244,11 +1249,28 @@ def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int
         pieces = [f"{company}'s strongest signal is {top.lower()}"]
         if bottom and bottom != top:
             pieces.append(f"the weakest is {bottom.lower()}")
-        result["fit_rationale"] = _ensure_single_highlight(
+        fallback_rationale = (
             f"Based on the available evidence, {'; '.join(pieces)}. "
-            "This reflects the balance of confirmed signals rather than a single deciding factor.",
-            top,
+            "This reflects the balance of confirmed signals rather than a single deciding factor."
         )
+        top_partner = next((p.get("name") for p in result.get("partners", []) if p.get("name")), "")
+        if top_partner:
+            fallback_rationale += (
+                f" Inference (unconfirmed): {company} could plausibly enter via its existing "
+                f"named relationship with {top_partner}, though this is not confirmed as an "
+                "open pathway in the evidence."
+            )
+        contacts = [d.get("name") for d in result.get("decision_makers", []) if d.get("name")][:3]
+        partners_or_programmes = [p.get("name") for p in result.get("partners", []) if p.get("name")][:4] or \
+            [p.get("name") for p in result.get("programmes", []) if p.get("name")][:4]
+        if contacts or partners_or_programmes:
+            names_clause = []
+            if contacts:
+                names_clause.append("Key contacts: " + ", ".join(contacts))
+            if partners_or_programmes:
+                names_clause.append("Key partners: " + ", ".join(partners_or_programmes))
+            fallback_rationale += " " + "; ".join(names_clause) + "."
+        result["fit_rationale"] = _ensure_single_highlight(fallback_rationale, top)
 
     _backfill_contact_pathway_from_decision_makers(result)
 
@@ -1915,6 +1937,11 @@ def strategic_insight_prompt(company: str, mission: str, state: str, fit_score: 
     estimate_note = ""
     if not spend.get("has_disclosed_budget") and spend.get("estimated_is_computed"):
         estimate_note = f"ESTIMATED (NOT DISCLOSED) STATUTORY MINIMUM: ₹{spend.get('estimated_min_inr_crore')} crore — {spend.get('estimated_basis', '')}"
+    named_partners = ", ".join(p.get("name", "") for p in analysis.get("partners", []) if p.get("name")) or "none named"
+    named_programmes = ", ".join(p.get("name", "") for p in analysis.get("programmes", []) if p.get("name")) or "none named"
+    named_contacts = ", ".join(
+        f"{d.get('name', '')} ({d.get('title', '')})" for d in analysis.get("decision_makers", []) if d.get("name")
+    ) or "none named"
     return f"""Senior CSR partnerships analyst writing the lead narrative of a due-diligence brief on {company} for education NGO TAP.
 
 MISSION: {mission}
@@ -1928,6 +1955,9 @@ SPEND TREND: {spend.get('trend_direction', 'UNKNOWN')} · CSR budget disclosed: 
 SECTOR: {sector.get('sector', 'UNKNOWN')}
 CSR-135 ELIGIBILITY: {eligibility.get('plausibly_mandated', 'UNKNOWN')}
 GROUP FOUNDATION: {group_foundation.get('routed_through_group', False)} {('via ' + group_foundation.get('foundation_name', '')) if group_foundation.get('foundation_name') else ''}
+NAMED CONTACTS (use only these, verbatim, if you name anyone): {named_contacts}
+NAMED PARTNERS (use only these, verbatim, if you name any org): {named_partners}
+NAMED PROGRAMMES (use only these, verbatim, if you name any initiative): {named_programmes}
 FOLLOW-UP VERIFICATION RESULTS: {resolved_text}
 
 SCORECARD:
@@ -1935,13 +1965,17 @@ SCORECARD:
 
 RED FLAGS: {red_flags_text}
 
-Write one 180-300 word narrative in a measured, evidence-grounded tone — neither harsh nor inflated. Lead with genuine, evidence-backed strengths before caveats. State plainly whether/why this is a good fit based only on the analyst reasoning above; if spend.has_disclosed_budget is false, do not describe any revenue/turnover figure as CSR capacity — call it business scale only, and if an estimated statutory minimum is given above, you may cite it but must call it an estimate, never a disclosed figure. If follow-up verification results are present and not "none", weave in what was specifically checked and confirmed or ruled out — this is stronger evidence than the original pass and should be named as such. Name strongest/weakest dimensions without dwelling on the weakest; flag group-foundation routing and who to actually approach if relevant; note eligibility read if uncertain; give one concrete next step matching tier/model/pathway; flowing prose, not bullets. Do not treat unknown geography or unknown similarity to existing partners as a weakness. Treat any remaining open questions as items to verify next, not reasons the fit itself is weak.
+Write one 180-320 word narrative in a measured, evidence-grounded tone — neither harsh nor inflated. Lead with genuine, evidence-backed strengths before caveats. State plainly whether/why this is a good fit based only on the analyst reasoning above; if spend.has_disclosed_budget is false, do not describe any revenue/turnover figure as CSR capacity — call it business scale only, and if an estimated statutory minimum is given above, you may cite it but must call it an estimate, never a disclosed figure. If follow-up verification results are present and not "none", weave in what was specifically checked and confirmed or ruled out — this is stronger evidence than the original pass and should be named as such. Name strongest/weakest dimensions without dwelling on the weakest; flag group-foundation routing and who to actually approach if relevant; note eligibility read if uncertain; give one concrete next step matching tier/model/pathway; flowing prose, not bullets. Do not treat unknown geography or unknown similarity to existing partners as a weakness. Treat any remaining open questions as items to verify next, not reasons the fit itself is weak.
 
-{HIGHLIGHT_RULE.replace("(fit_rationale, alignment_rationale, delivery_model_evidence, source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, and every criterion evidence field)", "(this narrative)")}
+If, and only if, a named partner or programme above offers a plausible indirect entry path not already confirmed as open, add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme from the lists above — never invent one, never let this change the score or tier framing.
+
+End the narrative with one short sentence starting "Key contacts:" naming up to 3 people from NAMED CONTACTS with title, then "; Key partners:" naming up to 4 orgs from NAMED PARTNERS (or NAMED PROGRAMMES if partners is empty). Omit this closing sentence only if both lists above say "none named".
+
+{HIGHLIGHT_RULE.replace("in fit_rationale, alignment_rationale, delivery_model_evidence, source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, and each criterion evidence", "in this narrative")}
 Use exactly one bolded phrase somewhere in the narrative.
 
 Return ONLY valid JSON:
-{{"narrative": "<180-300 word narrative with one **2-3 word** highlight>"}}"""
+{{"narrative": "<180-320 word narrative with one **2-3 word** highlight, optional Inference (unconfirmed): sentence, closing Key contacts/Key partners sentence>"}}"""
 
 
 async def generate_strategic_insight_narrative(company: str, mission: str, state: str, fit_score: int, tier_label: str, analysis: dict, temperature: float = 0.0) -> str:
@@ -1964,6 +1998,17 @@ async def generate_strategic_insight_narrative(company: str, mission: str, state
         )
         if strongest:
             narrative = _ensure_single_highlight(narrative, strongest[0].get("name", ""))
+    if narrative and narrative != LLM_UNAVAILABLE_EVIDENCE and "key contacts" not in narrative.lower():
+        contacts = [d.get("name") for d in analysis.get("decision_makers", []) if d.get("name")][:3]
+        partners_or_programmes = [p.get("name") for p in analysis.get("partners", []) if p.get("name")][:4] or \
+            [p.get("name") for p in analysis.get("programmes", []) if p.get("name")][:4]
+        if contacts or partners_or_programmes:
+            closing_pieces = []
+            if contacts:
+                closing_pieces.append("Key contacts: " + ", ".join(contacts))
+            if partners_or_programmes:
+                closing_pieces.append("Key partners: " + ", ".join(partners_or_programmes))
+            narrative = narrative.rstrip() + " " + "; ".join(closing_pieces) + "."
     return narrative if narrative else LLM_UNAVAILABLE_EVIDENCE
 
 

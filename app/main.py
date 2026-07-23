@@ -38,6 +38,7 @@ HISTORY_SEARCH_RESULT_LIMIT = 8
 FRESH_RESULT_MAX_AGE = {"screen": timedelta(hours=6), "deep": timedelta(days=3)}
 
 _INFLIGHT_JOB_BY_KEY: dict[tuple, str] = {}
+_JOBS_LOCK = asyncio.Lock()
 
 
 def _is_htmx_request(request: Request) -> bool:
@@ -67,12 +68,14 @@ def _prune_expired_jobs():
     now = time.monotonic()
     expired = [
         job_id for job_id, job in JOBS.items()
-        if now - job["created_at"] > _job_ttl_seconds(job)
+        if job["status"] != "running" and now - job["created_at"] > _job_ttl_seconds(job)
     ]
     for job_id in expired:
         job = JOBS.pop(job_id, None)
         if job:
-            _INFLIGHT_JOB_BY_KEY.pop(_job_key(job["company"], job["mode"]), None)
+            key = _job_key(job["company"], job["mode"])
+            if _INFLIGHT_JOB_BY_KEY.get(key) == job_id:
+                _INFLIGHT_JOB_BY_KEY.pop(key, None)
 
 
 def _current_user(request: Request) -> dict | None:
@@ -257,6 +260,7 @@ async def _run_screen_job(job_id: str, company: str, mode: str, user_id: str | N
             job["result"] = result
             job["files"] = files
             job["screening_id"] = screening_id
+            job["created_at"] = time.monotonic()
         else:
             logger.warning(
                 "job DONE but job_id no longer in JOBS job_id=%s company=%r screening_id=%s",
@@ -270,29 +274,32 @@ async def _run_screen_job(job_id: str, company: str, mode: str, user_id: str | N
         if job is not None:
             job["status"] = "error"
             job["error"] = str(exc)
+            job["created_at"] = time.monotonic()
     finally:
         if _INFLIGHT_JOB_BY_KEY.get(key) == job_id:
             _INFLIGHT_JOB_BY_KEY.pop(key, None)
 
 
-def _start_screen_job(company: str, mode: str, user_id: str | None) -> str:
+async def _start_screen_job(company: str, mode: str, user_id: str | None) -> str:
     key = _job_key(company, mode)
-    existing_job_id = _INFLIGHT_JOB_BY_KEY.get(key)
-    if existing_job_id and existing_job_id in JOBS and JOBS[existing_job_id]["status"] == "running":
-        return existing_job_id
+    async with _JOBS_LOCK:
+        existing_job_id = _INFLIGHT_JOB_BY_KEY.get(key)
+        if existing_job_id and existing_job_id in JOBS and JOBS[existing_job_id]["status"] == "running":
+            return existing_job_id
 
-    job_id = uuid.uuid4().hex
-    JOBS[job_id] = {
-        "status": "running",
-        "company": company,
-        "mode": mode,
-        "created_at": time.monotonic(),
-        "result": None,
-        "files": None,
-        "error": None,
-        "screening_id": None,
-    }
-    _INFLIGHT_JOB_BY_KEY[key] = job_id
+        job_id = uuid.uuid4().hex
+        JOBS[job_id] = {
+            "status": "running",
+            "company": company,
+            "mode": mode,
+            "created_at": time.monotonic(),
+            "result": None,
+            "files": None,
+            "error": None,
+            "screening_id": None,
+        }
+        _INFLIGHT_JOB_BY_KEY[key] = job_id
+
     asyncio.create_task(_run_screen_job(job_id, company, mode, user_id))
     return job_id
 
@@ -433,6 +440,13 @@ async def results_page(request: Request, screening_id: str):
 @app.post("/screen")
 async def screen(request: Request, company: str = Form(...), mode: str = Form("screen")):
     company = company.strip()
+    if not company:
+        return HTMLResponse(
+            '<div class="ff-error"><strong>Enter a company name.</strong>'
+            "<p>Type a company name before running research.</p></div>",
+            status_code=400,
+        )
+
     _prune_expired_jobs()
 
     user = _current_user(request)
@@ -446,7 +460,7 @@ async def screen(request: Request, company: str = Form(...), mode: str = Form("s
         )
         return RedirectResponse(f"/results/{reusable_row['id']}", status_code=303)
 
-    job_id = _start_screen_job(company, mode, user_id)
+    job_id = await _start_screen_job(company, mode, user_id)
     job = JOBS[job_id]
 
     return templates.TemplateResponse(
