@@ -1,9 +1,15 @@
 import hashlib
 import json
+import logging
 import re
+import time
 
 import certifi
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger("tap.utils")
 
 BOILERPLATE_LINE_PATTERNS = [
     re.compile(r"^(home|about us?|contact us?|careers?|sign in|log ?in|sign up|register)$", re.IGNORECASE),
@@ -27,24 +33,123 @@ STRIP_TAGS = [
 
 MAIN_CONTENT_SELECTORS = ["main", "article", "[role=main]", "#content", ".content", ".main-content"]
 
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+RETRY_STATUS_FORCELIST = (403, 429, 500, 502, 503, 504)
+RETRY_TOTAL = 2
+RETRY_BACKOFF_FACTOR = 1.2
+
 
 def build_http_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": DEFAULT_USER_AGENT,
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+        "DNT": "1",
     })
     session.verify = certifi.where()
+
+    retry = Retry(
+        total=RETRY_TOTAL,
+        backoff_factor=RETRY_BACKOFF_FACTOR,
+        status_forcelist=RETRY_STATUS_FORCELIST,
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     return session
 
 
+_SESSION_SINGLETON: requests.Session | None = None
+
+
 def get_session() -> requests.Session:
-    return build_http_session()
+    global _SESSION_SINGLETON
+    if _SESSION_SINGLETON is None:
+        _SESSION_SINGLETON = build_http_session()
+    return _SESSION_SINGLETON
+
+
+def get_with_referer_fallback(url: str, timeout: float, **kwargs) -> requests.Response:
+    """GET a URL, and if it 403s with no referer, retry once with a same-origin referer.
+
+    Some WAFs specifically block direct-to-resource requests (especially PDFs) that
+    arrive with no referer chain, but allow the same request if it looks like it came
+    from a click on the site's own homepage.
+    """
+    session = get_session()
+    response = session.get(url, timeout=timeout, **kwargs)
+    if response.status_code == 403:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            homepage = f"{parsed.scheme}://{parsed.netloc}/"
+            if homepage != url:
+                retry_headers = dict(kwargs.pop("headers", {}) or {})
+                retry_headers["Referer"] = homepage
+                logger.info("retrying with referer after 403 url=%s referer=%s", url, homepage)
+                response = session.get(url, timeout=timeout, headers=retry_headers, **kwargs)
+        except Exception as exc:
+            logger.info("referer retry failed url=%s error=%s", url, exc)
+    return response
+
+
+def classify_fetch_error(exc: Exception) -> str:
+    """Classify a fetch exception into a coarse error_type for structured logging."""
+    text = str(exc)
+    exc_type = type(exc).__name__
+    if "NameResolutionError" in text or "NameResolutionError" in exc_type or "getaddrinfo" in text:
+        return "dns"
+    if isinstance(exc, requests.exceptions.SSLError) or "SSLError" in exc_type:
+        return "ssl"
+    if isinstance(exc, requests.exceptions.Timeout) or "Timeout" in exc_type:
+        return "timeout"
+    if isinstance(exc, requests.exceptions.HTTPError):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status is not None:
+            if 400 <= status < 500:
+                return f"http_4xx_{status}"
+            if 500 <= status < 600:
+                return f"http_5xx_{status}"
+        return "http_error"
+    match = re.search(r"\b(4\d{2}|5\d{2})\b", text)
+    if match:
+        code = int(match.group(1))
+        return f"http_4xx_{code}" if code < 500 else f"http_5xx_{code}"
+    if "ConnectionError" in exc_type:
+        return "connection_error"
+    return "other"
+
+
+def domain_resolves(domain: str, timeout: float = 1.5) -> bool:
+    """Fast DNS-only check so we don't burn fetch slots/time on domains that don't exist."""
+    import socket
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.gethostbyname(domain)
+        return True
+    except Exception:
+        return False
+    finally:
+        socket.setdefaulttimeout(None)
 
 
 def make_source(source_name: str, priority: int, url: str = "", text: str = "",

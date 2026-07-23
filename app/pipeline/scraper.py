@@ -8,9 +8,17 @@ from bs4 import BeautifulSoup
 
 from app.pipeline import google_search
 from app.pipeline.people_parser import parse_linkedin_hit
-from app.pipeline.search_budget import SearchBudget, ddgs_global_lock
+from app.pipeline.search_budget import SearchBudget, ddgs_global_lock, ddgs_pace
 from app.pipeline.source_registry import SourceRegistry
-from app.pipeline.utils import clean_text, extract_main_text, get_session, make_source
+from app.pipeline.utils import (
+    classify_fetch_error,
+    clean_text,
+    domain_resolves,
+    extract_main_text,
+    get_session,
+    get_with_referer_fallback,
+    make_source,
+)
 
 logger = logging.getLogger("tap.scraper")
 
@@ -34,6 +42,11 @@ AGGREGATOR_DOMAINS = (
 BLOCKED_403_DOMAINS = (
     "zaubacorp.", "tracxn.",
 )
+
+# Domains that repeatedly 403'd within this process are added here at runtime so we
+# stop burning retries/time on them for the rest of the session.
+_DYNAMIC_BLOCKED_DOMAINS: dict[str, int] = {}
+_DYNAMIC_BLOCK_THRESHOLD = 3
 
 OFFICIAL_GOV_DOMAINS = (
     "mca.gov.in", "csr.gov.in", "nic.in", "india.gov.in", "meity.gov.in",
@@ -258,14 +271,15 @@ CANDIDATE_EVAL_LIMIT = 2
 MIN_ACCEPT_SCORE = 6
 STRONG_ACCEPT_SCORE = 10
 
-PAGE_FETCH_TIMEOUT_SECONDS = 6
-PDF_FETCH_TIMEOUT_SECONDS = 8
-HOMEPAGE_FETCH_TIMEOUT_SECONDS = 5
+PAGE_FETCH_TIMEOUT_SECONDS = 8
+PDF_FETCH_TIMEOUT_SECONDS = 10
+HOMEPAGE_FETCH_TIMEOUT_SECONDS = 6
+DNS_CHECK_TIMEOUT_SECONDS = 1.5
 DDGS_TOTAL_BUDGET_SECONDS = 4
-DDGS_BACKENDS = ("duckduckgo",)
+DDGS_BACKENDS = ("duckduckgo", "lite")
 SEARCH_TASK_TIMEOUT_SECONDS = 6
-FETCH_TASK_TIMEOUT_SECONDS = 8
-SOURCE_DEADLINE_SECONDS = 12
+FETCH_TASK_TIMEOUT_SECONDS = 10
+SOURCE_DEADLINE_SECONDS = 14
 FOLLOWUP_DEADLINE_SECONDS = 10
 CONCURRENT_FETCH_LIMIT = 4
 
@@ -362,9 +376,22 @@ def mentions_company(company: str, text: str) -> bool:
 
 
 def candidate_domains(company: str) -> list[str]:
+    """Generate plausible domain guesses, .com first, verified via a fast DNS check
+    so we never waste a fetch slot on a domain that plainly doesn't exist.
+    """
     tokens = company_name_tokens(company) or [re.sub(r"[^a-z0-9]", "", company.lower())]
     slugs = list(dict.fromkeys(["".join(tokens), tokens[0]]))
-    return [f"www.{slug}{tld}" for slug in slugs if slug for tld in (".com", ".in", ".co.in", ".org")]
+    # .com first: for well-known companies this is nearly always correct.
+    ordered = []
+    for tld in (".com", ".in", ".co.in", ".org"):
+        for slug in slugs:
+            if slug:
+                ordered.append(f"www.{slug}{tld}")
+
+    verified = [d for d in ordered if domain_resolves(d, timeout=DNS_CHECK_TIMEOUT_SECONDS)]
+    if not verified:
+        logger.info("candidate_domains: none of %d guessed domains resolved for company=%r", len(ordered), company)
+    return verified
 
 
 def url_belongs_to_company(company: str, url: str, known_domains: list[str] | None = None) -> bool:
@@ -388,7 +415,24 @@ def is_known_blocked_domain(url: str) -> bool:
     if not url:
         return False
     host = urlparse(url).netloc.lower()
-    return any(domain in host for domain in BLOCKED_403_DOMAINS)
+    if any(domain in host for domain in BLOCKED_403_DOMAINS):
+        return True
+    return _DYNAMIC_BLOCKED_DOMAINS.get(host, 0) >= _DYNAMIC_BLOCK_THRESHOLD
+
+
+def _record_blocked_response(url: str, status_code: int | None) -> None:
+    if status_code != 403:
+        return
+    host = urlparse(url).netloc.lower()
+    if not host:
+        return
+    count = _DYNAMIC_BLOCKED_DOMAINS.get(host, 0) + 1
+    _DYNAMIC_BLOCKED_DOMAINS[host] = count
+    if count == _DYNAMIC_BLOCK_THRESHOLD:
+        logger.warning(
+            "domain dynamically denylisted after %d consecutive 403s this session domain=%s",
+            count, host,
+        )
 
 
 def accept_fetched_text(company: str, text: str, min_len: int = 400) -> bool:
@@ -442,13 +486,14 @@ async def ddgs_search_web(query: str, budget: SearchBudget | None, max_results: 
         logger.info("ddgs skipped, budget exhausted query=%r", query)
         return []
 
-    def _run_sync() -> list[dict]:
+    def _run_sync() -> tuple[list[dict], str]:
         try:
             from ddgs import DDGS
         except Exception as exc:
             logger.warning("ddgs import failed query=%r error=%s", query, exc)
-            return []
+            return [], "import_failed"
         deadline = time.monotonic() + total_budget_seconds
+        last_error = ""
         for backend in DDGS_BACKENDS:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -458,28 +503,40 @@ async def ddgs_search_web(query: str, budget: SearchBudget | None, max_results: 
                 with DDGS(timeout=max(1, min(remaining, 5))) as ddgs:
                     results = list(ddgs.text(query, max_results=max_results, backend=backend))
                 if results:
-                    return results
+                    return results, ""
+                last_error = "empty_result_set"
             except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
                 logger.info("ddgs backend failed backend=%s query=%r error=%s", backend, query, exc)
                 continue
-        return []
+        return [], last_error
 
     lock = ddgs_global_lock()
     async with lock:
+        await ddgs_pace()
         if budget is not None:
             budget.record_ddgs_query()
         try:
-            return await asyncio.wait_for(asyncio.to_thread(_run_sync), timeout=SEARCH_TASK_TIMEOUT_SECONDS)
+            results, error_reason = await asyncio.wait_for(
+                asyncio.to_thread(_run_sync), timeout=SEARCH_TASK_TIMEOUT_SECONDS,
+            )
+            if not results:
+                logger.info(
+                    "ddgs_search_web no results query=%r reason=%s — likely rate-limited/blocked "
+                    "if this repeats across queries, not a genuine zero-result search",
+                    query, error_reason or "unknown",
+                )
+            return results
         except asyncio.TimeoutError:
             logger.warning("ddgs_search_web timed out query=%r", query)
             return []
 
 
 async def search_web(query: str, budget: SearchBudget, max_results: int = 6,
-                      prefer_google: bool = True, quota_guard=None) -> list[dict]:
+                      prefer_google: bool = True, quota_guard=None, category: str = "") -> list[dict]:
     google_available = prefer_google and google_search.google_search_configured_and_available(quota_guard)
 
-    if google_available and budget.google_has_budget():
+    if google_available and budget.google_has_budget(category):
         budget.record_google_query()
         try:
             results = await asyncio.wait_for(
@@ -491,46 +548,51 @@ async def search_web(query: str, budget: SearchBudget, max_results: int = 6,
             results = []
         if results:
             return results
-        logger.info("google search returned empty query=%r", query)
+        logger.info("google search returned empty query=%r category=%r", query, category)
         if not budget.ddgs_has_budget():
             return []
         return await ddgs_search_web(query, budget, max_results=max_results)
 
-    if google_available and not budget.google_has_budget():
-        logger.info("google search skipped, company budget exhausted query=%r", query)
+    if google_available and not budget.google_has_budget(category):
+        logger.info("google search skipped, company budget exhausted query=%r category=%r", query, category)
 
     if not budget.ddgs_has_budget():
         return []
     return await ddgs_search_web(query, budget, max_results=max_results)
 
 
-def _fetch_page_text_sync(url: str, max_chars: int, verify_ssl: bool) -> str:
+def _fetch_page_text_sync(url: str, max_chars: int, verify_ssl: bool) -> tuple[str, str]:
     if is_known_blocked_domain(url):
-        return ""
+        return "", "known_blocked_domain"
     try:
-        response = get_session().get(url, timeout=PAGE_FETCH_TIMEOUT_SECONDS, verify=verify_ssl)
+        response = get_with_referer_fallback(url, timeout=PAGE_FETCH_TIMEOUT_SECONDS, verify=verify_ssl)
+        _record_blocked_response(url, response.status_code)
+        if response.status_code == 403:
+            snippet = response.text[:200] if response.text else ""
+            logger.info("fetch_page_text 403 url=%s body_snippet=%r", url, snippet)
+            return "", "http_4xx_403"
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "lxml")
-        return extract_main_text(soup, max_chars)
+        return extract_main_text(soup, max_chars), ""
     except Exception as exc:
-        if "404" in str(exc):
-            logger.debug("fetch_page_text 404 url=%s", url)
-        elif "403" in str(exc):
-            logger.debug("fetch_page_text 403 url=%s", url)
+        error_type = classify_fetch_error(exc)
+        if error_type == "dns":
+            logger.info("fetch_page_text dns_failure url=%s error_type=%s", url, error_type)
         else:
-            logger.info("fetch_page_text failed url=%s error=%s", url, exc)
-        return ""
+            logger.info("fetch_page_text failed url=%s error_type=%s error=%s", url, error_type, exc)
+        return "", error_type
 
 
 async def fetch_page_text(url: str, max_chars: int = MAX_PAGE_TEXT_CHARS, verify_ssl: bool = True) -> str:
     async with _FETCH_SEMAPHORE:
         try:
-            return await asyncio.wait_for(
+            text, _error_type = await asyncio.wait_for(
                 asyncio.to_thread(_fetch_page_text_sync, url, max_chars, verify_ssl),
                 timeout=FETCH_TASK_TIMEOUT_SECONDS,
             )
+            return text
         except asyncio.TimeoutError:
-            logger.info("fetch_page_text timed out url=%s", url)
+            logger.info("fetch_page_text timed out url=%s error_type=timeout", url)
             return ""
 
 
@@ -567,14 +629,19 @@ def _select_financial_pdf_pages(pdf, max_pages: int, max_scan: int) -> list:
     return [pdf.pages[idx] for idx in top_indices]
 
 
-def _fetch_pdf_text_sync(url: str, max_chars: int, max_pages: int) -> str:
+def _fetch_pdf_text_sync(url: str, max_chars: int, max_pages: int) -> tuple[str, str]:
     if is_known_blocked_domain(url):
-        return ""
+        return "", "known_blocked_domain"
     try:
         import io
         import pdfplumber
 
-        response = get_session().get(url, timeout=PDF_FETCH_TIMEOUT_SECONDS)
+        response = get_with_referer_fallback(url, timeout=PDF_FETCH_TIMEOUT_SECONDS)
+        _record_blocked_response(url, response.status_code)
+        if response.status_code == 403:
+            snippet = response.text[:200] if response.text else ""
+            logger.info("fetch_pdf_text 403 url=%s body_snippet=%r", url, snippet)
+            return "", "http_4xx_403"
         response.raise_for_status()
         with pdfplumber.open(io.BytesIO(response.content)) as pdf:
             pages = _select_financial_pdf_pages(pdf, max_pages, FINANCIAL_PDF_SCAN_PAGES)
@@ -587,21 +654,23 @@ def _fetch_pdf_text_sync(url: str, max_chars: int, max_pages: int) -> str:
                     total_len += len(page_text)
                 if total_len >= max_chars:
                     break
-        return clean_text(" ".join(pages_text), max_chars)
+        return clean_text(" ".join(pages_text), max_chars), ""
     except Exception as exc:
-        logger.info("fetch_pdf_text failed url=%s error=%s", url, exc)
-        return ""
+        error_type = classify_fetch_error(exc)
+        logger.info("fetch_pdf_text failed url=%s error_type=%s error=%s", url, error_type, exc)
+        return "", error_type
 
 
 async def fetch_pdf_text(url: str, max_chars: int = MAX_PDF_TEXT_CHARS, max_pages: int = MAX_PDF_PAGES) -> str:
     async with _FETCH_SEMAPHORE:
         try:
-            return await asyncio.wait_for(
+            text, _error_type = await asyncio.wait_for(
                 asyncio.to_thread(_fetch_pdf_text_sync, url, max_chars, max_pages),
                 timeout=FETCH_TASK_TIMEOUT_SECONDS,
             )
+            return text
         except asyncio.TimeoutError:
-            logger.info("fetch_pdf_text timed out url=%s", url)
+            logger.info("fetch_pdf_text timed out url=%s error_type=timeout", url)
             return ""
 
 
@@ -655,7 +724,7 @@ def _sitemap_csr_urls_sync(domain: str, limit: int) -> list[str]:
                 logger.info("sitemap nested fetch failed url=%s error=%s", nested_url, exc)
                 continue
     except Exception as exc:
-        logger.info("sitemap fetch failed domain=%s error=%s", domain, exc)
+        logger.info("sitemap fetch failed domain=%s error_type=%s error=%s", domain, classify_fetch_error(exc), exc)
     return []
 
 
@@ -676,9 +745,47 @@ async def discover_company_domain(company: str, search_cfg: dict, budget: Search
     return domains[0] if domains else ""
 
 
+async def _direct_dotcom_probe(company: str) -> str:
+    """Try the obvious https://www.{slug}.com directly via a HEAD-equivalent GET,
+    before spending any search budget. For well-known companies this is nearly
+    always correct and costs one cheap request.
+    """
+    tokens = company_name_tokens(company)
+    if not tokens:
+        return ""
+    slug = "".join(tokens)
+    if not slug:
+        return ""
+    domain = f"www.{slug}.com"
+    if not domain_resolves(domain, timeout=DNS_CHECK_TIMEOUT_SECONDS):
+        return ""
+
+    def _probe() -> bool:
+        try:
+            response = get_session().get(f"https://{domain}", timeout=HOMEPAGE_FETCH_TIMEOUT_SECONDS)
+            return response.ok and mentions_company(company, response.text[:20000])
+        except Exception as exc:
+            logger.info("direct_dotcom_probe failed domain=%s error_type=%s", domain, classify_fetch_error(exc))
+            return False
+
+    try:
+        confirmed = await asyncio.wait_for(asyncio.to_thread(_probe), timeout=FETCH_TASK_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        return ""
+    return domain if confirmed else ""
+
+
 async def discover_company_domains(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None) -> list[str]:
     tokens = company_name_tokens(company)
     acronym = "".join(token[0] for token in tokens) if len(tokens) >= 2 else ""
+
+    matched_domains: list[str] = []
+
+    # Cheap, budget-free first-class candidate: the obvious .com, verified live.
+    direct_hit = await _direct_dotcom_probe(company)
+    if direct_hit:
+        matched_domains.append(direct_hit)
+
     results = await search_web(
         f'"{company}" official website India',
         budget,
@@ -686,7 +793,6 @@ async def discover_company_domains(company: str, search_cfg: dict, budget: Searc
         prefer_google=search_cfg.get("csr_pages", True),
         quota_guard=quota_guard,
     )
-    matched_domains = []
     for result in results:
         host = urlparse(result.get("href", "")).netloc.lower()
         if not host or any(domain in host for domain in AGGREGATOR_DOMAINS):
@@ -697,6 +803,7 @@ async def discover_company_domains(company: str, search_cfg: dict, budget: Searc
         if any(token in host for token in tokens) or (acronym and host_base == acronym):
             if host not in matched_domains:
                 matched_domains.append(host)
+
     return matched_domains[:3]
 
 
@@ -709,6 +816,7 @@ async def resolve_india_legal_entity_name(company: str, search_cfg: dict, budget
         query = query_template.format(c=company)
         results = await search_web(
             query, budget, max_results=6, prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
+            category="legal_entity",
         )
         for result in results:
             haystack = f"{result.get('title', '')} {result.get('body', '')}"
@@ -769,8 +877,12 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
             )
             if response.ok and mentions_company(company, response.text):
                 return domain, response.text
+            logger.info(
+                "homepage fetch non-match domain=%s status=%s mentions_company=%s",
+                domain, response.status_code, mentions_company(company, response.text) if response.ok else "n/a",
+            )
         except Exception as exc:
-            logger.info("homepage fetch failed domain=%s error=%s", domain, exc)
+            logger.info("homepage fetch failed domain=%s error_type=%s error=%s", domain, classify_fetch_error(exc), exc)
         return None
 
     live_homepages = []
@@ -828,7 +940,8 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
             if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
                 break
             results = await search_web(
-                query, budget, max_results=6, prefer_google=search_cfg.get("csr_pages", True), quota_guard=quota_guard
+                query, budget, max_results=6, prefer_google=search_cfg.get("csr_pages", True), quota_guard=quota_guard,
+                category="csr_page",
             )
             for result in results:
                 url = result.get("href", "")
@@ -870,6 +983,7 @@ async def find_company_cin(company: str, search_cfg: dict, budget: SearchBudget,
         query = query_template if legal_name and "{legal_name}" not in query_template else query_template.format(c=company)
         results = await search_web(
             query, budget, max_results=5, prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
+            category="cin",
         )
         for result in results:
             body = result.get("body", "") + " " + result.get("title", "") + " " + result.get("href", "")
@@ -928,6 +1042,7 @@ async def fetch_mca_portal(company: str, search_cfg: dict, budget: SearchBudget,
         results = await search_web(
             query, budget, max_results=6,
             prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
+            category="mca_filing",
         )
         for result in results:
             url = result.get("href", "")
@@ -990,6 +1105,7 @@ async def fetch_national_csr_portal(company: str, search_cfg: dict, budget: Sear
         results = await search_web(
             query_template.format(c=company), budget, max_results=6,
             prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
+            category="national_csr_portal",
         )
         for result in results[:6]:
             url = result.get("href", "")
@@ -1039,6 +1155,7 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
             max_results=8,
             prefer_google=search_cfg.get("annual_reports", True),
             quota_guard=quota_guard,
+            category="annual_report",
         )
         for result in results:
             url = result.get("href", "")
@@ -1078,7 +1195,8 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
                 break
             query = f'"{company}" "annual report" {fy} CSR filetype:pdf'
             results = await search_web(
-                query, budget, max_results=6, prefer_google=search_cfg.get("annual_reports", True), quota_guard=quota_guard
+                query, budget, max_results=6, prefer_google=search_cfg.get("annual_reports", True), quota_guard=quota_guard,
+                category="annual_report",
             )
             for result in results:
                 url = result.get("href", "")
@@ -1122,7 +1240,10 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
         if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
             break
         query = template.format(c=company)
-        results = await search_web(query, budget, max_results=6, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard)
+        results = await search_web(
+            query, budget, max_results=6, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard,
+            category="partner_search",
+        )
         for result in results:
             url = result.get("href", "")
             title = result.get("title", "")
@@ -1166,7 +1287,8 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
             break
         query = template.format(c=company)
         results = await search_web(
-            query, budget, max_results=6, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard
+            query, budget, max_results=6, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard,
+            category="education_programme_search",
         )
         for result in results:
             url = result.get("href", "")
@@ -1208,7 +1330,7 @@ async def _run_linkedin_query_batch(company: str, queries: list[str], search_cfg
     for query_template in queries:
         if not await _within_deadline(deadline) or collected >= max_hits:
             break
-        if not budget.google_has_budget():
+        if not budget.google_has_budget("people_search"):
             break
         role_hint = ""
         if '"' in query_template:
@@ -1299,7 +1421,8 @@ async def fetch_plans_source(company: str, search_cfg: dict, budget: SearchBudge
             break
         query = query_template.format(c=company)
         results = await search_web(
-            query, budget, max_results=5, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard
+            query, budget, max_results=5, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard,
+            category="plans_search",
         )
         for result in results:
             url = result.get("href", "")
@@ -1349,6 +1472,7 @@ async def fetch_sector_eligibility_source(company: str, search_cfg: dict, budget
         results = await search_web(
             query, budget, max_results=5,
             prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
+            category="sector_eligibility_search",
         )
         for result in results:
             url = result.get("href", "")
@@ -1393,7 +1517,10 @@ async def run_targeted_queries(company: str, question_category: str, search_cfg:
         if not await _within_deadline(deadline) or fetches_done >= max_fetches:
             break
         query = template.format(c=company, fy=CURRENT_FY_LABEL)
-        results = await search_web(query, budget, max_results=5, prefer_google=True, quota_guard=quota_guard)
+        results = await search_web(
+            query, budget, max_results=5, prefer_google=True, quota_guard=quota_guard,
+            category=f"followup_{question_category}",
+        )
         for result in results:
             url = result.get("href", "")
             title = result.get("title", "")
@@ -1477,19 +1604,20 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
 
     sources = [source_1, source_2, source_3, source_4, source_5, source_6, source_7, source_8, source_9]
     total_figures = sum(count_financial_figures(s.get("text", "")) for s in sources)
-    if total_figures == 0 and budget.google_has_budget():
+    if total_figures == 0 and budget.google_has_budget("csr_budget"):
         legal_name = await resolve_india_legal_entity_name(company, search_cfg, budget, quota_guard)
         spend_templates = [(t, True) for t in CSR_SPEND_ENTITY_QUERIES] if legal_name else []
         spend_templates += [(t, False) for t in CSR_SPEND_QUERIES]
         spend_deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
         for template, is_entity_query in spend_templates:
-            if time.monotonic() >= spend_deadline or not budget.google_has_budget():
+            if time.monotonic() >= spend_deadline or not budget.google_has_budget("csr_budget"):
                 break
             query = template.format(legal_name=legal_name, fy=CURRENT_FY_LABEL) if is_entity_query \
                 else template.format(c=company, fy=CURRENT_FY_LABEL)
             results = await search_web(
                 query, budget, max_results=6,
                 prefer_google=search_cfg.get("csr_pages", True), quota_guard=quota_guard,
+                category="csr_budget",
             )
             for result in results:
                 url = result.get("href", "")
