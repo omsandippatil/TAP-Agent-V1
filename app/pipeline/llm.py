@@ -22,7 +22,7 @@ LLM_UNAVAILABLE_EVIDENCE = "LLM unavailable — unable to generate evidence"
 OUTPUT_TOKEN_RESERVE = 6000
 SCAFFOLD_SAFETY_MARGIN = 250
 MIN_EVIDENCE_BUDGET = 350
-INSIGHT_MAX_TOKENS = 500
+INSIGHT_MAX_TOKENS = 900
 ELIGIBILITY_MAX_TOKENS = 400
 QUESTION_TRIAGE_MAX_TOKENS = 350
 QUESTION_RESOLUTION_MAX_TOKENS = 400
@@ -804,7 +804,7 @@ def parse_json_response(raw_text: str | None) -> dict:
     return {}
 
 
-def _recover_partial_json(cleaned: str) -> dict:
+def _recover_partial_json(cleaned: str, required_key: str | None = "fit_score") -> dict:
     decoder = json.JSONDecoder()
     for cut_point in range(len(cleaned), 0, -1):
         candidate = cleaned[:cut_point].rstrip()
@@ -817,11 +817,44 @@ def _recover_partial_json(cleaned: str) -> dict:
                 parsed = decoder.decode(attempt)
             except (json.JSONDecodeError, TypeError):
                 continue
-            if isinstance(parsed, dict) and parsed.get("fit_score") is not None:
+            if isinstance(parsed, dict) and (required_key is None or parsed.get(required_key) is not None):
                 return parsed
         if cut_point < len(cleaned) - 4000:
             break
     return {}
+
+
+def _extract_narrative_from_truncated_text(raw_text: str) -> str:
+    if not raw_text:
+        return ""
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    match = re.search(r'"narrative"\s*:\s*"', cleaned)
+    if not match:
+        return ""
+    remainder = cleaned[match.end():]
+    chars = []
+    escape_next = False
+    for char in remainder:
+        if escape_next:
+            if char == "n":
+                chars.append("\n")
+            elif char == "t":
+                chars.append("\t")
+            elif char in ('"', "\\", "/"):
+                chars.append(char)
+            else:
+                chars.append(char)
+            escape_next = False
+            continue
+        if char == "\\":
+            escape_next = True
+            continue
+        if char == '"':
+            break
+        chars.append(char)
+    text = "".join(chars).strip()
+    return text
 
 
 _STRAY_MARKER_PATTERN = re.compile(r"\*{3,}")
@@ -1603,10 +1636,12 @@ async def select_important_links(company: str, search_results: list[dict]) -> li
     raw_reply = await call_anthropic_chat(
         important_links_prompt(company, search_results_text),
         temperature=0.0,
-        max_tokens=500,
+        max_tokens=700,
         caller=f"select_important_links:{company}",
     )
     parsed = parse_json_response(raw_reply)
+    if not parsed and raw_reply:
+        parsed = _recover_partial_json(raw_reply, required_key="links")
     try:
         validated = ImportantLinksSchema.model_validate(parsed)
     except ValidationError:
@@ -1658,6 +1693,8 @@ async def match_people_from_search(company: str, hits: list[dict]) -> list[dict]
         caller=f"match_people_from_search:{company}",
     )
     parsed = parse_json_response(raw_reply)
+    if not parsed and raw_reply:
+        parsed = _recover_partial_json(raw_reply, required_key="people")
     try:
         validated = PeopleMatchListSchema.model_validate(parsed)
     except ValidationError:
@@ -2022,12 +2059,37 @@ async def generate_strategic_insight_narrative(company: str, mission: str, state
         max_tokens=INSIGHT_MAX_TOKENS,
         caller=f"strategic_insight:{company}",
     )
-    parsed = parse_json_response(raw_reply)
-    try:
-        validated = StrategicInsightSchema.model_validate(parsed)
-    except ValidationError:
+
+    narrative = ""
+    if raw_reply:
+        parsed = parse_json_response(raw_reply)
+        if not parsed:
+            parsed = _recover_partial_json(raw_reply, required_key="narrative")
+        try:
+            validated = StrategicInsightSchema.model_validate(parsed)
+            narrative = validated.narrative.strip()
+        except ValidationError:
+            narrative = ""
+        if not narrative:
+            narrative = _extract_narrative_from_truncated_text(raw_reply)
+            if narrative:
+                logger.info(
+                    "strategic_insight recovered narrative from truncated raw text company=%r chars=%d",
+                    company, len(narrative),
+                )
+
+    if not narrative:
+        logger.warning(
+            "strategic_insight could not produce a narrative company=%r fit_score=%d — falling back to "
+            "fit_rationale from the already-completed analysis instead of discarding it",
+            company, fit_score,
+        )
+        narrative = (analysis.get("fit_rationale") or "").strip()
+
+    if not narrative:
         return LLM_UNAVAILABLE_EVIDENCE
-    narrative = _normalize_highlight_markers(validated.narrative.strip())
+
+    narrative = _normalize_highlight_markers(narrative)
     if narrative and "**" not in narrative:
         strongest = sorted(
             [c for c in analysis.get("criteria", []) if c.get("confidence", 0) > 0],
@@ -2065,4 +2127,4 @@ async def api_health_check() -> dict:
             "configured": google_ok,
             "message": "Google Custom Search configured" if google_ok else "Google Search not configured — using DDGS fallback for all queries",
         },
-    } 
+    }

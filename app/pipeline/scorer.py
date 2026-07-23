@@ -26,14 +26,24 @@ TIER_DEFAULT = [
      "description": "Low fit with TAP's 21st-century skills mission."},
 ]
 
+TIER_UNSCORED = {
+    "tier": None, "label": "Insufficient Data", "color": "#9CA3A3", "key": "UNSCORED",
+    "action": "Gather more evidence before scoring — try direct outreach to the company's India CSR office.",
+    "description": "Not enough public evidence to score fit. This is not a negative signal.",
+}
+
 SCORE_BANDS = [
     {"min": 75, "key": "HIGH", "label": "Strong fit — prioritise", "color": "#146B65"},
     {"min": 40, "key": "MID", "label": "Partial fit — monitor", "color": "#F5C518"},
     {"min": 0, "key": "LOW", "label": "Low fit — deprioritise", "color": "#9CA3A3"},
 ]
 
+BAND_UNSCORED = {"key": "UNSCORED", "label": "Not enough evidence to score", "color": "#9CA3A3"}
 
-def get_scoring_tier(score: int, cfg: dict) -> dict:
+
+def get_scoring_tier(score, cfg: dict) -> dict:
+    if score is None:
+        return dict(TIER_UNSCORED)
     tiers = cfg.get("decision_tiers_v7", TIER_DEFAULT) or TIER_DEFAULT
     for tier in tiers:
         if score >= tier.get("min", 0):
@@ -41,7 +51,9 @@ def get_scoring_tier(score: int, cfg: dict) -> dict:
     return tiers[-1]
 
 
-def score_band(score: int, cfg: dict) -> dict:
+def score_band(score, cfg: dict) -> dict:
+    if score is None:
+        return dict(BAND_UNSCORED)
     bands = cfg.get("score_bands", SCORE_BANDS) or SCORE_BANDS
     for band in bands:
         if score >= band.get("min", 0):
@@ -215,6 +227,25 @@ async def resolve_logo(company: str, sources: list, cfg: dict, quota_guard=None)
         return ""
 
 
+def _unscored_result(state: str, insight: str, sources: list, source_links: list, logo_url: str,
+                      registry: SourceRegistry, decision_makers: list | None = None) -> dict:
+    return {
+        "state": state,
+        "fit_score": None,
+        "strategic_insight": insight,
+        "band": dict(BAND_UNSCORED),
+        "scoring_tier": dict(TIER_UNSCORED),
+        "analysis": None,
+        "score_breakdown": {},
+        "decision_makers": decision_makers or [],
+        "sources": sources,
+        "source_links": source_links,
+        "important_links": [],
+        "logo_url": logo_url,
+        "source_bank": registry.as_source_bank(),
+    }
+
+
 async def score(company: str, sources: list, cfg: dict, quota_guard=None,
                  registry: SourceRegistry | None = None) -> dict:
     registry = registry or SourceRegistry(company)
@@ -228,32 +259,19 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
     source_links = build_source_links(sources)
     logo_url = await resolve_logo(company, sources, cfg, quota_guard)
 
-    if state == "CONFIRMED_ABSENT":
-        logger.info("score SKIP company=%r reason=confirmed_absent no_anthropic_calls", company)
-        tier = get_scoring_tier(0, cfg)
-        return {
-            "state": state,
-            "fit_score": 0,
-            "strategic_insight": (
-                f"{company} has no publicly available India CSR data across the sources checked. "
-                "This may indicate no disclosed India CSR obligation, or CSR activity that is not "
-                "publicly documented. Recommended: direct outreach to their India CSR office to confirm."
-            ),
-            "band": score_band(0, cfg),
-            "scoring_tier": tier,
-            "analysis": None,
-            "score_breakdown": {},
-            "decision_makers": [],
-            "sources": sources,
-            "source_links": source_links,
-            "important_links": [],
-            "logo_url": logo_url,
-            "source_bank": registry.as_source_bank(),
-        }
-
     mission = cfg.get("org_mission") or llm.DEFAULT_MISSION
     sources_manifest = merge_manifest_with_registry(build_sources_manifest(sources), registry)
     relevant_evidence_preview, _ = build_evidence_for_analysis(sources, company)
+
+    if state == "CONFIRMED_ABSENT" and not relevant_evidence_preview.strip():
+        logger.info("score UNSCORED company=%r reason=confirmed_absent no_anthropic_calls", company)
+        insight = (
+            f"No publicly available India CSR data was found for {company} across the sources checked. "
+            "This does not mean {company} is a poor fit — it may simply mean their CSR activity isn't "
+            "publicly documented, or it sits behind channels this search doesn't reach. "
+            "Recommended: direct outreach to their India CSR office to confirm fit before deprioritising."
+        ).format(company=company)
+        return _unscored_result(state, insight, sources, source_links, logo_url, registry)
 
     analysis = None
     if relevant_evidence_preview.strip():
@@ -263,7 +281,7 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             logger.error("score analyze_company raised company=%r error=%s", company, exc)
             analysis = None
     else:
-        logger.info("score SKIP company=%r reason=no_relevant_evidence no_anthropic_calls", company)
+        logger.info("score UNSCORED company=%r reason=no_relevant_evidence no_anthropic_calls", company)
 
     valid_numbers = {entry["number"] for entry in registry.entries()}
 
@@ -272,31 +290,20 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         if cooldown_remaining > 0:
             insight = (
                 f"{llm.LLM_UNAVAILABLE_EVIDENCE} — Anthropic rate limit is active, "
-                f"try again in about {int(cooldown_remaining // 60)}m {int(cooldown_remaining % 60)}s."
+                f"try again in about {int(cooldown_remaining // 60)}m {int(cooldown_remaining % 60)}s. "
+                "This is a temporary infrastructure gap, not a reflection of the company's fit."
             )
             logger.warning(
-                "score ABORT company=%r reason=anthropic_cooldown_active seconds_left=%.0f fit_score=0",
+                "score UNSCORED company=%r reason=anthropic_cooldown_active seconds_left=%.0f",
                 company, cooldown_remaining,
             )
         else:
-            insight = llm.LLM_UNAVAILABLE_EVIDENCE
-            logger.warning("score ABORT company=%r reason=no_analysis fit_score=0", company)
-        tier = get_scoring_tier(0, cfg)
-        return {
-            "state": state,
-            "fit_score": 0,
-            "strategic_insight": insight,
-            "band": score_band(0, cfg),
-            "scoring_tier": tier,
-            "analysis": None,
-            "score_breakdown": {},
-            "decision_makers": resolve_decision_makers(sources),
-            "sources": sources,
-            "source_links": source_links,
-            "important_links": [],
-            "logo_url": logo_url,
-            "source_bank": registry.as_source_bank(),
-        }
+            insight = (
+                f"{llm.LLM_UNAVAILABLE_EVIDENCE} This is a temporary gap in evidence processing, "
+                "not a reflection of the company's fit — re-run scoring once evidence is available."
+            )
+            logger.warning("score UNSCORED company=%r reason=no_analysis", company)
+        return _unscored_result(state, insight, sources, source_links, logo_url, registry, resolve_decision_makers(sources))
 
     final_score = int(round(min(max(analysis.get("fit_score", 0), 0), 100)))
     breakdown = build_score_breakdown(analysis)
@@ -315,7 +322,10 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         insight = strip_unknown_citation_tokens(insight, valid_numbers)
     except Exception as exc:
         logger.error("score strategic_insight raised company=%r error=%s", company, exc)
-        insight = llm.LLM_UNAVAILABLE_EVIDENCE
+        insight = (
+            f"{llm.LLM_UNAVAILABLE_EVIDENCE} A numeric fit score was generated from available evidence, "
+            "but the narrative summary could not be produced this run."
+        )
 
     decision_makers = resolve_decision_makers(sources)
 
