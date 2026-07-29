@@ -40,6 +40,24 @@ FORMER_ROLE_KEYWORD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Titles that must NEVER be surfaced as a CSR decision-maker even if the
+# combined title+snippet text happens to also mention "CSR" (e.g. a generic
+# company-CSR blurb sitting next to an unrelated person's profile snippet).
+# This is the concrete fix for "drop software, sales and regional-operations
+# titles": these keywords are checked against the extracted TITLE only, and
+# only block when the title itself carries no CSR/sustainability signal.
+NON_CSR_TITLE_KEYWORD_PATTERN = re.compile(
+    r"\b(software\s+(?:engineer|developer)|sales\s+(?:manager|executive|director|"
+    r"representative|associate|lead)|regional\s+(?:operations|sales)|business\s+"
+    r"development|product\s+(?:manager|engineer)|account\s+manager|"
+    r"marketing\s+(?:manager|executive)(?!\s*,?\s*csr)|(?<!csr\s)finance\s+"
+    r"(?:manager|executive|analyst)|procurement|supply\s+chain|it\s+support|"
+    r"software\s+testing|human\s+resources?\s+(?:generalist|executive|associate)|"
+    r"talent\s+acquisition|recruiter|plant\s+(?:manager|operations)|factory\s+"
+    r"operations)\b",
+    re.IGNORECASE,
+)
+
 COMPANY_AT_PATTERN = re.compile(r"\bat\s+([A-Z][\w&.,\'\-]+(?:\s+[A-Z][\w&.,\'\-]+){0,5})", re.IGNORECASE)
 
 INDIA_LOCATION_TOKENS = frozenset([
@@ -203,6 +221,16 @@ def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> 
     has_csr_signal = bool(CSR_ROLE_KEYWORD_PATTERN.search(f"{raw_title} {snippet}"))
     company_match = is_currently_at_company(raw_title, snippet, affiliation, company)
 
+    # role_verified is the stricter, display-safe gate: has_csr_signal alone can
+    # be a false positive when a generic company-CSR blurb sits in the snippet
+    # next to an unrelated person (e.g. a Regional Sales Manager's profile that
+    # happens to mention the company's CSR programme). Block on the extracted
+    # TITLE matching a known non-CSR category, unless the title itself also
+    # independently carries a CSR/sustainability/ESG signal.
+    title_csr_match = bool(CSR_ROLE_KEYWORD_PATTERN.search(job_title))
+    title_blocked = bool(NON_CSR_TITLE_KEYWORD_PATTERN.search(job_title)) and not title_csr_match
+    role_verified = has_csr_signal and not title_blocked
+
     if current_role and company_match and india_signal:
         confidence = "HIGH"
     elif company_match and (current_role or has_csr_signal) :
@@ -222,6 +250,7 @@ def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> 
         "india_location_signal": india_signal,
         "is_current_csr_role": current_role,
         "has_csr_signal": has_csr_signal,
+        "role_verified": role_verified,
         "is_current_company_match": company_match,
         "confidence": confidence,
     }

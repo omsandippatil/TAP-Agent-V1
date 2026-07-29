@@ -301,7 +301,7 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
             spend_display = spend.get("display") or "Not publicly disclosed"
             spend_url = _resolve_evidence_url(spend.get("source", ""), source_url_lookup)
             spend_values = [
-                "Latest-year India CSR spend",
+                "Latest-year India EDUCATION CSR spend",
                 f"{spend_display} ({spend.get('fiscal_year', '')})".strip(),
                 f"confidence {spend.get('confidence', 0)}%",
                 spend.get("source_excerpt", ""),
@@ -313,14 +313,14 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
                 r = _row(ws, r, spend_values, alignments=spend_alignments)
         elif spend.get("estimated_is_computed") and spend.get("estimated_min_inr_crore") is not None:
             r = _row(ws, r, [
-                "Latest-year India CSR spend",
+                "Latest-year India EDUCATION CSR spend",
                 f"~₹{spend['estimated_min_inr_crore']:g} crore (ESTIMATED, not disclosed)",
                 "statutory minimum",
                 spend.get("estimated_basis", ""),
             ], fonts=[TEAL_BOLD, AMBER_BOLD, SMALL, SMALL], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP], fill=ESTIMATE_FILL)
         elif eligibility.get("net_worth_turnover_signal"):
             r = _row(ws, r, [
-                "Latest-year India CSR spend",
+                "Latest-year India EDUCATION CSR spend",
                 "Not publicly disclosed",
                 "—",
                 f"Business scale is known ({eligibility['net_worth_turnover_signal']}), but no net profit figure was "
@@ -328,16 +328,29 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
             ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP])
         else:
             r = _row(ws, r, [
-                "Latest-year India CSR spend", "Not publicly disclosed", "—",
-                "No CSR figure, net profit, or business-scale figure found to support an estimate.",
+                "Latest-year India EDUCATION CSR spend", "Not publicly disclosed", "—",
+                "No education-specific CSR figure, net profit, or business-scale figure found to support an estimate.",
+            ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP])
+        if spend.get("total_csr_display") or spend.get("total_csr_inr_crore") is not None:
+            r = _row(ws, r, [
+                "Total CSR (all causes — NOT education-specific)",
+                f"{spend.get('total_csr_display', '')} ({spend.get('total_csr_fiscal_year', '')})".strip(),
+                "—",
+                "Company-wide CSR figure; education's share of this total is not separately confirmed unless "
+                "shown in the row above.",
+            ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP])
+        if spend.get("education_pct_of_total_csr") is not None:
+            r = _row(ws, r, [
+                "Education % of total CSR", f"{spend['education_pct_of_total_csr']:g}%", "—",
+                "As stated in evidence.",
             ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP])
         if spend.get("trend_direction") and spend.get("trend_direction") != "UNKNOWN":
             r = _row(ws, r, [
-                "CSR spend trend", spend.get("trend_direction", ""), "—", spend.get("trend_evidence", ""),
+                "Education CSR spend trend", spend.get("trend_direction", ""), "—", spend.get("trend_evidence", ""),
             ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP])
         for entry in spend.get("history", []) or []:
             r = _row(ws, r, [
-                f"CSR spend — {entry.get('fiscal_year', '')}", entry.get("display", ""),
+                f"Education CSR spend — {entry.get('fiscal_year', '')}", entry.get("display", ""),
                 "—", entry.get("source_excerpt", ""),
             ], alignments=[LEFT_TOP, WRAP, WRAP_CENTER, WRAP])
         r = _row(ws, r, [
@@ -367,44 +380,58 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
     ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=4)
     ws.freeze_panes = "A5"
 
-    ws = _sheet(wb, "4. Programmes & Partners", [36, 13, 13, 20, 58])
-    r = _banner(ws, "Programmes & Partners", "Named programmes and partners, tagged Confirmed or Probable", 5)
-    r = _header(ws, r, ["Programme / partner", "Type", "Confidence", "Scale / relationship", "Evidence"])
+    ws = _sheet(wb, "4. Programmes & Partners", [30, 10, 11, 32, 15, 44])
+    r = _banner(ws, "Programmes & Partners", "Named programmes and partners, tagged Confirmed or Probable", 6)
+    r = _header(ws, r, ["Programme / partner", "Type", "Confidence", "What's funded / beneficiary", "Scale / relationship", "Evidence"])
     if has_analysis:
         for programme in analysis.get("programmes", []) or []:
             row_start = r
+            beneficiary_type = programme.get("beneficiary_type", "")
+            funded_beneficiary_lines = [
+                f"Funded: {programme['what_is_funded']}" if programme.get("what_is_funded") else "",
+                f"Beneficiary: {programme['beneficiary_group']}" +
+                (f" ({beneficiary_type.replace('_', ' ').title()})" if beneficiary_type and beneficiary_type != "OTHER" else "")
+                if programme.get("beneficiary_group") else "",
+            ]
             r = _row(ws, r, [
                 programme.get("name", ""), "Programme",
                 _confidence_display(programme.get("confidence", "confirmed")),
+                "\n".join(line for line in funded_beneficiary_lines if line),
                 ("Multi-year · " if programme.get("is_multi_year") else "") + programme.get("cohort_or_scale", ""),
                 f"{programme.get('description', '')} — {programme.get('source_excerpt', '')}".strip(" —"),
-            ], alignments=[LEFT_TOP, WRAP_CENTER, WRAP_CENTER, WRAP, WRAP])
+            ], alignments=[LEFT_TOP, WRAP_CENTER, WRAP_CENTER, WRAP, WRAP, WRAP])
             fill = _confidence_fill(programme.get("confidence"))
             if fill:
                 ws.cell(row=row_start, column=3).fill = fill
                 ws.cell(row=row_start, column=3).font = YELLOW_BOLD
         for partner in analysis.get("partners", []) or []:
             row_start = r
+            programme_cell = f"Programme: {partner['programme']}" if partner.get("programme") else ""
+            scale_lines = [partner.get("relationship_type", "")]
+            if partner.get("year"):
+                scale_lines.append(f"Year: {partner['year']}")
+            if partner.get("geography"):
+                scale_lines.append(f"Geography: {partner['geography']}")
             r = _row(ws, r, [
                 partner.get("name", ""), "Partner",
                 _confidence_display(partner.get("confidence", "confirmed")),
-                partner.get("relationship_type", ""), partner.get("source_excerpt", ""),
-            ], alignments=[LEFT_TOP, WRAP_CENTER, WRAP_CENTER, WRAP, WRAP])
+                programme_cell, "\n".join(line for line in scale_lines if line), partner.get("source_excerpt", ""),
+            ], alignments=[LEFT_TOP, WRAP_CENTER, WRAP_CENTER, WRAP, WRAP, WRAP])
             fill = _confidence_fill(partner.get("confidence"))
             if fill:
                 ws.cell(row=row_start, column=3).fill = fill
                 ws.cell(row=row_start, column=3).font = YELLOW_BOLD
         if not (analysis.get("programmes") or analysis.get("partners")):
-            r = _row(ws, r, ["No programmes or partners found in fetched sources", "", "", "", ""])
+            r = _row(ws, r, ["No programmes or partners found in fetched sources", "", "", "", "", ""])
     else:
-        r = _row(ws, r, ["All programmes/partners", "", "", "", LLM_UNAVAILABLE_EVIDENCE], fill=UNAVAILABLE_FILL)
+        r = _row(ws, r, ["All programmes/partners", "", "", "", "", LLM_UNAVAILABLE_EVIDENCE], fill=UNAVAILABLE_FILL)
     ws.row_dimensions[r + 1].height = 24
     tier_note_cell = ws.cell(
         row=r + 1, column=1,
         value="Confirmed = explicit relationship/detail stated in evidence. Probable = named but not independently confirmed — verify before outreach.",
     )
     tier_note_cell.font = SMALL
-    ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=5)
+    ws.merge_cells(start_row=r + 1, start_column=1, end_row=r + 1, end_column=6)
     ws.freeze_panes = "A5"
 
     ws = _sheet(wb, "5. Decision-Makers", [26, 32, 18, 56, 30])
