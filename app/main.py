@@ -348,7 +348,7 @@ async def history_search(request: Request, q: str = ""):
 
 
 @app.get("/results/{screening_id}")
-async def results_page(request: Request, screening_id: str):
+async def results_page(request: Request, screening_id: str, reused_as: str = ""):
     row = db.get_screening(screening_id)
     if row is None:
         return HTMLResponse(
@@ -388,10 +388,11 @@ async def results_page(request: Request, screening_id: str):
 
     company = row.get("company", "")
     mode = row.get("mode", "screen")
+    extra_context = {"showing_deep_for_screen": bool(reused_as == "screen" and mode == "deep")}
 
     if _is_htmx_request(request):
-        return render_results(request, company, mode, result, files)
-    return render_results_page(request, company, mode, result, files)
+        return render_results(request, company, mode, result, files, extra_context=extra_context)
+    return render_results_page(request, company, mode, result, files, extra_context=extra_context)
 
 
 @app.post("/screen")
@@ -415,7 +416,13 @@ async def screen(request: Request, company: str = Form(...), mode: str = Form("s
             "screen reusing recent result company=%r mode=%s screening_id=%s",
             company, mode, reusable_row["id"],
         )
-        return RedirectResponse(f"/results/{reusable_row['id']}", status_code=303)
+        redirect_url = f"/results/{reusable_row['id']}"
+        if reusable_row.get("mode") != mode:
+            # e.g. a Screen request served from a fresher Deep Research result —
+            # flag it so the results page can label it instead of looking identical
+            # to a fresh run in that mode.
+            redirect_url += f"?reused_as={mode}"
+        return RedirectResponse(redirect_url, status_code=303)
 
     job_id = await _start_screen_job(company, mode, user_id)
     job = JOBS[job_id]
@@ -455,11 +462,26 @@ async def screen_status(request: Request, job_id: str):
     job["status"] = "delivered"
     job["created_at"] = time.monotonic()
 
-    if screening_id:
-        return RedirectResponse(f"/results/{screening_id}", status_code=303)
-
     result = job["result"]
     files = job["files"]
+
+    if screening_id:
+        # /results/{id} rebuilds `files` from Supabase Storage (db.get_screening_files),
+        # not from this in-memory job. If save_screening_file() silently failed (missing
+        # "screening-files" bucket, or an API key without insert/upload permission), that
+        # lookup comes back empty and the Downloads panel vanishes even though we just
+        # generated working docx/xlsx files right here. Only redirect into that persisted
+        # view if there was nothing to generate (Screen mode) or Supabase actually has
+        # what we tried to save; otherwise serve the in-memory result directly so the
+        # user still gets their downloads.
+        if not files or db.get_screening_files(screening_id):
+            return RedirectResponse(f"/results/{screening_id}", status_code=303)
+        logger.warning(
+            "screen_status: job_id=%s screening_id=%s generated %d file(s) but none are "
+            "persisted in Supabase (storage bucket missing or key lacks write access) — "
+            "rendering in-memory result instead of redirecting",
+            job_id, screening_id, len(files),
+        )
 
     if _is_htmx_request(request):
         return render_results(request, job["company"], job["mode"], result, files)

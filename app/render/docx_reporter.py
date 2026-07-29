@@ -51,7 +51,13 @@ SOURCE_LABELS = {
 }
 
 
+UNSCORED_GREY = RGBColor(0x9C, 0xA3, 0xA3)
+UNSCORED_GREY_HEX = "9CA3A3"
+
+
 def fit_hex(score):
+    if score is None:
+        return UNSCORED_GREY_HEX
     if score >= 90:
         return TEAL_DARK_HEX
     if score >= 80:
@@ -64,6 +70,8 @@ def fit_hex(score):
 
 
 def fit_color(score):
+    if score is None:
+        return UNSCORED_GREY
     if score >= 90:
         return TEAL_DARK
     if score >= 80:
@@ -76,6 +84,8 @@ def fit_color(score):
 
 
 def fit_label(score):
+    if score is None:
+        return "NOT SCORED"
     if score >= 90:
         return "PRIORITY MATCH"
     if score >= 80:
@@ -512,7 +522,7 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     score_paragraph = score_cell.paragraphs[0]
     score_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     score_paragraph.paragraph_format.space_after = Pt(0)
-    score_run = score_paragraph.add_run(f"{fit_score}")
+    score_run = score_paragraph.add_run("N/A" if fit_score is None else f"{fit_score}")
     score_run.font.name = FONT_NAME
     score_run.bold = True
     score_run.font.size = Pt(34)
@@ -520,7 +530,7 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     label_paragraph = score_cell.add_paragraph()
     label_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     label_paragraph.paragraph_format.space_after = Pt(0)
-    label_run = label_paragraph.add_run(f"{fit_label(fit_score)} / 100")
+    label_run = label_paragraph.add_run(fit_label(fit_score) if fit_score is None else f"{fit_label(fit_score)} / 100")
     label_run.font.name = FONT_NAME
     label_run.bold = True
     label_run.font.size = Pt(10)
@@ -653,16 +663,35 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
                 add_source_reference_paragraph(doc, flag["source"], source_lookup)
 
     spend = analysis.get("spend", {}) if has_analysis else {}
-    add_section_heading(doc, "India CSR spend")
+    add_section_heading(doc, "India education CSR spend")
     spend_paragraph = doc.add_paragraph()
     spend_paragraph.paragraph_format.space_after = Pt(4)
-    spend_run = spend_paragraph.add_run(
-        f"{spend.get('display', 'Not publicly disclosed')}"
-        + (f"   ({spend['fiscal_year']})" if spend.get("fiscal_year") else ""))
+    if spend.get("is_education_specific") and (spend.get("display") or spend.get("inr_crore") is not None):
+        spend_label = spend.get("display", "")
+        spend_run = spend_paragraph.add_run(
+            f"{spend_label}" + (f"   ({spend['fiscal_year']})" if spend.get("fiscal_year") else ""))
+    else:
+        spend_run = spend_paragraph.add_run("Education-specific figure not publicly disclosed")
     spend_run.font.name = FONT_NAME
     spend_run.bold = True
     spend_run.font.size = Pt(11)
     spend_run.font.color.rgb = TEAL_DARK
+    if spend.get("education_pct_of_total_csr") is not None:
+        pct_paragraph = doc.add_paragraph()
+        pct_paragraph.paragraph_format.space_after = Pt(4)
+        pct_run = pct_paragraph.add_run(f"Education is stated as {spend['education_pct_of_total_csr']:g}% of total CSR spend.")
+        pct_run.font.name = FONT_NAME
+        pct_run.font.size = Pt(9.5)
+    if spend.get("total_csr_display") or spend.get("total_csr_inr_crore") is not None:
+        total_paragraph = doc.add_paragraph()
+        total_paragraph.paragraph_format.space_after = Pt(4)
+        total_run = total_paragraph.add_run(
+            f"Total CSR (all causes, not education-specific): {spend.get('total_csr_display', '')}"
+            + (f"   ({spend['total_csr_fiscal_year']})" if spend.get("total_csr_fiscal_year") else ""))
+        total_run.font.name = FONT_NAME
+        total_run.italic = True
+        total_run.font.size = Pt(9.5)
+        total_run.font.color.rgb = TEAL_MID
     if spend.get("source_excerpt"):
         add_evidence_paragraph(doc, spend["source_excerpt"], source_lookup.get(spend.get("source", ""), ""))
     if spend.get("trend_direction") and spend.get("trend_direction") != "UNKNOWN":
@@ -704,6 +733,26 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
                 scale_run = programme_paragraph.add_run(f"   · {programme['cohort_or_scale']}")
                 scale_run.font.name = FONT_NAME
                 scale_run.font.size = Pt(8.5)
+            beneficiary_type = programme.get("beneficiary_type", "")
+            if beneficiary_type and beneficiary_type != "OTHER":
+                type_run = programme_paragraph.add_run(f"   [{beneficiary_type.replace('_', ' ').title()}]")
+                type_run.font.name = FONT_NAME
+                type_run.font.size = Pt(7.5)
+                type_run.font.color.rgb = TEAL_MID
+            if programme.get("what_is_funded") or programme.get("beneficiary_group"):
+                detail_paragraph = doc.add_paragraph()
+                detail_paragraph.paragraph_format.left_indent = Cm(0.6)
+                detail_paragraph.paragraph_format.space_after = Pt(2)
+                if programme.get("what_is_funded"):
+                    funded_run = detail_paragraph.add_run(f"Funded: {programme['what_is_funded']}")
+                    funded_run.font.name = FONT_NAME
+                    style_small(funded_run, italic=False)
+                if programme.get("beneficiary_group"):
+                    if programme.get("what_is_funded"):
+                        detail_paragraph.add_run("   ")
+                    beneficiary_run = detail_paragraph.add_run(f"Beneficiary: {programme['beneficiary_group']}")
+                    beneficiary_run.font.name = FONT_NAME
+                    style_small(beneficiary_run, italic=False)
             if programme.get("description"):
                 add_evidence_paragraph(doc, programme["description"], source_lookup.get(programme.get("source", ""), ""))
     else:
@@ -715,14 +764,18 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     partners = analysis.get("partners", []) if has_analysis else []
     if partners:
         partner_rows = [
-            (partner.get("name", ""), partner.get("relationship_type", ""), partner.get("source_excerpt", ""))
+            (partner.get("name", ""), partner.get("relationship_type", ""),
+             partner.get("programme", "") or "—", partner.get("year", "") or "—",
+             partner.get("geography", "") or "—", partner.get("source_excerpt", ""))
             for partner in partners
         ]
-        build_data_table(doc, ["Partner", "Type", "Evidence"], [4.6, 3.2, 8.5], partner_rows)
+        build_data_table(doc, ["Partner", "Type", "Programme", "Year", "Geography", "Evidence"],
+                          [3.2, 2.2, 3.2, 1.4, 2.2, 6.5], partner_rows)
         note_paragraph = doc.add_paragraph()
         note_paragraph.paragraph_format.space_before = Pt(8)
         note_run = note_paragraph.add_run(
-            "Partners are listed only when named in a fetched source for this company, in CSR context.")
+            "Partners are listed only when named in a fetched source for this company, in CSR context. "
+            "Programme/Year/Geography show — when the evidence doesn't state them.")
         style_small(note_run)
     else:
         note_run = doc.add_paragraph().add_run("No funded partners found in public sources.")

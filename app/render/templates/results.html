@@ -79,6 +79,13 @@
     </div>
   </header>
 
+  {% if showing_deep_for_screen %}
+    <div class="note note-warn">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 9V13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 17H12.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/></svg>
+      <span>Showing a recent <b>Deep Research</b> result for {{ company }} instead of running a new Screen — Deep Research already covers everything Screen would check. This is not a fresh Screen-mode run.</span>
+    </div>
+  {% endif %}
+
   {% if result.state == 'CONFIRMED_ABSENT' %}
     <div class="note note-bad">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 9V13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 17H12.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/></svg>
@@ -98,6 +105,7 @@
     </div>
     <div class="summary-body">
       <div class="summary-tier" style="--tier-color: {{ tier_color }}">{{ tier.label }}</div>
+      {% if result.is_existing_tap_partner %}<span class="pill-green">Existing TAP partner</span>{% endif %}
       {% if analysis %}<p class="summary-insight">{{ mark(result.strategic_insight) }}</p>{% endif %}
     </div>
   </section>
@@ -217,7 +225,7 @@
       </section>
 
       <section class="section">
-        <h2>India CSR spend</h2>
+        <h2>India education CSR spend</h2>
         <div class="panel">
           {% if spend and spend.has_disclosed_budget %}
             <p><b>{{ spend.display }}</b>{% if spend.fiscal_year %} · {{ spend.fiscal_year }}{% endif %} <span class="conf-pill">confidence {{ spend.confidence }}%</span></p>
@@ -230,13 +238,19 @@
             </p>
             <p class="panel-footnote">{{ spend.estimated_basis }}</p>
           {% elif eligibility and eligibility.net_worth_turnover_signal %}
-            <p class="none">No disclosed CSR budget figure found in the sources fetched.</p>
+            <p class="none">No disclosed education-specific CSR budget figure found in the sources fetched.</p>
             <p class="panel-footnote">Business scale is known ({{ eligibility.net_worth_turnover_signal }}), but a statutory-minimum estimate needs a disclosed <b>net profit</b> figure specifically — revenue/turnover alone isn't a valid input to the 2% Section 135 formula, so no estimate is shown. See Sector &amp; eligibility above for the business-scale figure on record.</p>
           {% else %}
-            <p class="none">No disclosed CSR budget figure found in the sources fetched, and no net profit or business-scale figure was available to estimate a statutory minimum.</p>
+            <p class="none">No disclosed education-specific CSR budget figure found in the sources fetched, and no net profit or business-scale figure was available to estimate a statutory minimum.</p>
+          {% endif %}
+          {% if spend and (spend.total_csr_display or spend.total_csr_inr_crore is not none) %}
+            <p class="panel-footnote"><b>Total CSR (all causes — not education-specific):</b> {{ spend.total_csr_display }}{% if spend.total_csr_fiscal_year %} · {{ spend.total_csr_fiscal_year }}{% endif %}. Education's share of this total is only shown above when separately confirmed.</p>
+          {% endif %}
+          {% if spend and spend.education_pct_of_total_csr is not none %}
+            <p class="panel-footnote">Education is stated as <b>{{ spend.education_pct_of_total_csr }}%</b> of total CSR spend.</p>
           {% endif %}
           {% if spend and spend.trend_direction and spend.trend_direction != 'UNKNOWN' %}
-            <p class="mt-12"><b>Trend: {{ spend.trend_direction }}</b></p>
+            <p class="mt-12"><b>Education spend trend: {{ spend.trend_direction }}</b></p>
             <p class="panel-footnote">{{ evidence_line(spend.trend_evidence, spend.trend_source) }}</p>
           {% endif %}
           {% if spend and spend.history %}
@@ -265,6 +279,14 @@
                   {{ confidence_tag(p.confidence) }}
                   {% if p.is_multi_year %} <span class="pill-green">multi-year</span>{% endif %}
                   {% if p.cohort_or_scale %}<span class="pill">{{ p.cohort_or_scale }}</span>{% endif %}
+                  {% if p.beneficiary_type and p.beneficiary_type != 'OTHER' %}<span class="pill">{{ p.beneficiary_type.replace('_', ' ').title() }}</span>{% endif %}
+                  {% if p.what_is_funded or p.beneficiary_group %}
+                    <div class="evidence">
+                      {% if p.what_is_funded %}<b>Funded:</b> {{ p.what_is_funded }}{% endif %}
+                      {% if p.what_is_funded and p.beneficiary_group %} — {% endif %}
+                      {% if p.beneficiary_group %}<b>Beneficiary:</b> {{ p.beneficiary_group }}{% endif %}
+                    </div>
+                  {% endif %}
                   <div class="evidence">{{ evidence_line(p.description, p.source) }}{% if p.source_excerpt %} — {{ evidence_line(p.source_excerpt, p.source) }}{% endif %}</div>
                 </li>
               {% endfor %}
@@ -288,6 +310,9 @@
                   <b>{{ p.name }}</b>
                   {{ confidence_tag(p.confidence) }}
                   <span class="pill">{{ p.relationship_type }}</span>
+                  {% if p.programme %}<span class="pill">{{ p.programme }}</span>{% endif %}
+                  {% if p.year %}<span class="pill">{{ p.year }}</span>{% endif %}
+                  {% if p.geography %}<span class="pill">{{ p.geography }}</span>{% endif %}
                   <div class="evidence">{{ evidence_line(p.source_excerpt, p.source) }}</div>
                 </li>
               {% endfor %}

@@ -213,7 +213,17 @@ CSR_SPEND_ENTITY_QUERIES = [
 PARTNER_QUERIES = [
     '"{c}" CSR "implementation partner" OR "implementing partner" India NGO named',
     '"{c}" foundation "grant recipients" OR "funded organisations" India CSR named',
+    '"{c}" CSR partnership "press release" OR "joint statement" NGO India announced',
+    'site:linkedin.com/company "{c}" "partnered with" OR "proud to partner" OR "MoU" NGO CSR India',
+    '"{c}" "memorandum of understanding" OR "MoU" NGO education CSR India',
 ]
+
+# How many distinct partner-search pages to combine into one evidence blob.
+# The old version stopped at the single best-scoring page, which is why
+# "no partners found" usually just meant the CSR page was the only thing
+# checked — widening this surfaces LinkedIn announcements and joint press
+# releases that name partners the company's own CSR page never mentions.
+MAX_PARTNER_SOURCES = 4
 
 PLAN_QUERIES = [
     '"{c}" CSR "partnered with" OR "partnership with" education India announced',
@@ -1229,15 +1239,30 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
     return make_source("annual_report", 4, status="NOT_FOUND")
 
 
+_PARTNER_RELEVANCE_KEYWORD_PATTERN = re.compile(
+    r"\b(partner|partnered|partnership|ngo|foundation|mou|memorandum|collaborat|"
+    r"implement|grant|csr)\b", re.IGNORECASE,
+)
+
+
 async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
                                 registry: SourceRegistry | None = None) -> dict:
+    """Widened beyond the company's own CSR page: gathers up to
+    MAX_PARTNER_SOURCES distinct candidate pages (press releases, MoU
+    announcements, foundation grant lists) instead of stopping at the first
+    acceptable one, plus LinkedIn company-page partnership posts read
+    directly from search snippets (LinkedIn's full page is login-walled, so
+    it is never fetched — same approach as the people-search source). "No
+    partners found" used to usually mean only the CSR webpage was checked;
+    this is the fix for that.
+    """
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    best_candidate = None
+    candidates: list[tuple[float, str, str]] = []  # (score, url, text)
+    seen_urls: set[str] = set()
     urls_tried = 0
+
     for template in PARTNER_QUERIES:
         if not await _within_deadline(deadline):
-            break
-        if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
             break
         query = template.format(c=company)
         results = await search_web(
@@ -1248,10 +1273,27 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
             url = result.get("href", "")
             title = result.get("title", "")
             body = result.get("body", "")
-            if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
+            if not url or url in seen_urls:
                 continue
             if not mentions_company(company, f"{title} {body}"):
                 continue
+
+            if "linkedin.com" in url:
+                # LinkedIn is login-walled — never fetch the page, use the
+                # search snippet directly, the same approach fetch_linkedin_
+                # people uses for decision-maker discovery.
+                snippet_text = f"{title}. {body}".strip()
+                if len(snippet_text) < 60 or not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(snippet_text):
+                    continue
+                seen_urls.add(url)
+                urls_tried += 1
+                score = score_candidate_text(company, snippet_text, url)
+                candidates.append((score, url, snippet_text))
+                continue
+
+            if any(domain in url for domain in AGGREGATOR_DOMAINS):
+                continue
+            seen_urls.add(url)
             urls_tried += 1
             is_pdf = url.lower().endswith(".pdf")
             text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
@@ -1260,19 +1302,31 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
             if not (text and len(text) > 250 and is_csr_relevant(text) and mentions_company(company, text)):
                 continue
             score = score_candidate_text(company, text, url)
-            if best_candidate is None or score > best_candidate[0]:
-                best_candidate = (score, make_source("partner_search", 5, url, text, "FOUND", "search"))
-            if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
-                break
+            candidates.append((score, url, text))
 
-    logger.info("partner_search DONE company=%r urls_tried=%d found=%s", company, urls_tried, bool(best_candidate))
+        if len(candidates) >= MAX_PARTNER_SOURCES * 2:
+            break  # plenty gathered — let scoring pick the best below
 
-    if best_candidate:
-        if registry is not None:
-            registry.register_core_source(best_candidate[1])
-        return best_candidate[1]
+    logger.info("partner_search DONE company=%r urls_tried=%d candidates_found=%d", company, urls_tried, len(candidates))
 
-    return make_source("partner_search", 5, status="NOT_FOUND")
+    if not candidates:
+        return make_source("partner_search", 5, status="NOT_FOUND")
+
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    top = candidates[:MAX_PARTNER_SOURCES]
+    combined_text = "\n\n---\n\n".join(f"[{url}]\n{text[:2500]}" for _, url, text in top)
+    primary_url = top[0][1]
+    source = make_source("partner_search", 5, primary_url, clean_text(combined_text, 8000), "FOUND", "search")
+
+    if registry is not None:
+        registry.register_core_source(source)
+        for _, url, text in top[1:]:
+            registry.register_child_hit(
+                source_name="partner_search", url=url,
+                label="Partner search result", excerpt=text[:200],
+            )
+
+    return source
 
 
 async def fetch_education_programme_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,

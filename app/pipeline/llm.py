@@ -86,6 +86,52 @@ CRITERIA_TITLES = {
     "employee_volunteering": "Employee volunteering / payroll-giving programmes",
 }
 
+# Fixed weights (sum to 100) used to compute the headline fit_score as a pure
+# function of the 17 criteria scores. This is the ONLY place fit_score comes
+# from — the model is never trusted to invent the headline separately, so the
+# same 17 criteria scores always produce the same fit_score.
+# Core mission-alignment criteria (does the company actually run education/
+# STEM/tech programmes in Indian government schools) are weighted heaviest;
+# partnership/opportunity signals (contact access, budget, trajectory) weighted
+# lighter, matching the emphasis in FIT_SCORE_BAND_RULE.
+CRITERIA_WEIGHTS = {
+    "education_intervention": 12,
+    "stem": 8,
+    "tech_21cs": 10,
+    "public_schooling": 10,
+    "systems_change": 8,
+    "programme_depth": 8,
+    "partnership_quality": 6,
+    "decision_maker_accessibility": 4,
+    "csr_trajectory": 4,
+    "delivery_model_fit": 8,
+    "outreach_readiness": 4,
+    "funding_capacity": 4,
+    "csr_spend_trend": 4,
+    "decision_maker_tenure": 3,
+    "group_foundation_routing": 3,
+    "board_education_affinity": 2,
+    "employee_volunteering": 2,
+}
+assert set(CRITERIA_WEIGHTS) == set(CRITERIA_IDS), "CRITERIA_WEIGHTS must cover exactly the 17 CRITERIA_IDS"
+assert sum(CRITERIA_WEIGHTS.values()) == 100, "CRITERIA_WEIGHTS must sum to 100"
+
+
+def compute_fit_score_from_criteria(criteria: list[dict]) -> int:
+    """Deterministically compute the headline fit_score as a weighted sum of the
+    17 scored criteria (each 0-5). Pure maths over already-scored evidence — no
+    randomness, no separate model-generated number. Same criteria scores in,
+    same fit_score out, every time.
+    """
+    by_id = {c.get("id"): c for c in criteria if isinstance(c, dict) and c.get("id") in CRITERIA_WEIGHTS}
+    total = 0.0
+    for criterion_id, weight in CRITERIA_WEIGHTS.items():
+        entry = by_id.get(criterion_id)
+        score = clamp_float(entry.get("score") if entry else None, 0, 5, 0.0)
+        total += weight * (score / 5.0)
+    return clamp_int(round(total), 0, 100, 0)
+
+
 QUESTION_CATEGORY_KEYWORDS = {
     "education_programme": ("education", "stem", "skilling", "skill development", "curriculum", "classroom", "learning"),
     "csr_budget": ("budget", "spend", "expenditure", "crore", "lakh", "percentage-of-profit", "financials"),
@@ -113,9 +159,17 @@ class SpendYearSchema(BaseModel):
 
 
 class SpendSchema(BaseModel):
+    # inr_crore/display/fiscal_year/trend_* below describe the EDUCATION-
+    # SPECIFIC slice of CSR spend ONLY — never the company's total CSR
+    # corpus. is_education_specific must be true for these to be populated;
+    # see EDUCATION_SPEND_RULE and _enforce_education_spend_labeling, which
+    # forcibly clears them back to total_csr_* if the model didn't confirm
+    # the figure is education-specific.
     inr_crore: float | None = None
     display: str = ""
     fiscal_year: str = ""
+    is_education_specific: bool = False
+    education_pct_of_total_csr: float | None = None
     has_disclosed_budget: bool = False
     confidence: int = Field(ge=0, le=100, default=0)
     source_excerpt: str = Field(default="", max_length=200)
@@ -124,6 +178,12 @@ class SpendSchema(BaseModel):
     trend_evidence: str = Field(default="", max_length=240)
     trend_source: str = ""
     history: list[SpendYearSchema] = Field(default_factory=list)
+    # Total company-wide CSR (all causes, not just education) — populated
+    # whenever a total figure is disclosed, whether or not an
+    # education-specific breakdown also exists.
+    total_csr_inr_crore: float | None = None
+    total_csr_display: str = ""
+    total_csr_fiscal_year: str = ""
     estimated_min_inr_crore: float | None = None
     estimated_basis: str = Field(default="", max_length=200)
     estimated_is_computed: bool = False
@@ -131,6 +191,9 @@ class SpendSchema(BaseModel):
 
 class ProgrammeSchema(BaseModel):
     name: str = ""
+    what_is_funded: str = Field(default="", max_length=200)
+    beneficiary_group: str = Field(default="", max_length=160)
+    beneficiary_type: str = "OTHER"  # SCHOOL_CHILDREN_CURRICULUM | ADULT | OTHER
     description: str = Field(default="", max_length=220)
     is_multi_year: bool = False
     cohort_or_scale: str = ""
@@ -142,6 +205,9 @@ class ProgrammeSchema(BaseModel):
 class PartnerSchema(BaseModel):
     name: str = ""
     relationship_type: str = ""
+    programme: str = Field(default="", max_length=160)
+    year: str = ""
+    geography: str = Field(default="", max_length=120)
     source_excerpt: str = Field(default="", max_length=200)
     source: str = ""
     confidence: str = "confirmed"
@@ -419,28 +485,65 @@ SPEND_VS_REVENUE_RULE = (
     "as stated, never implied as CSR capacity."
 )
 
+EDUCATION_SPEND_RULE = (
+    "EDUCATION SPEND VS TOTAL CSR (apply strictly, second most common error after SPEND-VS-"
+    "REVENUE): most companies run CSR across several causes (health, environment, rural "
+    "development, education, etc.) — spend.inr_crore/display/fiscal_year/trend_* must hold "
+    "ONLY the EDUCATION-specific slice, never the company's whole CSR corpus. Set "
+    "is_education_specific=true and populate these fields ONLY when the evidence itself "
+    "states an education-specific figure or percentage (e.g. 'X crore towards education "
+    "programmes', 'education accounted for Y% of CSR spend'). If the evidence only gives a "
+    "TOTAL CSR figure with no education-specific breakdown, you MUST: leave "
+    "is_education_specific=false, leave spend.inr_crore/display/fiscal_year empty, and instead "
+    "put that total figure in total_csr_inr_crore/total_csr_display/total_csr_fiscal_year — "
+    "labeled as total CSR, never presented as the education budget. If a percentage of total "
+    "CSR going to education is stated (even without an absolute figure), record it in "
+    "education_pct_of_total_csr and still leave is_education_specific=false unless you can also "
+    "compute a specific rupee figure from it. The 2-3 year direction (trend_direction/history) "
+    "must also be education-specific if is_education_specific is true, or left UNKNOWN/empty "
+    "if only total-CSR trend data exists — never blend the two."
+)
+
 PARTNER_INCLUSION_RULE = (
     "PARTNERS: two tiers. confirmed = evidence explicitly states a working relationship "
     "(funds/co-designs/implements with/partners with/delivers via) with a named third-party "
     "org. probable = a named org appears alongside the company in a CSR/education context but "
     "the relationship verb is vague/implied. Exclude: internal initiative/programme/campaign "
     "names (not orgs); generic government mentions with no org named; award/index/certifying "
-    "bodies. CROSS-CHECK (mandatory): if fit_rationale/alignment_rationale/delivery_model_"
-    "evidence/csr_head_note names a specific third-party org the company works with, that org "
-    "MUST also appear in partners (confirmed or probable) — never describe a partnership in "
-    "prose while leaving the array without it, unless that org is TAP itself or an unnamed "
-    "government body. Each qualifying partner appears once, at its best-supported tier, using "
-    "its fullest verbatim name."
+    "bodies. Each partner is a STRUCTURED ROW, not just a name: also fill programme (the named "
+    "programme/initiative this partner is tied to, if the evidence connects one — else empty), "
+    "year (the year or fiscal year the partnership/programme is dated to, if stated — else "
+    "empty), and geography (state/city this partner's work is located in, if stated — else "
+    "empty). Leave a sub-field empty rather than guessing; do not invent a year or place. "
+    "CROSS-CHECK (mandatory): if fit_rationale/alignment_rationale/delivery_model_evidence/"
+    "csr_head_note names a specific third-party org the company works with, that org MUST also "
+    "appear in partners (confirmed or probable) — never describe a partnership in prose while "
+    "leaving the array without it, unless that org is TAP itself or an unnamed government body. "
+    "Each qualifying partner appears once, at its best-supported tier, using its fullest verbatim "
+    "name."
 )
 
 PROGRAMME_INCLUSION_RULE = (
-    "PROGRAMMES: add an entry (confidence='confirmed') only for a named initiative the company "
-    "runs/funds with ≥1 concrete detail (what/who/scale/since-when) beyond just a name. Named "
-    "but thinly/partially supported → confidence='probable' instead of omitting or inventing "
-    "detail. A bare name with zero supporting detail gets no entry at any tier. CROSS-CHECK "
-    "(mandatory): if fit_rationale/alignment_rationale/delivery_model_evidence names a specific "
-    "initiative, it MUST also appear in programmes (confirmed or probable) — never leave "
-    "programmes empty while prose names one."
+    "PROGRAMMES (must be specific, not thematic): every entry must answer four things from the "
+    "evidence — (1) name: the exact programme/initiative name; (2) what_is_funded: the precise "
+    "funded activity, never a bare theme (write 'financial-literacy curriculum delivered via "
+    "WhatsApp', never just 'financial literacy'); (3) beneficiary_group: exactly who benefits, "
+    "named as specifically as the evidence states it (write 'government-school students in "
+    "Maharashtra', never just 'students' or 'the community'); (4) beneficiary_type: "
+    "SCHOOL_CHILDREN_CURRICULUM if it delivers curriculum/learning content to school-age "
+    "children, ADULT if aimed at adults (employees, parents, out-of-school youth 18+, vocational "
+    "trainees), OTHER if neither or unclear. "
+    "REJECTION RULE: a theme or focus-area mention with no named programme AND no specific named "
+    "beneficiary group does not earn a programmes entry at any tier — 'the company supports "
+    "financial literacy' alone must be dropped entirely, never entered with the theme name "
+    "standing in for the missing fields. If you cannot fill both name and beneficiary_group from "
+    "the evidence, omit the entry rather than guessing. "
+    "confidence='confirmed' additionally needs ≥1 concrete supporting detail (scale/duration/"
+    "since-when) beyond the four required fields; confidence='probable' if the four fields are "
+    "answerable but the programme is otherwise thinly described. CROSS-CHECK (mandatory): if "
+    "fit_rationale/alignment_rationale/delivery_model_evidence names a specific initiative, it "
+    "MUST also appear in programmes (confirmed or probable) — never leave programmes empty while "
+    "prose names one."
 )
 
 EVIDENCE_ONLY_RULE = (
@@ -452,9 +555,13 @@ EVIDENCE_ONLY_RULE = (
     "PROGRAMME/SPEND-VS-REVENUE rules above — prose mention alone doesn't qualify it. Generic "
     "sector-wide stats (e.g. 'X% of firms in this sector partner with NGOs') never count as "
     "evidence of this specific company's activity and must not support any criterion or field. "
-    "This evidence-only bar governs every *score* (fit_score, criteria, alignment, authenticity) "
-    "without exception — scores are never adjusted for a plausible-sounding path that isn't "
-    "stated in the evidence."
+    "A bare theme/focus-area mention with no named programme and no specific named beneficiary "
+    "(rejected from programmes under the PROGRAMME rule) likewise cannot by itself justify a "
+    "high education_intervention/stem/tech_21cs/systems_change criterion score — score those "
+    "from the same named-programme-plus-beneficiary bar the programmes array uses, not from the "
+    "theme alone. This evidence-only bar governs every *score* (fit_score, criteria, alignment, "
+    "authenticity) without exception — scores are never adjusted for a plausible-sounding path "
+    "that isn't stated in the evidence."
 )
 
 REASONED_OPPORTUNITY_RULE = (
@@ -495,7 +602,11 @@ FIT_SCORE_BAND_RULE = (
     "down one band if evidence is stale, single-sourced, or self-reported only. If "
     "overall_authenticity_score will be below 40, cap fit_score at 55 regardless of programme "
     "detail — thin sourcing should not support a strong fit claim even if the activity described "
-    "sounds credible."
+    "sounds credible.\n"
+    "   NOTE: this fit_score is your own internal calibration estimate only — the system computes "
+    "the authoritative headline score separately, as a fixed weighted formula over the 17 "
+    "criteria scores in step 16, never from this field. Keep this estimate directionally "
+    "consistent with those criteria scores; do not treat it as the number shown to the user."
 )
 
 
@@ -512,6 +623,8 @@ EVIDENCE:
 {OUTPUT_ORDER_RULE}
 
 {SPEND_VS_REVENUE_RULE}
+
+{EDUCATION_SPEND_RULE}
 
 {PARTNER_INCLUSION_RULE}
 
@@ -530,9 +643,9 @@ Produce, in order:
 2. fit_rationale (2-4 sentences, required): justify fit_score from retrieved evidence only, state plainly what's confirmed vs inferred vs missing, never present revenue/turnover as CSR capacity — then apply REASONED_OPPORTUNITY_RULE and NAMED_ENTITIES_SUMMARY_RULE above.
 3. overall_semantic_alignment 0-100 + alignment_rationale (1-2 sentences), from named programme content only.
 4. delivery_model FUNDER/IMPLEMENTER/HYBRID/UNCLEAR + delivery_model_evidence naming the specific programme/statement (UNCLEAR + empty evidence if no clue).
-5. spend — apply SPEND-VS-REVENUE strictly. Latest figure+fiscal_year if stated else null/conf 0; prior years in history[]; trend_direction from CSR-labeled numbers only, never revenue growth. Populate eligibility.net_worth_turnover_inr_crore / net_profit_inr_crore whenever those business-scale numbers are stated (never into spend).
+5. spend — apply SPEND-VS-REVENUE and EDUCATION-SPEND-VS-TOTAL-CSR strictly. Latest EDUCATION-specific figure+fiscal_year if stated else null/conf 0; prior years in history[]; trend_direction from CSR-labeled EDUCATION numbers only, never revenue growth or total-CSR growth. Populate total_csr_inr_crore/total_csr_display/total_csr_fiscal_year whenever a total (all-cause) CSR figure is stated, independently of whether an education-specific figure also exists. Populate eligibility.net_worth_turnover_inr_crore / net_profit_inr_crore whenever those business-scale numbers are stated (never into spend).
 6. programmes — apply PROGRAMME rule incl. its cross-check; tag confirmed/probable.
-7. partners — apply PARTNER rule incl. its cross-check; tag confirmed/probable. A shorter list than the narrative implies is only correct if the narrative itself names no org.
+7. partners — apply PARTNER rule incl. its cross-check; tag confirmed/probable, with programme/year/geography sub-fields where evidence states them. A shorter list than the narrative implies is only correct if the narrative itself names no org.
 8. decision_makers: every named leader/exec/spokesperson in a CSR/sustainability context — title, public_facing_score 0-100, tenure_status, linkedin_url only if a literal linkedin.com/in/ URL is present else empty. Anyone in contact_pathway must appear here too.
 9. geographies: every state/city explicitly named.
 10. rfp_signal: explicit call for NGO partners — default false/empty unless stated.
@@ -563,9 +676,9 @@ JSON shape:
   "alignment_rationale": "<1-2 sentences, required, one **2-3 word** highlight>",
   "delivery_model": "<FUNDER|IMPLEMENTER|HYBRID|UNCLEAR>",
   "delivery_model_evidence": "<sentence, required unless truly no clue, one **2-3 word** highlight>",
-  "spend": {{"inr_crore": <number or null>, "display": "<exact CSR-labeled figure/unit as stated, never revenue>", "fiscal_year": "<if stated>", "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number or null>, "display": "<as stated>", "source_excerpt": "<short>"}}]}},
-  "programmes": [{{"name": "<exact name>", "description": "<short, must include a concrete supporting detail>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "source_excerpt": "<short>", "confidence": "<confirmed|probable>"}}],
-  "partners": [{{"name": "<exact standalone organisation name>", "relationship_type": "<funder|implementer|co-design|unclear>", "source_excerpt": "<short, must show relationship language>", "confidence": "<confirmed|probable>"}}],
+  "spend": {{"inr_crore": <number or null, EDUCATION-specific only>, "display": "<exact CSR-labeled EDUCATION figure/unit as stated, never revenue, never total CSR>", "fiscal_year": "<if stated>", "is_education_specific": <bool, true only if inr_crore/display is confirmed education-specific>, "education_pct_of_total_csr": <number or null>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number or null>, "display": "<as stated>", "source_excerpt": "<short>"}}], "total_csr_inr_crore": <number or null, whole-company CSR across all causes>, "total_csr_display": "<as stated, or empty>", "total_csr_fiscal_year": "<if stated>"}},
+  "programmes": [{{"name": "<exact name, required>", "what_is_funded": "<precise funded activity, never a bare theme, required>", "beneficiary_group": "<specific named beneficiary group, never a generic word like 'students', required>", "beneficiary_type": "<SCHOOL_CHILDREN_CURRICULUM|ADULT|OTHER>", "description": "<short, must include a concrete supporting detail>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "source_excerpt": "<short>", "confidence": "<confirmed|probable>"}}],
+  "partners": [{{"name": "<exact standalone organisation name>", "relationship_type": "<funder|implementer|co-design|unclear>", "programme": "<named programme this partner is tied to, or empty>", "year": "<year/fiscal year, or empty>", "geography": "<state/city, or empty>", "source_excerpt": "<short, must show relationship language>", "confidence": "<confirmed|probable>"}}],
   "decision_makers": [{{"name": "<name>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "source_excerpt": "<short>", "linkedin_url": "<url or empty>"}}],
   "geographies": [{{"place": "<place>", "source_excerpt": "<short>"}}],
   "criteria": [
@@ -941,6 +1054,35 @@ def _enforce_spend_integrity(spend: dict, eligibility: dict) -> dict:
     return spend
 
 
+def _enforce_education_spend_labeling(spend: dict) -> dict:
+    """SPEND-VS-TOTAL-CSR guard: inr_crore/display must only ever represent a
+    confirmed EDUCATION-specific figure. If the model populated a figure
+    without explicitly setting is_education_specific=true, that figure is
+    demoted to total_csr_* (labeled as total CSR) and the education-specific
+    fields are cleared — so a company-wide CSR number can never be silently
+    presented to the user as the education budget. This mirrors
+    _enforce_spend_integrity's code-guaranteed-over-model-promise approach.
+    """
+    if spend.get("has_disclosed_budget") and not spend.get("is_education_specific"):
+        figure_present = spend.get("inr_crore") is not None or bool(spend.get("display"))
+        if figure_present and not spend.get("total_csr_inr_crore") and not spend.get("total_csr_display"):
+            logger.info(
+                "education spend guard fired: figure not confirmed education-specific — "
+                "demoting to total_csr_* display=%r",
+                spend.get("display"),
+            )
+            spend["total_csr_inr_crore"] = spend.get("inr_crore")
+            spend["total_csr_display"] = spend.get("display") or ""
+            spend["total_csr_fiscal_year"] = spend.get("fiscal_year") or ""
+        spend["inr_crore"] = None
+        spend["display"] = ""
+        spend["fiscal_year"] = ""
+        spend["has_disclosed_budget"] = False
+        spend["confidence"] = 0
+        spend["is_education_specific"] = False
+    return spend
+
+
 _RELATIONSHIP_SIGNAL_PATTERN = re.compile(
     r"\b(fund(s|ed|ing)?|co-design|co-develop|implement(s|ing|ation)?|partner(s|ed|ship)?|"
     r"collaborat|deliver(s|ed|ing)?\s+(via|through|with)|works?\s+with|grant(s|ee|ed)?)\b",
@@ -974,13 +1116,28 @@ def _classify_partner_tier(entry: dict) -> str | None:
     return None
 
 
+_GENERIC_BENEFICIARY_PATTERN = re.compile(
+    r"^(students?|children|kids|youth|community|communities|people|the\s+public|society|"
+    r"beneficiaries|underprivileged|the\s+poor|citizens|individuals|the\s+community)$",
+    re.IGNORECASE,
+)
+
+
 def _classify_programme_tier(entry: dict) -> str | None:
     name = (entry.get("name") or "").strip()
+    beneficiary_group = (entry.get("beneficiary_group") or "").strip()
+    what_is_funded = (entry.get("what_is_funded") or "").strip()
     description = (entry.get("description") or "").strip()
+    # REJECTION RULE: a bare theme with no named programme and no specific named
+    # beneficiary is not a programme — it's dropped entirely, at any tier.
     if not name or len(name) < 3:
         return None
+    if not beneficiary_group or len(beneficiary_group) < 4 or _GENERIC_BENEFICIARY_PATTERN.match(beneficiary_group):
+        return None
+    if not what_is_funded:
+        return None
     stated_confidence = (entry.get("confidence") or "").strip().lower()
-    if len(description) >= 15:
+    if len(description) >= 15 or len(what_is_funded) >= 15:
         return "confirmed"
     if description or stated_confidence == "probable":
         return "probable"
@@ -1071,12 +1228,12 @@ def _repair_full_analysis(parsed: dict) -> FullAnalysisSchema:
         })
     parsed = dict(parsed)
     parsed["criteria"] = repaired_criteria
-    parsed["fit_score"] = clamp_int(parsed.get("fit_score"), 0, 100, 0)
 
     eligibility_raw = parsed.get("eligibility") if isinstance(parsed.get("eligibility"), dict) else {}
 
     if isinstance(parsed.get("spend"), dict):
         parsed["spend"] = _enforce_spend_integrity(dict(parsed["spend"]), eligibility_raw)
+        parsed["spend"] = _enforce_education_spend_labeling(dict(parsed["spend"]))
     else:
         estimate, basis = _compute_statutory_estimate(eligibility_raw)
         parsed["spend"] = {
@@ -1138,14 +1295,12 @@ def _repair_full_analysis(parsed: dict) -> FullAnalysisSchema:
     if isinstance(parsed.get("contact_pathway"), dict) and isinstance(parsed["contact_pathway"].get("channel"), str):
         parsed["contact_pathway"]["channel"] = _normalize_highlight_markers(parsed["contact_pathway"]["channel"])
 
-    fit_score = parsed.get("fit_score", 0)
-    authenticity_score = clamp_int(parsed.get("overall_authenticity_score"), 0, 100, 0)
-    if authenticity_score < AUTHENTICITY_FIT_SCORE_CAP_THRESHOLD and fit_score > AUTHENTICITY_FIT_SCORE_CAP_VALUE:
-        logger.info(
-            "fit_score capped by low authenticity original=%d authenticity=%d cap=%d",
-            fit_score, authenticity_score, AUTHENTICITY_FIT_SCORE_CAP_VALUE,
-        )
-        parsed["fit_score"] = AUTHENTICITY_FIT_SCORE_CAP_VALUE
+    # fit_score is never taken from the model's own output — it is always the
+    # deterministic weighted maths over the 17 criteria scores above. The
+    # authenticity cap (a separate guard rail, not part of the criteria maths)
+    # is applied once, downstream in analyze_company, after sources are
+    # sanitized — not here, to avoid capping twice.
+    parsed["fit_score"] = compute_fit_score_from_criteria(repaired_criteria)
 
     try:
         return FullAnalysisSchema.model_validate(parsed)
@@ -1410,14 +1565,11 @@ def _backfill_narrative_gaps(result: dict, company: str, found_source_count: int
     if result.get("overall_authenticity_score", 0) == 0 and found_source_count > 0:
         result["overall_authenticity_score"] = 40
 
-    if result.get("fit_score", 0) == 0 and found_source_count > 0 and usable:
-        alignment_ids = {"education_intervention", "stem", "tech_21cs", "public_schooling", "systems_change"}
-        relevant = [c for c in usable if c.get("id") in alignment_ids] or usable
-        inferred = clamp_int(
-            round((sum(c["score"] for c in relevant) / len(relevant)) / 5 * 100), 0, 100, 0
-        )
-        if inferred > 0:
-            result["fit_score"] = inferred
+    # fit_score is deliberately NOT backfilled here — it is always the
+    # deterministic weighted maths over the 17 criteria (see
+    # compute_fit_score_from_criteria), computed once in analyze_company after
+    # this function runs. A legitimate 0 (no usable evidence on any criterion)
+    # is a correct answer, not a gap to patch.
 
     return result
 
@@ -1567,9 +1719,22 @@ async def analyze_company(company: str, mission: str, sources: list, sources_man
     result["group_foundation"]["source"] = _sanitize_source(result["group_foundation"].get("source", ""), valid_sources)
     result["eligibility"]["source"] = _sanitize_source(result["eligibility"].get("source", ""), valid_sources)
 
-    result["fit_score"] = clamp_int(result.get("fit_score"), 0, 100, 0)
     result["overall_semantic_alignment"] = clamp_int(result.get("overall_semantic_alignment"), 0, 100, 0)
     result["overall_authenticity_score"] = clamp_int(result.get("overall_authenticity_score"), 0, 100, 0)
+
+    # Single authoritative computation of the headline score: pure, deterministic
+    # maths over the final sanitized 17 criteria — never the model's own
+    # fit_score field. Same criteria scores in, same fit_score out, every run.
+    computed_fit_score = compute_fit_score_from_criteria(result["criteria"])
+    if (result["overall_authenticity_score"] < AUTHENTICITY_FIT_SCORE_CAP_THRESHOLD
+            and computed_fit_score > AUTHENTICITY_FIT_SCORE_CAP_VALUE):
+        logger.info(
+            "fit_score capped by low authenticity criteria_score=%d authenticity=%d cap=%d",
+            computed_fit_score, result["overall_authenticity_score"], AUTHENTICITY_FIT_SCORE_CAP_VALUE,
+        )
+        computed_fit_score = AUTHENTICITY_FIT_SCORE_CAP_VALUE
+    result["fit_score"] = computed_fit_score
+
     result["open_questions"] = [q.strip()[:200] for q in result.get("open_questions", []) if q and q.strip()][:5]
     result["llm_fallback_used"] = not bool(parsed)
 
@@ -1847,7 +2012,7 @@ New evidence was just gathered specifically to try to answer it:
 
 Does this new evidence answer the question? Only say answered=true if the evidence contains a concrete, specific fact directly resolving the question — not a generic or sector-wide statement. If it answers, give a one-sentence answer citing only what's in the evidence, and a confidence 0-100. If the evidence still does not resolve it, set answered=false, answer to a short note on what's still missing, and confidence to 0.
 
-Optionally, if the answer contains a structured fact that maps cleanly onto one of: education_programme_name, education_programme_description, csr_spend_display, csr_spend_fiscal_year, csr_spend_inr_crore, decision_maker_name, decision_maker_title, decision_maker_linkedin_url, ngo_partner_name, ngo_partner_relationship — include it in "updates" as key-value pairs. Otherwise leave updates empty.
+Optionally, if the answer contains a structured fact that maps cleanly onto one of: education_programme_name, education_programme_description, csr_spend_display, csr_spend_fiscal_year, csr_spend_inr_crore, csr_spend_is_education_specific (bool — true ONLY if the figure is specifically an education-CSR figure, false if it is the company's total/all-cause CSR spend), decision_maker_name, decision_maker_title, decision_maker_linkedin_url, ngo_partner_name, ngo_partner_relationship — include it in "updates" as key-value pairs. Otherwise leave updates empty. A CSR spend figure with no explicit education label must be marked csr_spend_is_education_specific=false — never assume a total-CSR figure is education-specific.
 
 Return ONLY valid JSON:
 {{"answered": <bool>, "answer": "<one sentence>", "confidence": <0-100>, "updates": {{}}}}"""
@@ -1899,13 +2064,24 @@ def apply_question_resolution_to_analysis(result: dict, resolution: dict) -> dic
     if category == "csr_budget" and updates.get("csr_spend_display"):
         spend = result.get("spend") or {}
         if not spend.get("has_disclosed_budget"):
-            spend["display"] = updates["csr_spend_display"]
-            spend["fiscal_year"] = updates.get("csr_spend_fiscal_year", "")
+            is_education_specific = bool(updates.get("csr_spend_is_education_specific"))
             inr_crore = updates.get("csr_spend_inr_crore")
-            spend["inr_crore"] = inr_crore if isinstance(inr_crore, (int, float)) else spend.get("inr_crore")
-            spend["has_disclosed_budget"] = True
-            spend["confidence"] = min(resolution.get("confidence", 50), 70)
-            spend["source_excerpt"] = resolution.get("answer", "")[:200]
+            inr_crore = inr_crore if isinstance(inr_crore, (int, float)) else None
+            if is_education_specific:
+                spend["display"] = updates["csr_spend_display"]
+                spend["fiscal_year"] = updates.get("csr_spend_fiscal_year", "")
+                spend["inr_crore"] = inr_crore if inr_crore is not None else spend.get("inr_crore")
+                spend["has_disclosed_budget"] = True
+                spend["is_education_specific"] = True
+                spend["confidence"] = min(resolution.get("confidence", 50), 70)
+                spend["source_excerpt"] = resolution.get("answer", "")[:200]
+            else:
+                # SPEND-VS-TOTAL-CSR guard applies to follow-up resolution too:
+                # a figure not explicitly confirmed education-specific is a
+                # total-CSR figure, never the education budget.
+                spend["total_csr_display"] = updates["csr_spend_display"]
+                spend["total_csr_fiscal_year"] = updates.get("csr_spend_fiscal_year", "")
+                spend["total_csr_inr_crore"] = inr_crore if inr_crore is not None else spend.get("total_csr_inr_crore")
             result["spend"] = spend
 
     if category == "decision_maker" and updates.get("decision_maker_name"):
@@ -2011,6 +2187,12 @@ def strategic_insight_prompt(company: str, mission: str, state: str, fit_score: 
     estimate_note = ""
     if not spend.get("has_disclosed_budget") and spend.get("estimated_is_computed"):
         estimate_note = f"ESTIMATED (NOT DISCLOSED) STATUTORY MINIMUM: ₹{spend.get('estimated_min_inr_crore')} crore — {spend.get('estimated_basis', '')}"
+    total_csr_note = ""
+    if spend.get("total_csr_display") or spend.get("total_csr_inr_crore") is not None:
+        total_csr_note = (
+            f"TOTAL CSR ON RECORD (all causes, NOT education-specific — never call this the "
+            f"education budget): {spend.get('total_csr_display', '')}"
+        )
     named_partners = ", ".join(p.get("name", "") for p in analysis.get("partners", []) if p.get("name")) or "none named"
     named_programmes = ", ".join(p.get("name", "") for p in analysis.get("programmes", []) if p.get("name")) or "none named"
     named_contacts = ", ".join(
@@ -2024,8 +2206,9 @@ FIT RATIONALE FROM ANALYSIS: {analysis.get('fit_rationale', '')}
 DELIVERY MODEL: {analysis.get('delivery_model', 'UNCLEAR')} — {analysis.get('delivery_model_evidence', '')}
 ALIGNMENT: {analysis.get('overall_semantic_alignment', 0)}/100
 CONTACT PATHWAY: {analysis.get('contact_pathway', {}).get('channel', '')}
-SPEND TREND: {spend.get('trend_direction', 'UNKNOWN')} · CSR budget disclosed: {spend.get('has_disclosed_budget', False)}
+SPEND TREND: {spend.get('trend_direction', 'UNKNOWN')} · Education-specific CSR budget disclosed: {spend.get('has_disclosed_budget', False)}
 {estimate_note}
+{total_csr_note}
 SECTOR: {sector.get('sector', 'UNKNOWN')}
 CSR-135 ELIGIBILITY: {eligibility.get('plausibly_mandated', 'UNKNOWN')}
 GROUP FOUNDATION: {group_foundation.get('routed_through_group', False)} {('via ' + group_foundation.get('foundation_name', '')) if group_foundation.get('foundation_name') else ''}
