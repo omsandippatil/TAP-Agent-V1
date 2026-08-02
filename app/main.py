@@ -3,7 +3,6 @@ import base64
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -35,7 +34,6 @@ JOB_TTL_SECONDS = 60 * 30
 DELIVERED_JOB_TTL_SECONDS = 60 * 5
 
 HISTORY_SEARCH_RESULT_LIMIT = 8
-FRESH_RESULT_MAX_AGE = {"screen": timedelta(hours=6), "deep": timedelta(days=3)}
 
 _INFLIGHT_JOB_BY_KEY: dict[tuple, str] = {}
 _JOBS_LOCK = asyncio.Lock()
@@ -112,39 +110,6 @@ def _rows_to_history_results(rows: list[dict]) -> list[dict]:
         }
         for row in rows
     ]
-
-
-def _parse_created_at(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        cleaned = value.replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(cleaned)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
-    except ValueError:
-        return None
-
-
-def _is_fresh_enough(row: dict, mode: str) -> bool:
-    created_at = _parse_created_at(row.get("created_at"))
-    if created_at is None:
-        return False
-    max_age = FRESH_RESULT_MAX_AGE.get(mode, FRESH_RESULT_MAX_AGE["screen"])
-    return datetime.now(timezone.utc) - created_at <= max_age
-
-
-def _find_reusable_screening(company: str, mode: str) -> dict | None:
-    rows = db.company_history(company, limit=10)
-    for row in rows:
-        if row.get("mode") == mode and _is_fresh_enough(row, mode):
-            return row
-    if mode == "screen":
-        for row in rows:
-            if row.get("mode") == "deep" and _is_fresh_enough(row, "deep"):
-                return row
-    return None
 
 
 async def _run_screen_job(job_id: str, company: str, mode: str, user_id: str | None):
@@ -348,7 +313,7 @@ async def history_search(request: Request, q: str = ""):
 
 
 @app.get("/results/{screening_id}")
-async def results_page(request: Request, screening_id: str, reused_as: str = ""):
+async def results_page(request: Request, screening_id: str):
     row = db.get_screening(screening_id)
     if row is None:
         return HTMLResponse(
@@ -388,11 +353,10 @@ async def results_page(request: Request, screening_id: str, reused_as: str = "")
 
     company = row.get("company", "")
     mode = row.get("mode", "screen")
-    extra_context = {"showing_deep_for_screen": bool(reused_as == "screen" and mode == "deep")}
 
     if _is_htmx_request(request):
-        return render_results(request, company, mode, result, files, extra_context=extra_context)
-    return render_results_page(request, company, mode, result, files, extra_context=extra_context)
+        return render_results(request, company, mode, result, files)
+    return render_results_page(request, company, mode, result, files)
 
 
 @app.post("/screen")
@@ -410,20 +374,9 @@ async def screen(request: Request, company: str = Form(...), mode: str = Form("s
     user = _current_user(request)
     user_id = user["user_id"] if user else None
 
-    reusable_row = _find_reusable_screening(company, mode)
-    if reusable_row:
-        logger.info(
-            "screen reusing recent result company=%r mode=%s screening_id=%s",
-            company, mode, reusable_row["id"],
-        )
-        redirect_url = f"/results/{reusable_row['id']}"
-        if reusable_row.get("mode") != mode:
-            # e.g. a Screen request served from a fresher Deep Research result —
-            # flag it so the results page can label it instead of looking identical
-            # to a fresh run in that mode.
-            redirect_url += f"?reused_as={mode}"
-        return RedirectResponse(redirect_url, status_code=303)
-
+    # Submitting the search form (arrow button or Enter) always runs a fresh
+    # search — picking a saved result is a separate, explicit action via the
+    # autocomplete dropdown, which loads /results/{id} directly.
     job_id = await _start_screen_job(company, mode, user_id)
     job = JOBS[job_id]
 

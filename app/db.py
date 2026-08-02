@@ -134,10 +134,6 @@ def list_screenings(limit: int = 100, offset: int = 0, company_slug: str | None 
     return response.data or []
 
 
-def company_history(company: str, limit: int = 20) -> list[dict]:
-    return list_screenings(limit=limit, company_slug=_slugify(company))
-
-
 def search_screenings(query_text: str, limit: int = 8) -> list[dict]:
     client = get_client()
     if client is None:
