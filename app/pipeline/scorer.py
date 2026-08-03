@@ -75,14 +75,6 @@ def _normalize_company_name(name: str) -> str:
 
 
 def is_existing_tap_partner(company: str, cfg: dict) -> bool:
-    """Cross-check the company against TAP's existing donor/partner list before
-    scoring. This is the fix for the Capgemini error: an active donor was
-    scored 'Not a Target' because nothing in the pipeline ever checked this
-    list — tap_existing_partners existed in config.yaml but no code path read
-    it. Matches loosely (legal-entity suffixes like 'Private Limited'/'India'
-    stripped) since search results rarely return the bare brand name TAP uses
-    internally.
-    """
     existing_partners = cfg.get("tap_existing_partners", []) or []
     normalized_company = _normalize_company_name(company)
     if not normalized_company:
@@ -140,15 +132,6 @@ _CONFIDENCE_LABEL_TO_SCORE = {"HIGH": 80, "MEDIUM": 55, "LOW": 30}
 
 
 async def resolve_decision_makers(company: str, sources: list) -> list[dict]:
-    """Only CSR/sustainability/programme roles reach the user — never
-    software, sales, or regional-operations titles. A hit can carry
-    has_csr_signal=True purely from a generic company-CSR blurb sitting next
-    to an unrelated person's snippet, so this is a hard second gate on
-    role_verified (title-level check, see people_parser.NON_CSR_TITLE_KEYWORD_
-    PATTERN) before anyone is shown as a decision-maker. When Anthropic is
-    configured, results are further refined by the LLM current-role/tenure
-    matcher and capped — one verified contact beats six loose title matches.
-    """
     people_source = next((s for s in sources if s.get("source_name") == "people_search"), None)
     hits = (people_source or {}).get("people_hits", [])
     if not hits:
@@ -166,8 +149,6 @@ async def resolve_decision_makers(company: str, sources: list) -> list[dict]:
         seen_names.add(key)
         deduped.append(hit)
 
-    # Hard gate: drop anyone whose extracted title doesn't itself carry a
-    # verified CSR/sustainability/foundation/ESG signal.
     csr_only = [h for h in deduped if h.get("role_verified", h.get("has_csr_signal"))]
     dropped = len(deduped) - len(csr_only)
     if dropped:
@@ -186,9 +167,6 @@ async def resolve_decision_makers(company: str, sources: list) -> list[dict]:
         match = refined_by_name.get(name_key)
         if match:
             return match
-        # The LLM re-derives names from title text rather than echoing our
-        # extracted name verbatim, so fall back to a substring match before
-        # giving up on the refinement for this hit.
         for candidate_key, candidate in refined_by_name.items():
             if name_key in candidate_key or candidate_key in name_key:
                 return candidate
@@ -216,10 +194,54 @@ async def resolve_decision_makers(company: str, sources: list) -> list[dict]:
             "source_number": hit.get("source_number"),
         })
 
-    # Rank verified-current contacts first, then by match confidence, and cap:
-    # a short list of real contacts beats a long list of loose title matches.
     out.sort(key=lambda d: (d["is_current_csr_role"], d["match_confidence"]), reverse=True)
     return out[:6]
+
+
+def _name_key(name: str) -> str:
+    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+def merge_decision_makers(analysis_people: list[dict], linkedin_people: list[dict]) -> list[dict]:
+    linkedin_by_key = {}
+    for person in linkedin_people:
+        key = _name_key(person.get("name"))
+        if key:
+            linkedin_by_key[key] = person
+
+    merged = []
+    seen_keys = set()
+
+    for person in analysis_people:
+        name = (person.get("name") or "").strip()
+        key = _name_key(name)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        linkedin_match = linkedin_by_key.get(key, {})
+        merged.append({
+            "name": name,
+            "title": (person.get("title") or linkedin_match.get("title") or "").strip(),
+            "company_affiliation": linkedin_match.get("company_affiliation", ""),
+            "url": (person.get("linkedin_url") or linkedin_match.get("url") or "").strip(),
+            "india_location_signal": bool(linkedin_match.get("india_location_signal", True)),
+            "is_current_csr_role": True,
+            "tenure_status": person.get("tenure_status", "UNKNOWN"),
+            "confidence": "HIGH",
+            "match_confidence": max(80, linkedin_match.get("match_confidence", 80)),
+            "source_number": person.get("source_number") or linkedin_match.get("source_number"),
+        })
+
+    for person in linkedin_people:
+        name = (person.get("name") or "").strip()
+        key = _name_key(name)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        merged.append(person)
+
+    merged.sort(key=lambda d: (d["confidence"] == "HIGH", d["is_current_csr_role"], d["match_confidence"]), reverse=True)
+    return merged[:6]
 
 
 def build_source_links(sources: list) -> list[dict]:
@@ -419,7 +441,14 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         return _unscored_result(state, insight, sources, source_links, logo_url, registry,
                                  await resolve_decision_makers(company, sources), existing_partner=existing_partner)
 
-    final_score = int(round(min(max(analysis.get("fit_score", 0), 0), 100)))
+    recomputed_score = llm.compute_fit_score_from_criteria(analysis.get("criteria") or [])
+    reported_score = analysis.get("fit_score", 0)
+    if recomputed_score != reported_score:
+        logger.warning(
+            "score fit_score_mismatch_corrected company=%r reported=%s recomputed=%d",
+            company, reported_score, recomputed_score,
+        )
+    final_score = int(round(min(max(recomputed_score, 0), 100)))
 
     if existing_partner:
         partner_floor = cfg.get("tap_partner_floor", 92)
@@ -452,16 +481,14 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         )
 
     if existing_partner:
-        # Deterministic, code-guaranteed flag — never left to the model to remember
-        # to mention. This is what fixes the Capgemini error: the score itself is
-        # floored above, and the reason is always visible in the narrative too.
         insight = (
             f"**Existing TAP partner** — {company} is on TAP's active donor/partner list; "
             "this score reflects that established relationship and must never be treated "
             "as a cold 'Not a Target' rejection. "
         ) + insight
 
-    decision_makers = await resolve_decision_makers(company, sources)
+    linkedin_decision_makers = await resolve_decision_makers(company, sources)
+    decision_makers = merge_decision_makers(analysis.get("decision_makers") or [], linkedin_decision_makers)
 
     try:
         important_links = await gather_important_links(company, quota_guard=quota_guard, registry=registry)
