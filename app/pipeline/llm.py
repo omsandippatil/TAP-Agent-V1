@@ -32,11 +32,20 @@ ANTHROPIC_REQUEST_TIMEOUT_SECONDS = 120.0
 
 MAX_OPEN_QUESTIONS_TO_RESOLVE = 3
 
-AUTHENTICITY_FIT_SCORE_CAP_THRESHOLD = 40
-AUTHENTICITY_FIT_SCORE_CAP_VALUE = 55
+# --- BENEFIT-OF-THE-DOUBT TUNING ---------------------------------------
+# These constants were loosened from their original values so that thin or
+# silent evidence no longer drags a company down to "Not a Target" by
+# default. See NO_EVIDENCE_FLOOR_SCORE, SECTOR_PLAUSIBILITY_DEFAULTS,
+# AUTHENTICITY_FIT_SCORE_CAP_*, and SIMILAR_PARTNER_BONUS_CAP below — each
+# one is still the same lever it always was, just dialed toward leniency.
+# Nothing about the shapes/keys these feed into has changed, so scorer.py
+# and every schema below remain fully compatible.
+AUTHENTICITY_FIT_SCORE_CAP_THRESHOLD = 30   # was 40 — only very weak sourcing now triggers the cap
+AUTHENTICITY_FIT_SCORE_CAP_VALUE = 65        # was 55 — raised ceiling under the cap
 
-NO_EVIDENCE_FLOOR_SCORE = 1.5
-SIMILAR_PARTNER_BONUS_CAP = 1.0
+NO_EVIDENCE_FLOOR_SCORE = 2.0                # was 1.5 — generic no-evidence floor
+SIMILAR_PARTNER_BONUS_CAP = 1.3              # was 1.0 — more credit for TAP-similar partners
+# -------------------------------------------------------------------------
 
 DEFAULT_MISSION = (
     "The Apprentice Project (TAP) develops 21st-century skills (critical thinking, "
@@ -111,15 +120,18 @@ CRITERIA_WEIGHTS = {
 assert set(CRITERIA_WEIGHTS) == set(CRITERIA_IDS)
 assert sum(CRITERIA_WEIGHTS.values()) == 100
 
+# Per-criterion floor when the model returns zero evidence / zero confidence.
+# Raised across the board (see comment above) so undocumented-but-plausible
+# activity no longer reads as a strike against fit.
 SECTOR_PLAUSIBILITY_DEFAULTS = {
-    "education_intervention": 1.5,
-    "stem": 1.0,
-    "tech_21cs": 1.5,
-    "public_schooling": 1.0,
-    "systems_change": 1.0,
-    "programme_depth": 1.0,
-    "partnership_quality": 1.0,
-    "delivery_model_fit": 1.0,
+    "education_intervention": 2.0,   # was 1.5
+    "stem": 1.5,                     # was 1.0
+    "tech_21cs": 2.0,                # was 1.5
+    "public_schooling": 1.5,         # was 1.0
+    "systems_change": 1.5,           # was 1.0
+    "programme_depth": 1.5,          # was 1.0
+    "partnership_quality": 1.5,      # was 1.0
+    "delivery_model_fit": 1.5,       # was 1.0
 }
 
 
@@ -543,7 +555,9 @@ EVIDENCE_ONLY_RULE = (
     "criterion 0 or call fit poor solely because a fact wasn't surfaced; 0 is reserved for "
     "evidence that actively contradicts fit. Where the record is silent, score from sector, "
     "scale, and adjacent CSR behavior, labeled as an inferred estimate under undocumented "
-    "activity, never as a contradicted absence."
+    "activity, never as a contradicted absence. When genuinely torn between two adjacent "
+    "scores for a criterion, prefer the higher one — silence should never be read as a "
+    "negative signal."
 )
 
 SOURCE_INTEGRITY_RULE = (
@@ -590,25 +604,26 @@ FIT_SCORE_BAND_RULE = (
     "1. fit_score 0-100, advisory calibration only (code recomputes the real score from the 17 "
     "criteria in step 16 and discards this number) — no evidence still earns a plausibility "
     "score from sector/scale, never an automatic 0; reserve 0 for evidence that actively rules "
-    "out fit:\n"
+    "out fit. Treat these bands as a floor, not a ceiling — when evidence is genuinely "
+    "borderline between two bands, favour the higher one:\n"
     "   - 0-20: evidence actively shows no relevant activity, or is pure business-scale/"
     "marketing with no programme substance.\n"
-    "   - 21-40: sector plausibility only, one thin mention, or genuinely no evidence (silence "
-    "≠ 0).\n"
-    "   - 41-60: one named programme or partner with a concrete detail, spend undisclosed OK; "
+    "   - 21-45: sector plausibility only, one thin mention, or genuinely no evidence (silence "
+    "≠ 0 — most companies in an education-adjacent sector belong here or higher by default).\n"
+    "   - 46-65: one named programme or partner with a concrete detail, spend undisclosed OK; "
     "also applies if the company funds other TAP-like NGOs.\n"
-    "   - 61-80: named, detailed, multi-year programme(s) touching STEM/tech/21st-c-skills and "
+    "   - 66-82: named, detailed, multi-year programme(s) touching STEM/tech/21st-c-skills and "
     "education, with a credible partner or contact pathway.\n"
-    "   - 81-100: all of the above plus disclosed CSR spend and an identifiable decision-maker "
+    "   - 83-100: all of the above plus disclosed CSR spend and an identifiable decision-maker "
     "or contact pathway.\n"
     "   Move up a band for 2+ independent named programmes/partners or multiple TAP-similar "
     "NGOs funded; move down only for stale/single-sourced/self-reported evidence, never for "
-    "missing evidence. Cap at 55 if overall_authenticity_score < 40."
+    "missing evidence. Cap at 65 if overall_authenticity_score < 30."
 )
 
 
 def full_company_analysis_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
-    return f"""You are a careful, fair-minded CSR partnerships analyst judging whether {company} is a genuinely good funding/partnership fit for an Indian education NGO. Ground judgments strictly in the evidence below; where it is thin or silent, follow the ABSENCE and SECTOR-DEFAULT guidance in the rules below rather than defaulting fields to zero or empty.
+    return f"""You are a careful, fair-minded CSR partnerships analyst judging whether {company} is a genuinely good funding/partnership fit for an Indian education NGO. Ground judgments strictly in the evidence below; where it is thin or silent, follow the ABSENCE and SECTOR-DEFAULT guidance in the rules below rather than defaulting fields to zero or empty. Give the company the benefit of the doubt: undocumented activity is common in this sector and should never be treated as a mark against fit.
 
 NGO MISSION: {mission}
 
@@ -655,7 +670,7 @@ Produce, in order:
 13. group_foundation: CSR run via separate parent/group foundation, only if explicitly named.
 14. eligibility: Section 135 applicability LIKELY/UNLIKELY/UNKNOWN from net worth/turnover/profit figures (kept out of spend), plus the plain numeric fields from step 5.
 15. sector (UNKNOWN only if truly no clue): from company-description language; sub_sector if clear; one-line reasoning.
-16. criteria 0-5 each, all ids below in order, short evidence+reasoning — score undocumented items from sector/scale plausibility per EVIDENCE-ONLY and SIMILAR-PARTNER rules, never an automatic 0:
+16. criteria 0-5 each, all ids below in order, short evidence+reasoning — score undocumented items from sector/scale plausibility per EVIDENCE-ONLY and SIMILAR-PARTNER rules, never an automatic 0. When genuinely unsure between two adjacent scores, choose the higher one:
 {_criteria_rubric_block()}
 17. red_flags: genuine contradictions, marketing-not-substance signals, date mismatches, or conflicts with your own other output — severity low/medium/high. Missing/undocumented details go in open_questions — absence alone is never a red flag.
 18. contact_pathway: single most concrete real channel; "Not identified" if nothing exists — never invent one from a generic mention.
@@ -1170,7 +1185,9 @@ def _apply_similar_partner_weighting(criteria_by_id: dict, partners: list[dict])
     similar_count = sum(1 for p in partners if _partner_looks_tap_similar(p))
     if similar_count <= 0:
         return
-    bonus = min(SIMILAR_PARTNER_BONUS_CAP, 0.4 * similar_count)
+    # Bonus-per-partner also raised (0.4 -> 0.5) alongside SIMILAR_PARTNER_BONUS_CAP
+    # so that a company already funding TAP-like NGOs is rewarded more generously.
+    bonus = min(SIMILAR_PARTNER_BONUS_CAP, 0.5 * similar_count)
     for criterion_id in ("partnership_quality", "delivery_model_fit"):
         entry = criteria_by_id.get(criterion_id)
         if not entry:
@@ -1196,7 +1213,7 @@ def _apply_no_evidence_floor(criteria_by_id: dict) -> None:
         if score == 0.0 and confidence == 0 and not contradicted:
             floor = SECTOR_PLAUSIBILITY_DEFAULTS.get(criterion_id, NO_EVIDENCE_FLOOR_SCORE)
             entry["score"] = floor
-            entry["confidence"] = max(entry.get("confidence", 0), 20)
+            entry["confidence"] = max(entry.get("confidence", 0), 25)
             if not evidence:
                 entry["evidence"] = "No direct signal found — scored from sector/scale plausibility, not a confirmed absence"
             logger.info("no-evidence floor applied criterion=%s floor=%.1f", criterion_id, floor)
@@ -2344,7 +2361,7 @@ SCORECARD:
 
 RED FLAGS: {red_flags_text}
 
-Write one 180-320 word narrative, measured and evidence-grounded — balanced, neither harsh nor inflated. Lead with genuine strengths before caveats. State plainly whether/why this is a good fit; if spend.has_disclosed_budget is false, never call revenue/turnover CSR capacity — call it business scale, and cite any estimated statutory minimum as an estimate, never a disclosed figure. If follow-up verification results are present, weave in what was checked and confirmed or ruled out. If TAP-similar partners are listed (not "none flagged"), note the company already funds TAP-like organisations as a positive delivery-model signal. Name strongest/weakest dimensions without dwelling on the weakest; flag group-foundation routing and who to approach; note eligibility if uncertain; give one concrete next step matching tier/model/pathway; flowing prose, not bullets. Treat unknown geography, unconfirmed partner similarity, or undocumented activity as open questions to verify next, never as evidence of poor fit.
+Write one 180-320 word narrative, measured and evidence-grounded — balanced, neither harsh nor inflated, leaning generously rather than skeptically when evidence is thin or silent. Lead with genuine strengths before caveats. State plainly whether/why this is a good fit; if spend.has_disclosed_budget is false, never call revenue/turnover CSR capacity — call it business scale, and cite any estimated statutory minimum as an estimate, never a disclosed figure. If follow-up verification results are present, weave in what was checked and confirmed or ruled out. If TAP-similar partners are listed (not "none flagged"), note the company already funds TAP-like organisations as a positive delivery-model signal. Name strongest/weakest dimensions without dwelling on the weakest; flag group-foundation routing and who to approach; note eligibility if uncertain; give one concrete next step matching tier/model/pathway; flowing prose, not bullets. Treat unknown geography, unconfirmed partner similarity, or undocumented activity as open questions to verify next, never as evidence of poor fit.
 
 If a named partner or programme above offers a plausible indirect entry path not already confirmed, add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme from the lists above — never invent one, never let this change the score or tier framing.
 
