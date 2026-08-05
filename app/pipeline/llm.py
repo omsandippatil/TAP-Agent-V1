@@ -1121,18 +1121,31 @@ def _classify_programme_tier(entry: dict) -> str | None:
     beneficiary_group = (entry.get("beneficiary_group") or "").strip()
     what_is_funded = (entry.get("what_is_funded") or "").strip()
     description = (entry.get("description") or "").strip()
+    # REJECTION RULE: a bare theme mention with no named programme AND nothing
+    # else to anchor it (no beneficiary, no funded-activity detail at all) is
+    # not a programme entry at any tier. A genuinely NAMED programme with at
+    # least a funded activity or a stated beneficiary survives even when the
+    # beneficiary is worded in ordinary terms ("students", "children") rather
+    # than a hyper-specific phrase — most real CSR evidence IS that general,
+    # and requiring hyper-specific wording was silently dropping legitimately
+    # named, evidenced programmes from the output entirely. Generic-
+    # beneficiary programmes now land in "probable" instead of vanishing.
     if not name or len(name) < 3:
         return None
-    if not beneficiary_group or len(beneficiary_group) < 4 or _GENERIC_BENEFICIARY_PATTERN.match(beneficiary_group):
+    if not beneficiary_group and not what_is_funded:
         return None
-    if not what_is_funded:
-        return None
+
+    specific_beneficiary = (
+        len(beneficiary_group) >= 4
+        and not _GENERIC_BENEFICIARY_PATTERN.match(beneficiary_group)
+    )
     stated_confidence = (entry.get("confidence") or "").strip().lower()
-    if len(description) >= 15 or len(what_is_funded) >= 15:
+
+    if specific_beneficiary and what_is_funded and (len(description) >= 15 or len(what_is_funded) >= 15):
         return "confirmed"
-    if description or stated_confidence == "probable":
-        return "probable"
-    return None
+    if stated_confidence == "confirmed" and what_is_funded and specific_beneficiary:
+        return "confirmed"
+    return "probable"
 
 
 _SIMILAR_PARTNER_KEYWORD_PATTERN = re.compile(
@@ -1196,6 +1209,21 @@ def _field_max_length(field) -> int | None:
     return None
 
 
+def _field_numeric_bounds(field) -> tuple[float | None, float | None]:
+    lower = None
+    upper = None
+    for constraint in field.metadata:
+        if hasattr(constraint, "ge"):
+            lower = constraint.ge
+        if hasattr(constraint, "gt"):
+            lower = constraint.gt
+        if hasattr(constraint, "le"):
+            upper = constraint.le
+        if hasattr(constraint, "lt"):
+            upper = constraint.lt
+    return lower, upper
+
+
 def _sanitize_value_for_field(value, field):
     annotation = field.annotation
     origin = typing.get_origin(annotation)
@@ -1233,7 +1261,14 @@ def _sanitize_value_for_field(value, field):
         return bool(value) if value is not None else False
 
     if unwrapped in (int, float):
-        return value if isinstance(value, (int, float)) else None
+        if not isinstance(value, (int, float)):
+            return None
+        lower, upper = _field_numeric_bounds(field)
+        if lower is not None and value < lower:
+            value = lower
+        if upper is not None and value > upper:
+            value = upper
+        return int(value) if unwrapped is int else float(value)
 
     return value
 
@@ -1251,6 +1286,18 @@ def _sanitize_dict_for_model(data: dict, model: type[BaseModel]) -> dict:
 
 def _repair_full_analysis(parsed: dict) -> FullAnalysisSchema:
     parsed = dict(parsed) if isinstance(parsed, dict) else {}
+    # THE ACTUAL BUG (root cause of "programmes/partners not showing"): this
+    # sanitize call was missing here. Without it, raw LLM JSON — nulls, wrong
+    # types, over-length strings, out-of-range scores, the new
+    # similar_to_tap_profile bool the model sometimes omits or returns as
+    # null — goes straight into model_validate() below, which then fails far
+    # more often than it should. When it fails on BOTH the first attempt and
+    # the container-repair retry a few lines down, the last-resort fallback
+    # discards programmes/partners/decision_makers/spend entirely, defaulting
+    # them to empty. Restoring this coerces/truncates/clamps every field up
+    # front (per the actual FullAnalysisSchema field constraints) so
+    # validation succeeds on real evidence instead of silently losing it.
+    parsed = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
 
     raw_criteria = parsed.get("criteria") if isinstance(parsed.get("criteria"), list) else []
     repaired_criteria = []
@@ -1345,11 +1392,71 @@ def _repair_full_analysis(parsed: dict) -> FullAnalysisSchema:
         try:
             return FullAnalysisSchema.model_validate(parsed)
         except ValidationError as exc2:
-            logger.error("full analysis validation failed after repair, using minimal fallback error=%s", exc2)
-            return FullAnalysisSchema(
-                fit_score=clamp_int(parsed.get("fit_score"), 0, 100, 0),
-                criteria=[CriterionResultSchema(**c) for c in repaired_criteria],
+            logger.error(
+                "full analysis validation failed after container repair error=%s — salvaging "
+                "each nested item independently instead of discarding programmes/partners/"
+                "decision_makers/spend wholesale",
+                exc2,
             )
+            # Previously this branch returned a bare FullAnalysisSchema(fit_score=..., criteria=...),
+            # silently wiping every other field (programmes, partners, decision_makers, spend, etc.)
+            # even when most of that data was perfectly valid and only one nested item was bad.
+            # Instead, validate each nested object/list item on its own and keep everything that
+            # individually passes, so one malformed entry can no longer erase the whole analysis.
+            safe_kwargs: dict = {
+                "fit_score": clamp_int(parsed.get("fit_score"), 0, 100, 0),
+                "criteria": [CriterionResultSchema(**c) for c in repaired_criteria],
+            }
+            for scalar_field in (
+                "fit_rationale", "overall_semantic_alignment", "alignment_rationale",
+                "delivery_model", "delivery_model_evidence", "delivery_model_source",
+                "evidence_recency", "csr_head_note", "source_quality_assessment",
+                "overall_authenticity_score",
+            ):
+                if scalar_field in parsed:
+                    safe_kwargs[scalar_field] = parsed[scalar_field]
+            for object_field, schema in (
+                ("spend", SpendSchema), ("contact_pathway", ContactPathwaySchema),
+                ("rfp_signal", RfpSignalSchema), ("board_affinity", BoardAffinitySchema),
+                ("volunteering", VolunteeringSchema), ("group_foundation", GroupFoundationSchema),
+                ("eligibility", EligibilitySchema), ("sector", SectorSchema),
+            ):
+                candidate = parsed.get(object_field)
+                if isinstance(candidate, dict):
+                    try:
+                        safe_kwargs[object_field] = schema(**_sanitize_dict_for_model(candidate, schema))
+                    except ValidationError:
+                        continue
+            for list_field, schema in (
+                ("programmes", ProgrammeSchema), ("partners", PartnerSchema),
+                ("decision_makers", DecisionMakerSchema), ("geographies", GeographySchema),
+                ("red_flags", RedFlagSchema),
+            ):
+                candidates = parsed.get(list_field)
+                kept = []
+                if isinstance(candidates, list):
+                    for item in candidates:
+                        if not isinstance(item, dict):
+                            continue
+                        try:
+                            kept.append(schema(**_sanitize_dict_for_model(item, schema)))
+                        except ValidationError:
+                            continue
+                safe_kwargs[list_field] = kept
+            if isinstance(parsed.get("open_questions"), list):
+                safe_kwargs["open_questions"] = [q for q in parsed["open_questions"] if isinstance(q, str)]
+            try:
+                return FullAnalysisSchema(**safe_kwargs)
+            except ValidationError as exc3:
+                logger.error(
+                    "full analysis validation failed even after item-level salvage error=%s — "
+                    "using minimal fit_score/criteria-only fallback as absolute last resort",
+                    exc3,
+                )
+                return FullAnalysisSchema(
+                    fit_score=clamp_int(parsed.get("fit_score"), 0, 100, 0),
+                    criteria=[CriterionResultSchema(**c) for c in repaired_criteria],
+                )
 
 
 def _valid_source_lookup(sources_manifest: str) -> set[str]:
@@ -1435,7 +1542,7 @@ def _extract_probable_partner_from_narrative(result: dict, company: str) -> dict
                 "name": candidate,
                 "relationship_type": "unclear",
                 "source_excerpt": (
-                    f"Named in the analysis narrative: \u201c...{match.group(0)}...\u201d — "
+                    f"Named in the analysis narrative: “...{match.group(0)}...” — "
                     "not independently confirmed in the structured evidence extraction."
                 ),
                 "source": "",
