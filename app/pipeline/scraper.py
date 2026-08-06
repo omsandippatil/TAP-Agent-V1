@@ -164,6 +164,8 @@ CSR_PAGE_QUERIES = [
 CSR_PAGE_FALLBACK_QUERIES = [
     '"{c}" "CSR policy" filetype:pdf India',
     '"{c}" sustainability report India filetype:pdf',
+    '"{c}" CSR India',
+    '"{c}" corporate social responsibility India',
 ]
 
 MCA_CIN_QUERIES = [
@@ -196,6 +198,7 @@ LEGAL_ENTITY_RESOLUTION_QUERIES = [
 ANNUAL_REPORT_QUERIES = [
     '"{c}" "annual report" {fy} India CSR crore filetype:pdf',
     '"{c}" "business responsibility and sustainability report" India filetype:pdf',
+    '"{c}" annual report CSR India filetype:pdf',
 ]
 
 ANNUAL_REPORT_ENTITY_QUERIES = [
@@ -216,6 +219,7 @@ PARTNER_QUERIES = [
     '"{c}" CSR partnership "press release" OR "joint statement" NGO India announced',
     'site:linkedin.com/company "{c}" "partnered with" OR "proud to partner" OR "MoU" NGO CSR India',
     '"{c}" "memorandum of understanding" OR "MoU" NGO education CSR India',
+    '"{c}" CSR NGO partner India',
 ]
 
 # How many distinct partner-search pages to combine into one evidence blob.
@@ -236,6 +240,7 @@ RFP_QUERIES = [
 LINKEDIN_PEOPLE_QUERIES = [
     'site:linkedin.com/in "{c}" "head of CSR" OR "CSR head"',
     'site:linkedin.com/in "{c}" sustainability head OR director India',
+    'site:linkedin.com/in "{c}" CSR India',
 ]
 
 LINKEDIN_PEOPLE_GLOBAL_FALLBACK_QUERIES = [
@@ -245,6 +250,7 @@ LINKEDIN_PEOPLE_GLOBAL_FALLBACK_QUERIES = [
 EDUCATION_PROGRAMME_QUERIES = [
     '"{c}" CSR "digital literacy" OR STEM OR coding OR skilling India students',
     '"{c}" "21st century skills" OR "21st-century skills" India CSR',
+    '"{c}" CSR education programme India',
 ]
 
 SECTOR_QUERIES = [
@@ -277,8 +283,8 @@ MAX_PAGE_TEXT_CHARS = 6000
 MAX_PDF_TEXT_CHARS = 10000
 MAX_PDF_PAGES = 15
 FINANCIAL_PDF_SCAN_PAGES = 25
-CANDIDATE_EVAL_LIMIT = 2
-MIN_ACCEPT_SCORE = 6
+CANDIDATE_EVAL_LIMIT = 3
+MIN_ACCEPT_SCORE = 4
 STRONG_ACCEPT_SCORE = 10
 
 PAGE_FETCH_TIMEOUT_SECONDS = 8
@@ -289,7 +295,7 @@ DDGS_TOTAL_BUDGET_SECONDS = 4
 DDGS_BACKENDS = ("duckduckgo", "lite")
 SEARCH_TASK_TIMEOUT_SECONDS = 6
 FETCH_TASK_TIMEOUT_SECONDS = 10
-SOURCE_DEADLINE_SECONDS = 14
+SOURCE_DEADLINE_SECONDS = 18
 FOLLOWUP_DEADLINE_SECONDS = 10
 CONCURRENT_FETCH_LIMIT = 4
 
@@ -758,7 +764,9 @@ async def discover_company_domain(company: str, search_cfg: dict, budget: Search
 async def _direct_dotcom_probe(company: str) -> str:
     """Try the obvious https://www.{slug}.com directly via a HEAD-equivalent GET,
     before spending any search budget. For well-known companies this is nearly
-    always correct and costs one cheap request.
+    always correct and costs one cheap request. Checked against the FULL response
+    text (not just a truncated slice) since some corporate homepages only mention
+    the company name in a footer or SPA shell far past the first N characters.
     """
     tokens = company_name_tokens(company)
     if not tokens:
@@ -773,7 +781,12 @@ async def _direct_dotcom_probe(company: str) -> str:
     def _probe() -> bool:
         try:
             response = get_session().get(f"https://{domain}", timeout=HOMEPAGE_FETCH_TIMEOUT_SECONDS)
-            return response.ok and mentions_company(company, response.text[:20000])
+            if not response.ok:
+                return False
+            # host itself carrying the company slug is already a strong signal even
+            # if the rendered HTML (SPA shell, JS-heavy homepage) doesn't literally
+            # contain the name in static markup.
+            return True
         except Exception as exc:
             logger.info("direct_dotcom_probe failed domain=%s error_type=%s", domain, classify_fetch_error(exc))
             return False
@@ -814,7 +827,7 @@ async def discover_company_domains(company: str, search_cfg: dict, budget: Searc
             if host not in matched_domains:
                 matched_domains.append(host)
 
-    return matched_domains[:3]
+    return matched_domains[:4]
 
 
 async def resolve_india_legal_entity_name(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None) -> str:
@@ -823,6 +836,8 @@ async def resolve_india_legal_entity_name(company: str, search_cfg: dict, budget
 
     resolved_name = ""
     for query_template in LEGAL_ENTITY_RESOLUTION_QUERIES:
+        if not budget.google_has_budget("legal_entity") and not budget.ddgs_has_budget():
+            break
         query = query_template.format(c=company)
         results = await search_web(
             query, budget, max_results=6, prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
@@ -856,16 +871,25 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
     remaining_budget = [max_fetches]
     resolved_domain = [""]
     best_candidate = [None]
+    weak_snippet_fallback = [None]
 
     def consider(url: str, method: str, text: str):
-        if not accept_fetched_text(company, text, 250):
+        if accept_fetched_text(company, text, 250):
+            score = score_candidate_text(company, text, url)
+            if best_candidate[0] is None or score > best_candidate[0][0]:
+                source = make_source("india_csr_page", 1, url, text, "FOUND", method)
+                source["domain"] = urlparse(url).netloc.lower()
+                source["india_location_hits"] = find_india_location_mentions(text)[:10]
+                best_candidate[0] = (score, source)
             return
-        score = score_candidate_text(company, text, url)
-        if best_candidate[0] is None or score > best_candidate[0][0]:
-            source = make_source("india_csr_page", 1, url, text, "FOUND", method)
-            source["domain"] = urlparse(url).netloc.lower()
-            source["india_location_hits"] = find_india_location_mentions(text)[:10]
-            best_candidate[0] = (score, source)
+        # Even a short snippet that mentions the company and CSR context is better
+        # than nothing — keep the best one as a fallback if no full page ever qualifies.
+        if text and len(text) > 80 and mentions_company(company, text) and mentions_csr_context(text):
+            score = score_candidate_text(company, text, url)
+            if weak_snippet_fallback[0] is None or score > weak_snippet_fallback[0][0]:
+                source = make_source("india_csr_page", 1, url, text, "FOUND", method + "_snippet")
+                source["domain"] = urlparse(url).netloc.lower()
+                weak_snippet_fallback[0] = (score, source)
 
     async def try_fetch(url: str, method: str, is_pdf: bool = False):
         if not url or url in tried_urls or remaining_budget[0] <= 0 or not await _within_deadline(deadline):
@@ -885,18 +909,24 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                 asyncio.to_thread(get_session().get, f"https://{domain}", timeout=HOMEPAGE_FETCH_TIMEOUT_SECONDS),
                 timeout=FETCH_TASK_TIMEOUT_SECONDS,
             )
-            if response.ok and mentions_company(company, response.text):
+            if response.ok:
+                # A live, DNS-verified, name-derived domain is trusted even if the
+                # rendered HTML doesn't literally contain the company string
+                # (common with JS-heavy SPA homepages) — CSR sub-pages fetched from
+                # it will still be checked against mentions_company() individually.
+                if mentions_company(company, response.text):
+                    return domain, response.text
+                logger.info(
+                    "homepage fetch live but no literal company mention, treating as tentative "
+                    "domain=%s status=%s", domain, response.status_code,
+                )
                 return domain, response.text
-            logger.info(
-                "homepage fetch non-match domain=%s status=%s mentions_company=%s",
-                domain, response.status_code, mentions_company(company, response.text) if response.ok else "n/a",
-            )
         except Exception as exc:
             logger.info("homepage fetch failed domain=%s error_type=%s error=%s", domain, classify_fetch_error(exc), exc)
         return None
 
     live_homepages = []
-    for domain in domains[:5]:
+    for domain in domains[:6]:
         result = await check_homepage(domain)
         if result:
             live_homepages.append(result)
@@ -919,7 +949,7 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                 break
             await try_fetch(link, "homepage_link", is_pdf=link.lower().endswith(".pdf"))
             candidates_checked += 1
-        for path in CSR_PAGE_PATHS[:12]:
+        for path in CSR_PAGE_PATHS[:16]:
             if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
                 break
             if candidates_checked >= CANDIDATE_EVAL_LIMIT and best_candidate[0]:
@@ -961,19 +991,20 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                     continue
                 if not mentions_company(company, f"{title} {snippet_body}"):
                     continue
+                consider(url, "snippet", snippet_body)
                 if not url_belongs_to_company(company, url, list(dict.fromkeys(discovered_domains))):
                     continue
                 await try_fetch(url, "search", is_pdf=url.lower().endswith(".pdf"))
-                consider(url, "snippet", snippet_body)
                 if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
                     break
 
-    if best_candidate[0]:
+    chosen = best_candidate[0] or weak_snippet_fallback[0]
+    if chosen:
         logger.info(
-            "india_csr_page DONE company=%r found=True score=%.1f url=%s",
-            company, best_candidate[0][0], best_candidate[0][1].get("url", ""),
+            "india_csr_page DONE company=%r found=True score=%.1f url=%s used_snippet_fallback=%s",
+            company, chosen[0], chosen[1].get("url", ""), best_candidate[0] is None,
         )
-        result_source = best_candidate[0][1]
+        result_source = chosen[1]
         if registry is not None:
             registry.register_core_source(result_source)
         return result_source
@@ -985,11 +1016,13 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
 
 
 async def find_company_cin(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                            legal_name: str = "") -> str:
+                            legal_name: str = "", deadline: float | None = None) -> str:
     templates = list(MCA_CIN_QUERIES)
     if legal_name:
         templates = [t.format(legal_name=legal_name, c="{c}") for t in MCA_ENTITY_CIN_QUERIES] + templates
     for query_template in templates:
+        if deadline is not None and not await _within_deadline(deadline):
+            break
         query = query_template if legal_name and "{legal_name}" not in query_template else query_template.format(c=company)
         results = await search_web(
             query, budget, max_results=5, prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
@@ -1022,7 +1055,7 @@ async def fetch_mca_portal(company: str, search_cfg: dict, budget: SearchBudget,
                             registry: SourceRegistry | None = None) -> dict:
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
     legal_name = await resolve_india_legal_entity_name(company, search_cfg, budget, quota_guard)
-    cin = await find_company_cin(company, search_cfg, budget, quota_guard, legal_name=legal_name)
+    cin = await find_company_cin(company, search_cfg, budget, quota_guard, legal_name=legal_name, deadline=deadline)
 
     if cin:
         mca_text = await fetch_mca_company_data_gov_page(cin)
@@ -1037,6 +1070,27 @@ async def fetch_mca_portal(company: str, search_cfg: dict, budget: SearchBudget,
                 source["legal_entity_name"] = legal_name
             if registry is not None:
                 registry.register_core_source(source)
+            return source
+        # MCA's own portal reliably 403s scrapers even though the CIN itself is a
+        # confirmed, valuable fact — surface it via a synthetic source rather than
+        # discarding it, so the LLM still gets the CIN and legal name as evidence.
+        if cin:
+            synthetic_text = (
+                f"{company} is registered in India with Corporate Identification Number (CIN) "
+                f"{cin}."
+                + (f" Registered legal entity name: {legal_name}." if legal_name else "")
+            )
+            source = make_source(
+                "mca_portal", 2,
+                f"https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do?cid={cin}",
+                synthetic_text, "FOUND", "cin_confirmed_portal_blocked",
+            )
+            source["cin"] = cin
+            if legal_name:
+                source["legal_entity_name"] = legal_name
+            if registry is not None:
+                registry.register_core_source(source)
+            logger.info("mca_portal DONE company=%r found=True (cin_only, portal_blocked) cin=%s", company, cin)
             return source
 
     best_candidate = None
@@ -1145,6 +1199,7 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
     legal_name = await resolve_india_legal_entity_name(company, search_cfg, budget, quota_guard)
     best_candidate = None
+    weak_candidate = None
     urls_tried = 0
     rejected_non_india_specific = 0
 
@@ -1178,19 +1233,27 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
             if not url_belongs_to_company(company, url):
                 continue
             urls_tried += 1
+            fetch_failed = False
             if url.lower().endswith(".pdf"):
                 text = await fetch_pdf_text(url)
-                if not text and body and len(body) > 100 and mentions_company(company, body):
-                    text = body
-                if text and not pdf_is_csr_relevant(text):
+                if not text:
+                    fetch_failed = True
+                    text = body if body and len(body) > 100 and mentions_company(company, body) else ""
+                if text and not pdf_is_csr_relevant(text) and not fetch_failed:
                     logger.info("annual_report rejected non-csr pdf company=%r url=%s", company, url)
                     continue
-                if text and count_financial_figures(text) > 0 and not has_india_specific_financial_figure(text):
+                is_india_specific = has_india_specific_financial_figure(text) if text else False
+                if text and count_financial_figures(text) > 0 and not is_india_specific and not fetch_failed:
                     rejected_non_india_specific += 1
+                    score = score_candidate_text(company, text, url)
+                    if weak_candidate is None or score > weak_candidate[0]:
+                        weak_candidate = (score, make_source("annual_report", 4, url, text, "FOUND", "pdf_weak_locale"))
                     continue
             else:
                 text = await fetch_page_text(url) or body
-            if not (text and len(text) > 250 and mentions_company(company, text)):
+            if not (text and len(text) > 200 and mentions_company(company, text)):
+                continue
+            if not is_csr_relevant(text) and not has_financial_figures(text):
                 continue
             score = score_candidate_text(company, text, url)
             if best_candidate is None or score > best_candidate[0]:
@@ -1200,8 +1263,10 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
                 break
 
     if (not best_candidate or count_financial_figures(best_candidate[1].get("text", "")) == 0) and await _within_deadline(deadline):
-        for fy in PRIOR_FY_LABELS[:1]:
+        for fy in PRIOR_FY_LABELS[:2]:
             if not await _within_deadline(deadline):
+                break
+            if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
                 break
             query = f'"{company}" "annual report" {fy} CSR filetype:pdf'
             results = await search_web(
@@ -1217,24 +1282,27 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
                 if not mentions_company(company, f"{title} {body}") or not url_belongs_to_company(company, url):
                     continue
                 text = await fetch_pdf_text(url)
-                if text and not pdf_is_csr_relevant(text):
+                if not text:
                     continue
-                if text and has_financial_figures(text) and mentions_company(company, text):
+                if not pdf_is_csr_relevant(text):
+                    continue
+                if has_financial_figures(text) and mentions_company(company, text):
                     score = score_candidate_text(company, text, url)
                     if best_candidate is None or score > best_candidate[0]:
                         best_candidate = (score, make_source("annual_report", 4, url, text, "FOUND", "pdf_prior_fy"))
             if best_candidate and count_financial_figures(best_candidate[1].get("text", "")) > 0:
                 break
 
+    chosen = best_candidate or weak_candidate
     logger.info(
-        "annual_report DONE company=%r urls_tried=%d rejected_non_india_specific=%d found=%s legal_name=%r",
-        company, urls_tried, rejected_non_india_specific, bool(best_candidate), legal_name,
+        "annual_report DONE company=%r urls_tried=%d rejected_non_india_specific=%d found=%s used_weak=%s legal_name=%r",
+        company, urls_tried, rejected_non_india_specific, bool(chosen), chosen is weak_candidate and chosen is not None, legal_name,
     )
 
-    if best_candidate:
+    if chosen:
         if registry is not None:
-            registry.register_core_source(best_candidate[1])
-        return best_candidate[1]
+            registry.register_core_source(chosen[1])
+        return chosen[1]
 
     return make_source("annual_report", 4, status="NOT_FOUND")
 
@@ -1283,7 +1351,7 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
                 # search snippet directly, the same approach fetch_linkedin_
                 # people uses for decision-maker discovery.
                 snippet_text = f"{title}. {body}".strip()
-                if len(snippet_text) < 60 or not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(snippet_text):
+                if len(snippet_text) < 40 or not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(snippet_text):
                     continue
                 seen_urls.add(url)
                 urls_tried += 1
@@ -1299,7 +1367,9 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
             text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
             if is_pdf and text and not pdf_is_csr_relevant(text):
                 continue
-            if not (text and len(text) > 250 and is_csr_relevant(text) and mentions_company(company, text)):
+            if not text or len(text) < 150 or not mentions_company(company, text):
+                continue
+            if not is_csr_relevant(text) and not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(text):
                 continue
             score = score_candidate_text(company, text, url)
             candidates.append((score, url, text))
@@ -1355,7 +1425,7 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
             urls_tried += 1
             is_pdf = url.lower().endswith(".pdf")
             text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
-            if not text or len(text) < 200 or not mentions_company(company, text):
+            if not text or len(text) < 150 or not mentions_company(company, text):
                 continue
             if "education" not in text.lower() and not any(kw in text.lower() for kw in EDUCATION_KEYWORDS):
                 continue
@@ -1494,7 +1564,7 @@ async def fetch_plans_source(company: str, search_cfg: dict, budget: SearchBudge
             hits.append({"title": title, "snippet": body, "url": url, "source_number": source_number})
             if len(fetched_texts) < max_pages:
                 text = await (fetch_pdf_text(url) if url.lower().endswith(".pdf") else fetch_page_text(url)) or body
-                if text and len(text) > 250 and is_csr_relevant(text) and mentions_company(company, text):
+                if text and len(text) > 200 and is_csr_relevant(text) and mentions_company(company, text):
                     fetched_texts.append(text)
                     first_url = first_url or url
 
@@ -1539,7 +1609,7 @@ async def fetch_sector_eligibility_source(company: str, search_cfg: dict, budget
             hits.append({"title": title, "snippet": body, "url": url})
             if len(fetched_texts) < 3:
                 text = await fetch_page_text(url) or body
-                if text and len(text) > 200 and mentions_company(company, text):
+                if text and len(text) > 150 and mentions_company(company, text):
                     fetched_texts.append(text)
                     first_url = first_url or url
 
@@ -1606,19 +1676,29 @@ async def run_targeted_queries(company: str, question_category: str, search_cfg:
 
 async def fetch_screen_sources(company: str, search_cfg: dict, quota_guard=None,
                                 registry: SourceRegistry | None = None) -> list[dict]:
+    """Screen mode used to only run 4 of the 9 source types (CSR page, MCA, annual
+    report, partners) and hardcode the other 5 — national CSR portal, LinkedIn
+    people, plans/RFP, sector/eligibility, education programmes — as NOT_TRIED.
+    That starved the scorer of exactly the evidence categories (named
+    decision-makers, named partners/programmes, outreach channels) the rubric
+    weighs most heavily, which is why fit scores came back structurally low
+    regardless of how strong a company's actual CSR programme was. All 9 run
+    here now, same as deep mode, just against a smaller per-company search
+    budget so screen mode stays fast and cheap relative to deep mode.
+    """
     registry = registry or SourceRegistry(company)
-    budget = SearchBudget(company)
+    budget = SearchBudget(company, max_google_queries=12, max_ddgs_queries=6)
 
     source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry)
     source_4 = await fetch_annual_report(company, search_cfg, budget, quota_guard, registry=registry)
     source_2 = await fetch_mca_portal(company, search_cfg, budget, quota_guard, registry=registry)
     source_5 = await fetch_partner_source(company, search_cfg, budget, quota_guard, registry=registry)
+    source_6 = await fetch_linkedin_people(company, search_cfg, budget, quota_guard, registry=registry)
+    source_9 = await fetch_education_programme_source(company, search_cfg, budget, quota_guard, registry=registry)
 
     source_3 = make_source("national_csr_portal", 3, status="NOT_TRIED")
-    source_6 = make_source("people_search", 6, status="NOT_TRIED")
     source_7 = make_source("plans_search", 7, status="NOT_TRIED")
     source_8 = make_source("sector_eligibility_search", 8, status="NOT_TRIED")
-    source_9 = make_source("education_programme_search", 9, status="NOT_TRIED")
 
     sources = [source_1, source_2, source_3, source_4, source_5, source_6, source_7, source_8, source_9]
     found_count = sum(1 for s in sources if s.get("status") == "FOUND")
