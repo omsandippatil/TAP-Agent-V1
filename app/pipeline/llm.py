@@ -27,6 +27,19 @@ ANTHROPIC_REQUEST_TIMEOUT_SECONDS = 120.0
 MIN_PROMPT_TRIM_CHARS = 150
 MAX_PROMPT_SHRINK_ATTEMPTS = 6
 PROMPT_SHRINK_SAFETY_MARGIN = 120
+DEFAULT_ANTHROPIC_CONTEXT_WINDOW = 200000
+
+
+def _anthropic_context_window() -> int:
+    value = getattr(settings, "anthropic_context_window", None)
+    if not isinstance(value, int) or value <= 0:
+        logger.warning(
+            "settings.anthropic_context_window missing or invalid (%r) — falling back to default=%d. "
+            "Add anthropic_context_window to app.config.Settings to remove this warning.",
+            value, DEFAULT_ANTHROPIC_CONTEXT_WINDOW,
+        )
+        return DEFAULT_ANTHROPIC_CONTEXT_WINDOW
+    return value
 
 DEFAULT_MISSION = (
     "The Apprentice Project (TAP) develops 21st-century skills (critical thinking, "
@@ -990,7 +1003,7 @@ def anthropic_cooldown_remaining_seconds() -> float:
 def evidence_token_budget(company: str, mission: str, sources_manifest: str) -> int:
     scaffold_tokens = estimate_tokens(_extraction_prompt(company, mission, "", sources_manifest))
     reserved_for_output = EXTRACTION_OUTPUT_TOKEN_RESERVE
-    ceiling = settings.anthropic_context_window - reserved_for_output - scaffold_tokens
+    ceiling = _anthropic_context_window() - reserved_for_output - scaffold_tokens
     return max(MIN_EVIDENCE_TOKEN_BUDGET, ceiling)
 
 
@@ -1038,7 +1051,7 @@ async def extract_company_facts(
         logger.info("extract_company_facts skipped company=%r reason=no_evidence_text", company)
         return None
 
-    output_ceiling = settings.anthropic_context_window - EXTRACTION_OUTPUT_TOKEN_RESERVE
+    output_ceiling = _anthropic_context_window() - EXTRACTION_OUTPUT_TOKEN_RESERVE
 
     def _build(evidence: str) -> str:
         return _extraction_prompt(company, mission, evidence, sources_manifest)
@@ -1127,7 +1140,7 @@ async def score_extracted_facts(
     prompt = _scoring_prompt(company, mission, mode, scoring_facts, sources_manifest)
     prompt_tokens = estimate_tokens(prompt)
     output_reserve = OUTPUT_TOKEN_RESERVE - EXTRACTION_OUTPUT_TOKEN_RESERVE
-    output_ceiling = settings.anthropic_context_window - output_reserve
+    output_ceiling = _anthropic_context_window() - output_reserve
 
     if prompt_tokens > output_ceiling:
         trimmed_facts = dict(scoring_facts)
