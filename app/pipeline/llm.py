@@ -22,7 +22,6 @@ LLM_SCORING_UNAVAILABLE_NOTE = (
 
 OUTPUT_TOKEN_RESERVE = 6000
 EXTRACTION_OUTPUT_TOKEN_RESERVE = 3200
-SCAFFOLD_SAFETY_MARGIN = 400
 MIN_EVIDENCE_TOKEN_BUDGET = 500
 ANTHROPIC_REQUEST_TIMEOUT_SECONDS = 120.0
 MIN_PROMPT_TRIM_CHARS = 150
@@ -122,20 +121,6 @@ def _criteria_json_template() -> str:
         for cid in CRITERIA_IDS
     )
 
-
-# --------------------------------------------------------------------------
-# MODE CALIBRATION
-#
-# Screen and deep research are different questions, not the same question run
-# with less evidence. Screen mode exists to triage — its job is "does this
-# company deserve a deep-research pass", so it should read genuinely promising
-# but thinly-documented signals generously. Deep mode exists to brief someone
-# on an actual outreach decision, so it stays strict and evidentiary. Treating
-# them identically (the old behaviour) meant every screen-mode run was
-# structurally penalised for having less evidence to work with, even when the
-# available evidence was itself positive — this is what was producing
-# uniformly low screen scores regardless of true fit.
-# --------------------------------------------------------------------------
 
 MODE_CALIBRATION = {
     "screen": {
@@ -267,17 +252,6 @@ HIGHLIGHT_RULE = (
 )
 
 
-# --------------------------------------------------------------------------
-# PASS 1 — EXTRACTION
-#
-# Pulls every structured fact (spend, programmes, partners, decision-makers,
-# geographies, governance signals, sector/eligibility, red flags) out of the
-# evidence with no scoring involved. Separating this from scoring means the
-# scoring pass reads a short, already-distilled fact sheet instead of raw
-# evidence text plus 20 instructions at once, which is what was causing
-# scores to drift and undercount real signal in the single-shot version.
-# --------------------------------------------------------------------------
-
 def _extraction_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
     return f"""You are a meticulous fact-extraction analyst. Extract every concrete, sourced fact about {company}'s India CSR activity from the evidence below. Do NOT score or judge fit — that happens in a separate pass. Your only job here is complete, accurate, well-cited extraction.
 
@@ -352,17 +326,6 @@ JSON shape:
   "key_facts_summary": "<3-6 lines, each starting with '- '>"
 }}"""
 
-
-# --------------------------------------------------------------------------
-# PASS 2 — SCORING
-#
-# Reads the distilled extraction output (not raw evidence) and produces the
-# 17 criteria scores plus narrative fields. fit_score itself is NOT trusted
-# from this call — it's computed deterministically in Python afterward from
-# the weighted criteria (see _compute_fit_score), which is what actually
-# fixes the "score doesn't match its own rubric" problem. The model is only
-# asked for fit_score here as a sanity cross-check value for logging.
-# --------------------------------------------------------------------------
 
 def _scoring_prompt(company: str, mission: str, mode: str, extraction: dict, sources_manifest: str) -> str:
     calibration = _mode_calibration(mode)
@@ -589,11 +552,6 @@ async def call_anthropic_chat(
     model: str | None = None,
     caller: str = "unknown",
 ) -> str | None:
-    """Sends a single message to the Anthropic API. No local TPM budgeting or
-    cooldown bookkeeping — Anthropic's own rate limiter is authoritative, and
-    a 429 here is handled the same way any other transient HTTP error is:
-    logged and returned as None so the caller can decide what to do next.
-    """
     if not settings.anthropic_configured:
         logger.warning("anthropic call skipped caller=%s reason=not_configured", caller)
         return None
@@ -798,21 +756,6 @@ def _sanitize_dict_for_model(data: dict, model: type[BaseModel]) -> dict:
     return sanitized
 
 
-# --------------------------------------------------------------------------
-# DETERMINISTIC FIT-SCORE COMPUTATION
-#
-# This is the concrete fix for "score doesn't match its own rubric": instead
-# of trusting the model's single fit_score number (which the old prompt only
-# ever *asked* to be self-consistent with the 17 criteria, with nothing
-# enforcing it), the actual number shown to the user is always computed here
-# in Python from criteria_score * criteria_weight, scaled 0-5 -> 0-100. The
-# model's own fit_score is kept only as a logged cross-check value.
-#
-# Mode calibration and the authenticity-based ceiling are also both applied
-# here deterministically, rather than being just another paragraph the model
-# has to remember to obey inside one giant prompt.
-# --------------------------------------------------------------------------
-
 def _compute_weighted_fit_score(criteria: list[dict]) -> float:
     if not criteria:
         return 0.0
@@ -828,8 +771,6 @@ def _compute_weighted_fit_score(criteria: list[dict]) -> float:
         total_weight += weight
     if total_weight == 0:
         return 0.0
-    # total_weight should already be 100 (all 17 present), but normalize
-    # defensively in case the model dropped or duplicated an id.
     return (weighted_sum / total_weight) * 100.0
 
 
@@ -859,13 +800,6 @@ def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode:
 
 
 def _repair_extraction(parsed: dict) -> dict:
-    """Sanitizes the extraction-pass output using the same field-level rules
-    as the full analysis schema, but only for the subset of fields the
-    extraction pass produces (no criteria, fit_score, or narrative fields —
-    those belong to the scoring pass). Reuses FullAnalysisSchema for
-    sanitization since the field shapes are identical/overlapping, then
-    strips back down to just the extraction fields.
-    """
     parsed = dict(parsed) if isinstance(parsed, dict) else {}
     sanitized = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
 
@@ -893,15 +827,6 @@ def _empty_criteria() -> list[dict]:
 
 
 def build_extraction_only_result(extraction: dict, mode: str) -> dict:
-    """Used when pass 1 (extraction) succeeds but pass 2 (scoring) fails —
-    instead of discarding the successfully extracted facts and returning
-    None (the old behaviour, which produced a confusing zero'd-out report
-    with a fully populated scorecard rendered from stale/cached data
-    upstream), this builds a schema-valid, clearly-labeled result: real
-    extraction fields, zeroed criteria, fit_score 0, and
-    scoring_incomplete=True so the caller/frontend can render an honest
-    "facts extracted, scoring failed" state instead of a misleading one.
-    """
     merged = dict(extraction)
     merged.pop("key_facts_summary", None)
     merged["criteria"] = _empty_criteria()
@@ -1058,18 +983,12 @@ def _sanitize_source(value: str, valid_sources: set[str]) -> str:
     return cleaned if cleaned in valid_sources else ""
 
 
+def evidence_token_budget(output_token_reserve: int) -> int:
+    return settings.anthropic_context_window - output_token_reserve
+
+
 def _shrink_to_fit(company: str, mission: str, sources_manifest: str, cleaned_sources: list[dict],
                     prompt_builder, output_ceiling: int) -> tuple[str, list[dict], int]:
-    """Shared shrink loop used by both the extraction and scoring passes:
-    repeatedly trims FOUND source text proportionally until the built prompt
-    fits inside output_ceiling tokens, or gives up after
-    MAX_PROMPT_SHRINK_ATTEMPTS. output_ceiling here is a context-window
-    budget (how much the model can accept alongside a given output
-    reservation), not a rate-limit budget — this is a hard model constraint,
-    not a policy choice, so it stays even without any TPM throttling.
-    Returns (evidence_text, working_sources, final_prompt_tokens);
-    prompt_builder(evidence_text) -> str.
-    """
     evidence_text = combine_evidence_text(cleaned_sources)
     prompt = prompt_builder(evidence_text)
     prompt_tokens = estimate_tokens(prompt)
@@ -1107,15 +1026,12 @@ async def extract_company_facts(
     cleaned_sources: list[dict],
     sources_manifest: str,
 ) -> dict | None:
-    """Pass 1: pure fact extraction, no scoring. See module docstring above
-    _extraction_prompt for why this is split from scoring.
-    """
     evidence_text = combine_evidence_text(cleaned_sources)
     if not evidence_text.strip():
         logger.info("extract_company_facts skipped company=%r reason=no_evidence_text", company)
         return None
 
-    output_ceiling = settings.anthropic_context_window - EXTRACTION_OUTPUT_TOKEN_RESERVE
+    output_ceiling = evidence_token_budget(EXTRACTION_OUTPUT_TOKEN_RESERVE)
 
     def _build(evidence: str) -> str:
         return _extraction_prompt(company, mission, evidence, sources_manifest)
@@ -1196,11 +1112,6 @@ async def score_extracted_facts(
     extraction: dict,
     sources_manifest: str,
 ) -> dict | None:
-    """Pass 2: scores the 17 criteria and writes narrative fields against the
-    already-extracted fact sheet. fit_score returned here is a cross-check
-    only — compute_final_fit_score() in analyze_and_score_company() is what
-    actually determines the number shown to the user.
-    """
     scoring_facts = {
         k: v for k, v in extraction.items()
         if k not in ("open_questions", "key_facts_summary", "overall_authenticity_score",
@@ -1209,11 +1120,9 @@ async def score_extracted_facts(
     prompt = _scoring_prompt(company, mission, mode, scoring_facts, sources_manifest)
     prompt_tokens = estimate_tokens(prompt)
     output_reserve = OUTPUT_TOKEN_RESERVE - EXTRACTION_OUTPUT_TOKEN_RESERVE
-    output_ceiling = settings.anthropic_context_window - output_reserve
+    output_ceiling = evidence_token_budget(output_reserve)
 
     if prompt_tokens > output_ceiling:
-        # Extraction facts are already distilled, so this should be rare;
-        # fall back to trimming the largest text-bearing sub-lists if it happens.
         trimmed_facts = dict(scoring_facts)
         for list_field in ("programmes", "partners", "decision_makers", "geographies", "red_flags"):
             if trimmed_facts.get(list_field):
@@ -1257,23 +1166,6 @@ async def analyze_and_score_company(
     sources_manifest: str,
     mode: str = "deep",
 ) -> dict | None:
-    """Public entry point — signature-compatible with the previous single-shot
-    version (mode is new but optional and defaults to the old strict/deep
-    behaviour, so any existing caller that doesn't pass mode still works
-    unchanged). Internally runs extraction then scoring, then computes
-    fit_score deterministically from the weighted criteria rather than
-    trusting either LLM call's own number.
-
-    Only returns None if extraction itself fails (no usable evidence to work
-    with at all). If extraction succeeds but scoring fails, this now returns
-    an extraction-only result (scoring_incomplete=True) instead of silently
-    discarding everything that was already learned — this was the source of
-    reports that showed a fully populated scorecard/sources next to a
-    zero'd-out "LLM unavailable" summary: the caller was reconstructing a
-    partial view from data this function used to throw away on a scoring
-    failure. Now there is exactly one object returned, and it's internally
-    consistent either way.
-    """
     extraction = await extract_company_facts(company, mission, cleaned_sources, sources_manifest)
     if not extraction:
         return None
