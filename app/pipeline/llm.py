@@ -983,8 +983,15 @@ def _sanitize_source(value: str, valid_sources: set[str]) -> str:
     return cleaned if cleaned in valid_sources else ""
 
 
-def evidence_token_budget(output_token_reserve: int) -> int:
-    return settings.anthropic_context_window - output_token_reserve
+def anthropic_cooldown_remaining_seconds() -> float:
+    return 0.0
+
+
+def evidence_token_budget(company: str, mission: str, sources_manifest: str) -> int:
+    scaffold_tokens = estimate_tokens(_extraction_prompt(company, mission, "", sources_manifest))
+    reserved_for_output = EXTRACTION_OUTPUT_TOKEN_RESERVE
+    ceiling = settings.anthropic_context_window - reserved_for_output - scaffold_tokens
+    return max(MIN_EVIDENCE_TOKEN_BUDGET, ceiling)
 
 
 def _shrink_to_fit(company: str, mission: str, sources_manifest: str, cleaned_sources: list[dict],
@@ -1031,7 +1038,7 @@ async def extract_company_facts(
         logger.info("extract_company_facts skipped company=%r reason=no_evidence_text", company)
         return None
 
-    output_ceiling = evidence_token_budget(EXTRACTION_OUTPUT_TOKEN_RESERVE)
+    output_ceiling = settings.anthropic_context_window - EXTRACTION_OUTPUT_TOKEN_RESERVE
 
     def _build(evidence: str) -> str:
         return _extraction_prompt(company, mission, evidence, sources_manifest)
@@ -1120,7 +1127,7 @@ async def score_extracted_facts(
     prompt = _scoring_prompt(company, mission, mode, scoring_facts, sources_manifest)
     prompt_tokens = estimate_tokens(prompt)
     output_reserve = OUTPUT_TOKEN_RESERVE - EXTRACTION_OUTPUT_TOKEN_RESERVE
-    output_ceiling = evidence_token_budget(output_reserve)
+    output_ceiling = settings.anthropic_context_window - output_reserve
 
     if prompt_tokens > output_ceiling:
         trimmed_facts = dict(scoring_facts)
