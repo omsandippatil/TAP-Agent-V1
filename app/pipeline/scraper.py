@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import re
 import time
@@ -43,8 +44,6 @@ BLOCKED_403_DOMAINS = (
     "zaubacorp.", "tracxn.",
 )
 
-# Domains that repeatedly 403'd within this process are added here at runtime so we
-# stop burning retries/time on them for the rest of the session.
 _DYNAMIC_BLOCKED_DOMAINS: dict[str, int] = {}
 _DYNAMIC_BLOCK_THRESHOLD = 3
 
@@ -222,11 +221,6 @@ PARTNER_QUERIES = [
     '"{c}" CSR NGO partner India',
 ]
 
-# How many distinct partner-search pages to combine into one evidence blob.
-# The old version stopped at the single best-scoring page, which is why
-# "no partners found" usually just meant the CSR page was the only thing
-# checked — widening this surfaces LinkedIn announcements and joint press
-# releases that name partners the company's own CSR page never mentions.
 MAX_PARTNER_SOURCES = 4
 
 PLAN_QUERIES = [
@@ -297,9 +291,18 @@ SEARCH_TASK_TIMEOUT_SECONDS = 6
 FETCH_TASK_TIMEOUT_SECONDS = 10
 SOURCE_DEADLINE_SECONDS = 18
 FOLLOWUP_DEADLINE_SECONDS = 10
-CONCURRENT_FETCH_LIMIT = 4
+CONCURRENT_FETCH_LIMIT = 2
+
+DEEP_JOB_HARD_DEADLINE_SECONDS = 110
+MAX_PDF_DOWNLOAD_BYTES = 15 * 1024 * 1024
+PDF_STREAM_CHUNK_BYTES = 262144
+MAX_PDF_PAGES_HARD_CAP = 40
 
 _FETCH_SEMAPHORE = asyncio.Semaphore(CONCURRENT_FETCH_LIMIT)
+
+
+class DeepJobDeadlineExceeded(Exception):
+    pass
 
 
 def pdf_is_csr_relevant(text: str) -> bool:
@@ -392,12 +395,8 @@ def mentions_company(company: str, text: str) -> bool:
 
 
 def candidate_domains(company: str) -> list[str]:
-    """Generate plausible domain guesses, .com first, verified via a fast DNS check
-    so we never waste a fetch slot on a domain that plainly doesn't exist.
-    """
     tokens = company_name_tokens(company) or [re.sub(r"[^a-z0-9]", "", company.lower())]
     slugs = list(dict.fromkeys(["".join(tokens), tokens[0]]))
-    # .com first: for well-known companies this is nearly always correct.
     ordered = []
     for tld in (".com", ".in", ".co.in", ".org"):
         for slug in slugs:
@@ -588,8 +587,14 @@ def _fetch_page_text_sync(url: str, max_chars: int, verify_ssl: bool) -> tuple[s
             logger.info("fetch_page_text 403 url=%s body_snippet=%r", url, snippet)
             return "", "http_4xx_403"
         response.raise_for_status()
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > MAX_PDF_DOWNLOAD_BYTES:
+            logger.info("fetch_page_text skipped oversized_response url=%s bytes=%s", url, content_length)
+            return "", "oversized_response"
         soup = BeautifulSoup(response.text, "lxml")
-        return extract_main_text(soup, max_chars), ""
+        text = extract_main_text(soup, max_chars)
+        del soup
+        return text, ""
     except Exception as exc:
         error_type = classify_fetch_error(exc)
         if error_type == "dns":
@@ -597,6 +602,8 @@ def _fetch_page_text_sync(url: str, max_chars: int, verify_ssl: bool) -> tuple[s
         else:
             logger.info("fetch_page_text failed url=%s error_type=%s error=%s", url, error_type, exc)
         return "", error_type
+    finally:
+        gc.collect()
 
 
 async def fetch_page_text(url: str, max_chars: int = MAX_PAGE_TEXT_CHARS, verify_ssl: bool = True) -> str:
@@ -612,11 +619,11 @@ async def fetch_page_text(url: str, max_chars: int = MAX_PAGE_TEXT_CHARS, verify
             return ""
 
 
-def _select_financial_pdf_pages(pdf, max_pages: int, max_scan: int) -> list:
+def _select_financial_pdf_pages(pdf, max_pages: int, max_scan: int) -> list[int]:
     total_pages = len(pdf.pages)
     scan_upper = min(total_pages, max_scan)
     if total_pages <= max_pages:
-        return list(pdf.pages[:total_pages])
+        return list(range(total_pages))
 
     scored_indices = []
     for idx in range(scan_upper):
@@ -638,11 +645,41 @@ def _select_financial_pdf_pages(pdf, max_pages: int, max_scan: int) -> list:
             scored_indices.append((score, idx))
 
     if not scored_indices:
-        return list(pdf.pages[:max_pages])
+        return list(range(min(max_pages, total_pages)))
 
     scored_indices.sort(key=lambda pair: pair[0], reverse=True)
-    top_indices = sorted(idx for _, idx in scored_indices[:max_pages])
-    return [pdf.pages[idx] for idx in top_indices]
+    return sorted(idx for _, idx in scored_indices[:max_pages])
+
+
+def _download_pdf_bytes(url: str) -> tuple[bytes, str]:
+    response = get_with_referer_fallback(url, timeout=PDF_FETCH_TIMEOUT_SECONDS, stream=True)
+    _record_blocked_response(url, response.status_code)
+    if response.status_code == 403:
+        snippet = response.text[:200] if getattr(response, "text", None) else ""
+        logger.info("fetch_pdf_text 403 url=%s body_snippet=%r", url, snippet)
+        response.close()
+        return b"", "http_4xx_403"
+    response.raise_for_status()
+
+    content_length = response.headers.get("Content-Length")
+    if content_length and int(content_length) > MAX_PDF_DOWNLOAD_BYTES:
+        logger.info("fetch_pdf_text skipped oversized_pdf url=%s bytes=%s", url, content_length)
+        response.close()
+        return b"", "oversized_pdf"
+
+    chunks = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=PDF_STREAM_CHUNK_BYTES):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > MAX_PDF_DOWNLOAD_BYTES:
+            logger.info("fetch_pdf_text aborted oversized_pdf_stream url=%s bytes_read=%d", url, total)
+            response.close()
+            return b"", "oversized_pdf"
+        chunks.append(chunk)
+    response.close()
+    return b"".join(chunks), ""
 
 
 def _fetch_pdf_text_sync(url: str, max_chars: int, max_pages: int) -> tuple[str, str]:
@@ -652,29 +689,39 @@ def _fetch_pdf_text_sync(url: str, max_chars: int, max_pages: int) -> tuple[str,
         import io
         import pdfplumber
 
-        response = get_with_referer_fallback(url, timeout=PDF_FETCH_TIMEOUT_SECONDS)
-        _record_blocked_response(url, response.status_code)
-        if response.status_code == 403:
-            snippet = response.text[:200] if response.text else ""
-            logger.info("fetch_pdf_text 403 url=%s body_snippet=%r", url, snippet)
-            return "", "http_4xx_403"
-        response.raise_for_status()
-        with pdfplumber.open(io.BytesIO(response.content)) as pdf:
-            pages = _select_financial_pdf_pages(pdf, max_pages, FINANCIAL_PDF_SCAN_PAGES)
-            pages_text = []
-            total_len = 0
-            for page in pages:
-                page_text = page.extract_text() or ""
-                if page_text:
-                    pages_text.append(page_text)
-                    total_len += len(page_text)
-                if total_len >= max_chars:
-                    break
+        pdf_bytes, error = _download_pdf_bytes(url)
+        if error:
+            return "", error
+        if not pdf_bytes:
+            return "", "empty_response"
+
+        capped_pages = min(max_pages, MAX_PDF_PAGES_HARD_CAP)
+        pages_text = []
+        total_len = 0
+        buffer = io.BytesIO(pdf_bytes)
+        try:
+            with pdfplumber.open(buffer) as pdf:
+                selected_indices = _select_financial_pdf_pages(pdf, capped_pages, FINANCIAL_PDF_SCAN_PAGES)
+                for idx in selected_indices:
+                    page = pdf.pages[idx]
+                    page_text = page.extract_text() or ""
+                    page.flush_cache()
+                    if page_text:
+                        pages_text.append(page_text)
+                        total_len += len(page_text)
+                    if total_len >= max_chars:
+                        break
+        finally:
+            buffer.close()
+            del pdf_bytes
+
         return clean_text(" ".join(pages_text), max_chars), ""
     except Exception as exc:
         error_type = classify_fetch_error(exc)
         logger.info("fetch_pdf_text failed url=%s error_type=%s error=%s", url, error_type, exc)
         return "", error_type
+    finally:
+        gc.collect()
 
 
 async def fetch_pdf_text(url: str, max_chars: int = MAX_PDF_TEXT_CHARS, max_pages: int = MAX_PDF_PAGES) -> str:
@@ -706,6 +753,7 @@ def csr_links_from_html(base_url: str, html: str, limit: int = 10) -> list[str]:
                 score += 2
             if score:
                 scored_links.append((score, urljoin(base_url, href)))
+        del soup
     except Exception as exc:
         logger.info("csr_links_from_html parse failed base_url=%s error=%s", base_url, exc)
     scored_links.sort(key=lambda item: -item[0])
@@ -762,12 +810,6 @@ async def discover_company_domain(company: str, search_cfg: dict, budget: Search
 
 
 async def _direct_dotcom_probe(company: str) -> str:
-    """Try the obvious https://www.{slug}.com directly via a HEAD-equivalent GET,
-    before spending any search budget. For well-known companies this is nearly
-    always correct and costs one cheap request. Checked against the FULL response
-    text (not just a truncated slice) since some corporate homepages only mention
-    the company name in a footer or SPA shell far past the first N characters.
-    """
     tokens = company_name_tokens(company)
     if not tokens:
         return ""
@@ -781,12 +823,7 @@ async def _direct_dotcom_probe(company: str) -> str:
     def _probe() -> bool:
         try:
             response = get_session().get(f"https://{domain}", timeout=HOMEPAGE_FETCH_TIMEOUT_SECONDS)
-            if not response.ok:
-                return False
-            # host itself carrying the company slug is already a strong signal even
-            # if the rendered HTML (SPA shell, JS-heavy homepage) doesn't literally
-            # contain the name in static markup.
-            return True
+            return bool(response.ok)
         except Exception as exc:
             logger.info("direct_dotcom_probe failed domain=%s error_type=%s", domain, classify_fetch_error(exc))
             return False
@@ -804,7 +841,6 @@ async def discover_company_domains(company: str, search_cfg: dict, budget: Searc
 
     matched_domains: list[str] = []
 
-    # Cheap, budget-free first-class candidate: the obvious .com, verified live.
     direct_hit = await _direct_dotcom_probe(company)
     if direct_hit:
         matched_domains.append(direct_hit)
@@ -864,9 +900,18 @@ async def _within_deadline(deadline: float) -> bool:
     return time.monotonic() < deadline
 
 
+async def _check_job_deadline(job_deadline: float | None) -> None:
+    if job_deadline is not None and time.monotonic() >= job_deadline:
+        raise DeepJobDeadlineExceeded()
+
+
 async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                max_fetches: int = 20, registry: SourceRegistry | None = None) -> dict:
+                                max_fetches: int = 20, registry: SourceRegistry | None = None,
+                                job_deadline: float | None = None) -> dict:
+    await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+    if job_deadline is not None:
+        deadline = min(deadline, job_deadline)
     tried_urls = set()
     remaining_budget = [max_fetches]
     resolved_domain = [""]
@@ -882,8 +927,6 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                 source["india_location_hits"] = find_india_location_mentions(text)[:10]
                 best_candidate[0] = (score, source)
             return
-        # Even a short snippet that mentions the company and CSR context is better
-        # than nothing — keep the best one as a fallback if no full page ever qualifies.
         if text and len(text) > 80 and mentions_company(company, text) and mentions_csr_context(text):
             score = score_candidate_text(company, text, url)
             if weak_snippet_fallback[0] is None or score > weak_snippet_fallback[0][0]:
@@ -910,10 +953,6 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                 timeout=FETCH_TASK_TIMEOUT_SECONDS,
             )
             if response.ok:
-                # A live, DNS-verified, name-derived domain is trusted even if the
-                # rendered HTML doesn't literally contain the company string
-                # (common with JS-heavy SPA homepages) — CSR sub-pages fetched from
-                # it will still be checked against mentions_company() individually.
                 if mentions_company(company, response.text):
                     return domain, response.text
                 logger.info(
@@ -927,6 +966,7 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
 
     live_homepages = []
     for domain in domains[:6]:
+        await _check_job_deadline(job_deadline)
         result = await check_homepage(domain)
         if result:
             live_homepages.append(result)
@@ -1052,8 +1092,11 @@ async def fetch_mca_company_data_gov_page(cin: str) -> str:
 
 
 async def fetch_mca_portal(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                            registry: SourceRegistry | None = None) -> dict:
+                            registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
+    await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+    if job_deadline is not None:
+        deadline = min(deadline, job_deadline)
     legal_name = await resolve_india_legal_entity_name(company, search_cfg, budget, quota_guard)
     cin = await find_company_cin(company, search_cfg, budget, quota_guard, legal_name=legal_name, deadline=deadline)
 
@@ -1071,9 +1114,6 @@ async def fetch_mca_portal(company: str, search_cfg: dict, budget: SearchBudget,
             if registry is not None:
                 registry.register_core_source(source)
             return source
-        # MCA's own portal reliably 403s scrapers even though the CIN itself is a
-        # confirmed, valuable fact — surface it via a synthetic source rather than
-        # discarding it, so the LLM still gets the CIN and legal name as evidence.
         if cin:
             synthetic_text = (
                 f"{company} is registered in India with Corporate Identification Number (CIN) "
@@ -1148,8 +1188,11 @@ async def fetch_mca_portal(company: str, search_cfg: dict, budget: SearchBudget,
 
 
 async def fetch_national_csr_portal(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                     registry: SourceRegistry | None = None) -> dict:
+                                     registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
+    await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+    if job_deadline is not None:
+        deadline = min(deadline, job_deadline)
     company_query = company.replace(" ", "+")
     direct_urls = [
         f"https://www.csr.gov.in/content/csr/global/master/home/companydetail.html?companyName={company_query}",
@@ -1195,8 +1238,11 @@ async def fetch_national_csr_portal(company: str, search_cfg: dict, budget: Sear
 
 
 async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                               registry: SourceRegistry | None = None) -> dict:
+                               registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
+    await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+    if job_deadline is not None:
+        deadline = min(deadline, job_deadline)
     legal_name = await resolve_india_legal_entity_name(company, search_cfg, budget, quota_guard)
     best_candidate = None
     weak_candidate = None
@@ -1223,6 +1269,8 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
             category="annual_report",
         )
         for result in results:
+            if not await _within_deadline(deadline):
+                break
             url = result.get("href", "")
             title = result.get("title", "")
             body = result.get("body", "")
@@ -1274,6 +1322,8 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
                 category="annual_report",
             )
             for result in results:
+                if not await _within_deadline(deadline):
+                    break
                 url = result.get("href", "")
                 title = result.get("title", "")
                 body = result.get("body", "")
@@ -1314,18 +1364,12 @@ _PARTNER_RELEVANCE_KEYWORD_PATTERN = re.compile(
 
 
 async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                registry: SourceRegistry | None = None) -> dict:
-    """Widened beyond the company's own CSR page: gathers up to
-    MAX_PARTNER_SOURCES distinct candidate pages (press releases, MoU
-    announcements, foundation grant lists) instead of stopping at the first
-    acceptable one, plus LinkedIn company-page partnership posts read
-    directly from search snippets (LinkedIn's full page is login-walled, so
-    it is never fetched — same approach as the people-search source). "No
-    partners found" used to usually mean only the CSR webpage was checked;
-    this is the fix for that.
-    """
+                                registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
+    await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    candidates: list[tuple[float, str, str]] = []  # (score, url, text)
+    if job_deadline is not None:
+        deadline = min(deadline, job_deadline)
+    candidates: list[tuple[float, str, str]] = []
     seen_urls: set[str] = set()
     urls_tried = 0
 
@@ -1338,6 +1382,8 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
             category="partner_search",
         )
         for result in results:
+            if not await _within_deadline(deadline):
+                break
             url = result.get("href", "")
             title = result.get("title", "")
             body = result.get("body", "")
@@ -1347,9 +1393,6 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
                 continue
 
             if "linkedin.com" in url:
-                # LinkedIn is login-walled — never fetch the page, use the
-                # search snippet directly, the same approach fetch_linkedin_
-                # people uses for decision-maker discovery.
                 snippet_text = f"{title}. {body}".strip()
                 if len(snippet_text) < 40 or not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(snippet_text):
                     continue
@@ -1375,7 +1418,7 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
             candidates.append((score, url, text))
 
         if len(candidates) >= MAX_PARTNER_SOURCES * 2:
-            break  # plenty gathered — let scoring pick the best below
+            break
 
     logger.info("partner_search DONE company=%r urls_tried=%d candidates_found=%d", company, urls_tried, len(candidates))
 
@@ -1400,8 +1443,11 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
 
 
 async def fetch_education_programme_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                            registry: SourceRegistry | None = None) -> dict:
+                                            registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
+    await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+    if job_deadline is not None:
+        deadline = min(deadline, job_deadline)
     best_candidate = None
     urls_tried = 0
     for template in EDUCATION_PROGRAMME_QUERIES:
@@ -1415,6 +1461,8 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
             category="education_programme_search",
         )
         for result in results:
+            if not await _within_deadline(deadline):
+                break
             url = result.get("href", "")
             title = result.get("title", "")
             body = result.get("body", "")
@@ -1475,8 +1523,11 @@ async def _run_linkedin_query_batch(company: str, queries: list[str], search_cfg
 
 
 async def fetch_linkedin_people(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                 registry: SourceRegistry | None = None) -> dict:
+                                 registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
+    await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+    if job_deadline is not None:
+        deadline = min(deadline, job_deadline)
     hits: list[dict] = []
     seen_urls: set[str] = set()
 
@@ -1534,8 +1585,12 @@ async def fetch_linkedin_people(company: str, search_cfg: dict, budget: SearchBu
 
 
 async def fetch_plans_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                              max_pages: int = 3, registry: SourceRegistry | None = None) -> dict:
+                              max_pages: int = 3, registry: SourceRegistry | None = None,
+                              job_deadline: float | None = None) -> dict:
+    await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+    if job_deadline is not None:
+        deadline = min(deadline, job_deadline)
     hits, fetched_texts, first_url = [], [], ""
     all_queries = PLAN_QUERIES + RFP_QUERIES
     for query_template in all_queries:
@@ -1549,6 +1604,8 @@ async def fetch_plans_source(company: str, search_cfg: dict, budget: SearchBudge
             category="plans_search",
         )
         for result in results:
+            if not await _within_deadline(deadline):
+                break
             url = result.get("href", "")
             title = result.get("title", "")
             body = result.get("body", "")
@@ -1583,8 +1640,12 @@ async def fetch_plans_source(company: str, search_cfg: dict, budget: SearchBudge
 
 
 async def fetch_sector_eligibility_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                           registry: SourceRegistry | None = None) -> dict:
+                                           registry: SourceRegistry | None = None,
+                                           job_deadline: float | None = None) -> dict:
+    await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+    if job_deadline is not None:
+        deadline = min(deadline, job_deadline)
     hits, fetched_texts, first_url = [], [], ""
     queries = [t.format(c=company, fy=CURRENT_FY_LABEL) for t in SECTOR_QUERIES] + \
               [t.format(c=company) for t in GROUP_FOUNDATION_QUERIES]
@@ -1599,6 +1660,8 @@ async def fetch_sector_eligibility_source(company: str, search_cfg: dict, budget
             category="sector_eligibility_search",
         )
         for result in results:
+            if not await _within_deadline(deadline):
+                break
             url = result.get("href", "")
             title = result.get("title", "")
             body = result.get("body", "")
@@ -1646,6 +1709,8 @@ async def run_targeted_queries(company: str, question_category: str, search_cfg:
             category=f"followup_{question_category}",
         )
         for result in results:
+            if not await _within_deadline(deadline):
+                break
             url = result.get("href", "")
             title = result.get("title", "")
             body = result.get("body", "")
@@ -1676,16 +1741,6 @@ async def run_targeted_queries(company: str, question_category: str, search_cfg:
 
 async def fetch_screen_sources(company: str, search_cfg: dict, quota_guard=None,
                                 registry: SourceRegistry | None = None) -> list[dict]:
-    """Screen mode used to only run 4 of the 9 source types (CSR page, MCA, annual
-    report, partners) and hardcode the other 5 — national CSR portal, LinkedIn
-    people, plans/RFP, sector/eligibility, education programmes — as NOT_TRIED.
-    That starved the scorer of exactly the evidence categories (named
-    decision-makers, named partners/programmes, outreach channels) the rubric
-    weighs most heavily, which is why fit scores came back structurally low
-    regardless of how strong a company's actual CSR programme was. All 9 run
-    here now, same as deep mode, just against a smaller per-company search
-    budget so screen mode stays fast and cheap relative to deep mode.
-    """
     registry = registry or SourceRegistry(company)
     budget = SearchBudget(company, max_google_queries=12, max_ddgs_queries=6)
 
@@ -1713,36 +1768,54 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
                               registry: SourceRegistry | None = None) -> list[dict]:
     registry = registry or SourceRegistry(company)
     budget = SearchBudget(company)
+    job_deadline = time.monotonic() + DEEP_JOB_HARD_DEADLINE_SECONDS
+
+    def not_tried(name: str, num: int) -> dict:
+        return make_source(name, num, status="NOT_TRIED")
 
     async def advance_step(message: str):
         if progress_cb:
             await progress_cb(message)
 
-    await advance_step("Sources 1-4/9 — CSR page, MCA, National CSR Portal, annual report...")
-    source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry)
-    source_2 = await fetch_mca_portal(company, search_cfg, budget, quota_guard, registry=registry)
-    source_3 = await fetch_national_csr_portal(company, search_cfg, budget, quota_guard, registry=registry)
-    source_4 = await fetch_annual_report(company, search_cfg, budget, quota_guard, registry=registry)
-    logger.info(
-        "deep sources 1-4 company=%r csr_page=%s mca=%s national=%s annual=%s google_used=%d ddgs_used=%d",
-        company, source_1.get("status"), source_2.get("status"), source_3.get("status"), source_4.get("status"),
-        budget.google_queries_used, budget.ddgs_queries_used,
-    )
+    try:
+        await advance_step("Sources 1-4/9 — CSR page, MCA, National CSR Portal, annual report...")
+        source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        source_2 = await fetch_mca_portal(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        source_3 = await fetch_national_csr_portal(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        source_4 = await fetch_annual_report(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        logger.info(
+            "deep sources 1-4 company=%r csr_page=%s mca=%s national=%s annual=%s google_used=%d ddgs_used=%d",
+            company, source_1.get("status"), source_2.get("status"), source_3.get("status"), source_4.get("status"),
+            budget.google_queries_used, budget.ddgs_queries_used,
+        )
 
-    await advance_step("Sources 5-9/9 — partners, decision-makers, plans, sector, education programmes...")
-    source_5 = await fetch_partner_source(company, search_cfg, budget, quota_guard, registry=registry)
-    source_6 = await fetch_linkedin_people(company, search_cfg, budget, quota_guard, registry=registry)
-    source_7 = await fetch_plans_source(company, search_cfg, budget, quota_guard, registry=registry)
-    source_8 = await fetch_sector_eligibility_source(company, search_cfg, budget, quota_guard, registry=registry)
-    source_9 = await fetch_education_programme_source(company, search_cfg, budget, quota_guard, registry=registry)
+        await advance_step("Sources 5-9/9 — partners, decision-makers, plans, sector, education programmes...")
+        source_5 = await fetch_partner_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        source_6 = await fetch_linkedin_people(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        source_7 = await fetch_plans_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        source_8 = await fetch_sector_eligibility_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        source_9 = await fetch_education_programme_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+    except DeepJobDeadlineExceeded:
+        logger.warning("fetch_deep_sources hit hard job deadline company=%r seconds=%d", company, DEEP_JOB_HARD_DEADLINE_SECONDS)
+        existing = locals()
+        source_1 = existing.get("source_1") or not_tried("india_csr_page", 1)
+        source_2 = existing.get("source_2") or not_tried("mca_portal", 2)
+        source_3 = existing.get("source_3") or not_tried("national_csr_portal", 3)
+        source_4 = existing.get("source_4") or not_tried("annual_report", 4)
+        source_5 = existing.get("source_5") or not_tried("partner_search", 5)
+        source_6 = existing.get("source_6") or not_tried("people_search", 6)
+        source_7 = existing.get("source_7") or not_tried("plans_search", 7)
+        source_8 = existing.get("source_8") or not_tried("sector_eligibility_search", 8)
+        source_9 = existing.get("source_9") or not_tried("education_programme_search", 9)
 
     sources = [source_1, source_2, source_3, source_4, source_5, source_6, source_7, source_8, source_9]
+
     total_figures = sum(count_financial_figures(s.get("text", "")) for s in sources)
-    if total_figures == 0 and budget.google_has_budget("csr_budget"):
+    if total_figures == 0 and budget.google_has_budget("csr_budget") and time.monotonic() < job_deadline:
         legal_name = await resolve_india_legal_entity_name(company, search_cfg, budget, quota_guard)
         spend_templates = [(t, True) for t in CSR_SPEND_ENTITY_QUERIES] if legal_name else []
         spend_templates += [(t, False) for t in CSR_SPEND_QUERIES]
-        spend_deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+        spend_deadline = min(time.monotonic() + SOURCE_DEADLINE_SECONDS, job_deadline)
         for template, is_entity_query in spend_templates:
             if time.monotonic() >= spend_deadline or not budget.google_has_budget("csr_budget"):
                 break
@@ -1754,6 +1827,8 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
                 category="csr_budget",
             )
             for result in results:
+                if time.monotonic() >= spend_deadline:
+                    break
                 url = result.get("href", "")
                 body = result.get("body", "")
                 if not url or not mentions_company(company, body):
@@ -1778,4 +1853,5 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
         company, found_count, sum(count_financial_figures(s.get("text", "")) for s in sources),
         len(registry.entries()), budget.google_queries_used, budget.ddgs_queries_used,
     )
+    gc.collect()
     return sources
