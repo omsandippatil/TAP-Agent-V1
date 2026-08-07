@@ -1,8 +1,6 @@
-import asyncio
 import json
 import logging
 import re
-import time
 import typing
 
 import httpx
@@ -17,13 +15,16 @@ ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_VERSION = "2023-06-01"
 
 LLM_UNAVAILABLE_EVIDENCE = "LLM unavailable — unable to generate evidence"
+LLM_SCORING_UNAVAILABLE_NOTE = (
+    "Automated scoring could not complete for this run, but the facts below were "
+    "successfully extracted from the fetched sources — verify and score manually."
+)
 
 OUTPUT_TOKEN_RESERVE = 6000
 EXTRACTION_OUTPUT_TOKEN_RESERVE = 3200
 SCAFFOLD_SAFETY_MARGIN = 400
 MIN_EVIDENCE_TOKEN_BUDGET = 500
 ANTHROPIC_REQUEST_TIMEOUT_SECONDS = 120.0
-INTER_CALL_DELAY_SECONDS = 1.5
 MIN_PROMPT_TRIM_CHARS = 150
 MAX_PROMPT_SHRINK_ATTEMPTS = 6
 PROMPT_SHRINK_SAFETY_MARGIN = 120
@@ -578,66 +579,7 @@ class FullAnalysisSchema(BaseModel):
     overall_authenticity_score: int = Field(ge=0, le=100, default=0)
     open_questions: list[str] = Field(default_factory=list)
     strategic_insight: str = Field(default="", max_length=2200)
-
-
-_cooldown_until_monotonic: float = 0.0
-_cooldown_reason: str = ""
-_TPM_WINDOW_SECONDS = 60.0
-_tpm_window_events: list[tuple] = []
-_last_call_finished_at_monotonic: float = 0.0
-_anthropic_call_lock = asyncio.Lock()
-
-
-def _prune_tpm_window(now: float) -> None:
-    cutoff = now - _TPM_WINDOW_SECONDS
-    while _tpm_window_events and _tpm_window_events[0][0] < cutoff:
-        _tpm_window_events.pop(0)
-
-
-def _record_tpm_usage(tokens: int) -> None:
-    now = time.monotonic()
-    _prune_tpm_window(now)
-    _tpm_window_events.append((now, tokens))
-
-
-def tpm_tokens_used_in_window() -> int:
-    now = time.monotonic()
-    _prune_tpm_window(now)
-    return sum(tokens for _, tokens in _tpm_window_events)
-
-
-def tpm_tokens_available(safety_margin: int = 300) -> int:
-    used = tpm_tokens_used_in_window()
-    return max(0, settings.anthropic_tpm_limit - used - safety_margin)
-
-
-def _parse_retry_after_seconds(retry_after_header: str, response_body_text: str) -> float:
-    try:
-        return float(retry_after_header)
-    except (TypeError, ValueError):
-        pass
-    match = re.search(r"try again in ([\d.]+)s", response_body_text)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            pass
-    return 30.0
-
-
-def anthropic_cooldown_remaining_seconds() -> float:
-    return max(0.0, _cooldown_until_monotonic - time.monotonic())
-
-
-def evidence_token_budget(company: str, mission: str, sources_manifest: str, mode: str = "deep") -> int:
-    scaffold_tokens = estimate_tokens(
-        _extraction_prompt(company, mission, "", sources_manifest)
-    ) + SCAFFOLD_SAFETY_MARGIN
-    output_reserve = EXTRACTION_OUTPUT_TOKEN_RESERVE
-    static_budget = settings.anthropic_tpm_limit - output_reserve - scaffold_tokens
-    live_budget = tpm_tokens_available(safety_margin=output_reserve + scaffold_tokens)
-    budget = min(static_budget, live_budget) if live_budget > 0 else static_budget
-    return max(MIN_EVIDENCE_TOKEN_BUDGET, budget)
+    scoring_incomplete: bool = False
 
 
 async def call_anthropic_chat(
@@ -647,116 +589,75 @@ async def call_anthropic_chat(
     model: str | None = None,
     caller: str = "unknown",
 ) -> str | None:
-    global _cooldown_until_monotonic, _cooldown_reason, _last_call_finished_at_monotonic
-
+    """Sends a single message to the Anthropic API. No local TPM budgeting or
+    cooldown bookkeeping — Anthropic's own rate limiter is authoritative, and
+    a 429 here is handled the same way any other transient HTTP error is:
+    logged and returned as None so the caller can decide what to do next.
+    """
     if not settings.anthropic_configured:
         logger.warning("anthropic call skipped caller=%s reason=not_configured", caller)
         return None
 
-    cooldown_remaining = anthropic_cooldown_remaining_seconds()
-    if cooldown_remaining > 0:
+    estimated_prompt_tokens = estimate_tokens(prompt)
+    resolved_model = model or settings.anthropic_model
+    payload = {
+        "model": resolved_model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "{"},
+        ],
+    }
+
+    logger.info(
+        "anthropic request caller=%s model=%s max_tokens=%d estimated_prompt_tokens=%d",
+        caller, resolved_model, max_tokens, estimated_prompt_tokens,
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=ANTHROPIC_REQUEST_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                ANTHROPIC_MESSAGES_URL,
+                headers={
+                    "x-api-key": settings.anthropic_api_key,
+                    "anthropic-version": ANTHROPIC_API_VERSION,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except httpx.HTTPError as exc:
+        logger.error("anthropic transport error caller=%s error=%s", caller, exc)
+        return None
+
+    if response.status_code == 429:
         logger.warning(
-            "anthropic call skipped caller=%s reason=cooldown_active seconds_left=%.0f last_reason=%s",
-            caller, cooldown_remaining, _cooldown_reason,
+            "anthropic 429 caller=%s retry_after=%s body=%s",
+            caller, response.headers.get("retry-after", "unknown"), response.text[:200],
         )
         return None
 
-    async with _anthropic_call_lock:
-        since_last_call = time.monotonic() - _last_call_finished_at_monotonic
-        if since_last_call < INTER_CALL_DELAY_SECONDS:
-            await asyncio.sleep(INTER_CALL_DELAY_SECONDS - since_last_call)
+    if response.status_code >= 400:
+        logger.error("anthropic http error caller=%s status=%d body=%s", caller, response.status_code, response.text[:400])
+        return None
 
-        estimated_prompt_tokens = estimate_tokens(prompt)
-        estimated_total_tokens = estimated_prompt_tokens + max_tokens
-        hard_ceiling = settings.anthropic_tpm_limit - max_tokens
+    try:
+        body = response.json()
+    except ValueError:
+        logger.error("anthropic non-json response caller=%s", caller)
+        return None
 
-        if estimated_prompt_tokens > hard_ceiling:
-            logger.error(
-                "anthropic call aborted before send caller=%s estimated_prompt_tokens=%d max_tokens=%d tpm_limit=%d",
-                caller, estimated_prompt_tokens, max_tokens, settings.anthropic_tpm_limit,
-            )
-            return None
+    logger.info("anthropic response caller=%s status=%d", caller, response.status_code)
 
-        tokens_used_in_window = tpm_tokens_used_in_window()
-        if tokens_used_in_window + estimated_total_tokens > settings.anthropic_tpm_limit:
-            logger.warning(
-                "anthropic call skipped caller=%s reason=local_tpm_budget_exhausted used=%d estimated=%d limit=%d",
-                caller, tokens_used_in_window, estimated_total_tokens, settings.anthropic_tpm_limit,
-            )
-            _cooldown_until_monotonic = max(_cooldown_until_monotonic, time.monotonic() + 15.0)
-            _cooldown_reason = "local tpm budget exhausted"
-            return None
+    if body.get("stop_reason") == "max_tokens":
+        logger.warning("anthropic response TRUNCATED caller=%s max_tokens=%d", caller, max_tokens)
 
-        resolved_model = model or settings.anthropic_model
-        payload = {
-            "model": resolved_model,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "messages": [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": "{"},
-            ],
-        }
-
-        logger.info(
-            "anthropic request caller=%s model=%s max_tokens=%d estimated_prompt_tokens=%d",
-            caller, resolved_model, max_tokens, estimated_prompt_tokens,
-        )
-        request_started_at = time.monotonic()
-        _record_tpm_usage(estimated_total_tokens)
-
-        try:
-            async with httpx.AsyncClient(timeout=ANTHROPIC_REQUEST_TIMEOUT_SECONDS) as client:
-                response = await client.post(
-                    ANTHROPIC_MESSAGES_URL,
-                    headers={
-                        "x-api-key": settings.anthropic_api_key,
-                        "anthropic-version": ANTHROPIC_API_VERSION,
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
-        except httpx.HTTPError as exc:
-            logger.error("anthropic transport error caller=%s error=%s", caller, exc)
-            _last_call_finished_at_monotonic = time.monotonic()
-            return None
-
-        elapsed_ms = (time.monotonic() - request_started_at) * 1000
-        _last_call_finished_at_monotonic = time.monotonic()
-
-        if response.status_code == 429:
-            retry_after_seconds = _parse_retry_after_seconds(response.headers.get("retry-after", ""), response.text)
-            _cooldown_until_monotonic = time.monotonic() + retry_after_seconds
-            _cooldown_reason = response.text[:200]
-            logger.warning("anthropic 429 caller=%s retry_after=%.0fs", caller, retry_after_seconds)
-            return None
-
-        if response.status_code >= 400:
-            logger.error("anthropic http error caller=%s status=%d body=%s", caller, response.status_code, response.text[:400])
-            return None
-
-        try:
-            body = response.json()
-        except ValueError:
-            logger.error("anthropic non-json response caller=%s", caller)
-            return None
-
-        logger.info("anthropic response caller=%s status=%d elapsed_ms=%.0f", caller, response.status_code, elapsed_ms)
-
-        usage = body.get("usage") or {}
-        input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
-        if isinstance(input_tokens, int) and isinstance(output_tokens, int):
-            _record_tpm_usage((input_tokens + output_tokens) - estimated_total_tokens)
-
-        if body.get("stop_reason") == "max_tokens":
-            logger.warning("anthropic response TRUNCATED caller=%s max_tokens=%d", caller, max_tokens)
-
-        content_blocks = body.get("content") or []
-        text_parts = [block.get("text", "") for block in content_blocks if block.get("type") == "text"]
-        if not text_parts:
-            logger.error("anthropic malformed response caller=%s", caller)
-            return None
-        return "{" + "".join(text_parts)
+    content_blocks = body.get("content") or []
+    text_parts = [block.get("text", "") for block in content_blocks if block.get("type") == "text"]
+    if not text_parts:
+        logger.error("anthropic malformed response caller=%s", caller)
+        return None
+    return "{" + "".join(text_parts)
 
 
 def parse_json_response(raw_text: str | None) -> dict:
@@ -980,6 +881,51 @@ def _repair_extraction(parsed: dict) -> dict:
     return sanitized
 
 
+def _empty_criteria() -> list[dict]:
+    return [
+        {
+            "id": criterion_id, "name": CRITERIA_TITLES[criterion_id],
+            "score": 0.0, "confidence": 0,
+            "evidence": "No signal returned for this criterion", "reasoning": "", "source": "",
+        }
+        for criterion_id in CRITERIA_IDS
+    ]
+
+
+def build_extraction_only_result(extraction: dict, mode: str) -> dict:
+    """Used when pass 1 (extraction) succeeds but pass 2 (scoring) fails —
+    instead of discarding the successfully extracted facts and returning
+    None (the old behaviour, which produced a confusing zero'd-out report
+    with a fully populated scorecard rendered from stale/cached data
+    upstream), this builds a schema-valid, clearly-labeled result: real
+    extraction fields, zeroed criteria, fit_score 0, and
+    scoring_incomplete=True so the caller/frontend can render an honest
+    "facts extracted, scoring failed" state instead of a misleading one.
+    """
+    merged = dict(extraction)
+    merged.pop("key_facts_summary", None)
+    merged["criteria"] = _empty_criteria()
+    merged["fit_score"] = 0
+    merged["fit_rationale"] = ""
+    merged["overall_semantic_alignment"] = 0
+    merged["alignment_rationale"] = ""
+    merged["strategic_insight"] = LLM_SCORING_UNAVAILABLE_NOTE
+    merged["scoring_incomplete"] = True
+
+    validated = _repair_analysis(merged)
+    result = validated.model_dump()
+    result["scoring_incomplete"] = True
+    result["open_questions"] = [q.strip()[:200] for q in extraction.get("open_questions", []) if q and q.strip()][:5]
+
+    logger.warning(
+        "build_extraction_only_result company_facts_preserved mode=%r authenticity=%d "
+        "partners=%d programmes=%d decision_makers=%d",
+        mode, result["overall_authenticity_score"], len(result["partners"]),
+        len(result["programmes"]), len(result["decision_makers"]),
+    )
+    return result
+
+
 def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
     parsed = dict(parsed) if isinstance(parsed, dict) else {}
     parsed = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
@@ -1055,7 +1001,7 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
                 "fit_rationale", "overall_semantic_alignment", "alignment_rationale",
                 "delivery_model", "delivery_model_evidence", "evidence_recency",
                 "csr_head_note", "source_quality_assessment", "overall_authenticity_score",
-                "strategic_insight",
+                "strategic_insight", "scoring_incomplete",
             ):
                 if scalar_field in parsed:
                     safe_kwargs[scalar_field] = parsed[scalar_field]
@@ -1117,8 +1063,12 @@ def _shrink_to_fit(company: str, mission: str, sources_manifest: str, cleaned_so
     """Shared shrink loop used by both the extraction and scoring passes:
     repeatedly trims FOUND source text proportionally until the built prompt
     fits inside output_ceiling tokens, or gives up after
-    MAX_PROMPT_SHRINK_ATTEMPTS. Returns (evidence_text, working_sources,
-    final_prompt_tokens); prompt_builder(evidence_text) -> str.
+    MAX_PROMPT_SHRINK_ATTEMPTS. output_ceiling here is a context-window
+    budget (how much the model can accept alongside a given output
+    reservation), not a rate-limit budget — this is a hard model constraint,
+    not a policy choice, so it stays even without any TPM throttling.
+    Returns (evidence_text, working_sources, final_prompt_tokens);
+    prompt_builder(evidence_text) -> str.
     """
     evidence_text = combine_evidence_text(cleaned_sources)
     prompt = prompt_builder(evidence_text)
@@ -1165,7 +1115,7 @@ async def extract_company_facts(
         logger.info("extract_company_facts skipped company=%r reason=no_evidence_text", company)
         return None
 
-    output_ceiling = settings.anthropic_tpm_limit - EXTRACTION_OUTPUT_TOKEN_RESERVE
+    output_ceiling = settings.anthropic_context_window - EXTRACTION_OUTPUT_TOKEN_RESERVE
 
     def _build(evidence: str) -> str:
         return _extraction_prompt(company, mission, evidence, sources_manifest)
@@ -1176,7 +1126,7 @@ async def extract_company_facts(
 
     if prompt_tokens > output_ceiling:
         logger.error(
-            "extract_company_facts could not fit prompt within budget company=%r prompt_tokens=%d ceiling=%d",
+            "extract_company_facts could not fit prompt within context window company=%r prompt_tokens=%d ceiling=%d",
             company, prompt_tokens, output_ceiling,
         )
         return None
@@ -1259,7 +1209,7 @@ async def score_extracted_facts(
     prompt = _scoring_prompt(company, mission, mode, scoring_facts, sources_manifest)
     prompt_tokens = estimate_tokens(prompt)
     output_reserve = OUTPUT_TOKEN_RESERVE - EXTRACTION_OUTPUT_TOKEN_RESERVE
-    output_ceiling = settings.anthropic_tpm_limit - output_reserve
+    output_ceiling = settings.anthropic_context_window - output_reserve
 
     if prompt_tokens > output_ceiling:
         # Extraction facts are already distilled, so this should be rare;
@@ -1273,7 +1223,7 @@ async def score_extracted_facts(
 
     if prompt_tokens > output_ceiling:
         logger.error(
-            "score_extracted_facts could not fit prompt within budget company=%r prompt_tokens=%d ceiling=%d",
+            "score_extracted_facts could not fit prompt within context window company=%r prompt_tokens=%d ceiling=%d",
             company, prompt_tokens, output_ceiling,
         )
         return None
@@ -1310,9 +1260,19 @@ async def analyze_and_score_company(
     """Public entry point — signature-compatible with the previous single-shot
     version (mode is new but optional and defaults to the old strict/deep
     behaviour, so any existing caller that doesn't pass mode still works
-    unchanged). Internally now runs extraction then scoring, then computes
+    unchanged). Internally runs extraction then scoring, then computes
     fit_score deterministically from the weighted criteria rather than
     trusting either LLM call's own number.
+
+    Only returns None if extraction itself fails (no usable evidence to work
+    with at all). If extraction succeeds but scoring fails, this now returns
+    an extraction-only result (scoring_incomplete=True) instead of silently
+    discarding everything that was already learned — this was the source of
+    reports that showed a fully populated scorecard/sources next to a
+    zero'd-out "LLM unavailable" summary: the caller was reconstructing a
+    partial view from data this function used to throw away on a scoring
+    failure. Now there is exactly one object returned, and it's internally
+    consistent either way.
     """
     extraction = await extract_company_facts(company, mission, cleaned_sources, sources_manifest)
     if not extraction:
@@ -1320,7 +1280,12 @@ async def analyze_and_score_company(
 
     scoring = await score_extracted_facts(company, mission, mode, extraction, sources_manifest)
     if not scoring:
-        return None
+        logger.error(
+            "analyze_and_score_company scoring pass failed after successful extraction, "
+            "returning extraction-only result company=%r mode=%r",
+            company, mode,
+        )
+        return build_extraction_only_result(extraction, mode)
 
     merged = dict(extraction)
     merged.pop("key_facts_summary", None)
@@ -1330,6 +1295,7 @@ async def analyze_and_score_company(
     merged["overall_semantic_alignment"] = scoring.get("overall_semantic_alignment", 0)
     merged["alignment_rationale"] = scoring.get("alignment_rationale", "")
     merged["strategic_insight"] = scoring.get("strategic_insight", "")
+    merged["scoring_incomplete"] = False
 
     validated = _repair_analysis(merged)
     result = validated.model_dump()
