@@ -47,6 +47,29 @@ BLOCKED_403_DOMAINS = (
 _DYNAMIC_BLOCKED_DOMAINS: dict[str, int] = {}
 _DYNAMIC_BLOCK_THRESHOLD = 3
 
+_GOOGLE_CSE_BROKEN = False
+_GOOGLE_CSE_BROKEN_LOCK = asyncio.Lock()
+
+
+def _mark_google_cse_broken(reason: str) -> None:
+    global _GOOGLE_CSE_BROKEN
+    if not _GOOGLE_CSE_BROKEN:
+        _GOOGLE_CSE_BROKEN = True
+        logger.error(
+            "google CSE marked broken for rest of process, all further google calls will be skipped reason=%s",
+            reason,
+        )
+
+
+def google_cse_is_broken() -> bool:
+    return _GOOGLE_CSE_BROKEN
+
+
+def reset_google_cse_broken_flag_for_tests() -> None:
+    global _GOOGLE_CSE_BROKEN
+    _GOOGLE_CSE_BROKEN = False
+
+
 OFFICIAL_GOV_DOMAINS = (
     "mca.gov.in", "csr.gov.in", "nic.in", "india.gov.in", "meity.gov.in",
     "pib.gov.in", "sebi.gov.in", "rbi.org.in",
@@ -286,7 +309,7 @@ PDF_FETCH_TIMEOUT_SECONDS = 10
 HOMEPAGE_FETCH_TIMEOUT_SECONDS = 6
 DNS_CHECK_TIMEOUT_SECONDS = 1.5
 DDGS_TOTAL_BUDGET_SECONDS = 4
-DDGS_BACKENDS = ("duckduckgo", "lite")
+DDGS_BACKENDS = ("duckduckgo", "brave", "mojeek")
 SEARCH_TASK_TIMEOUT_SECONDS = 6
 FETCH_TASK_TIMEOUT_SECONDS = 10
 SOURCE_DEADLINE_SECONDS = 18
@@ -549,7 +572,11 @@ async def ddgs_search_web(query: str, budget: SearchBudget | None, max_results: 
 
 async def search_web(query: str, budget: SearchBudget, max_results: int = 6,
                       prefer_google: bool = True, quota_guard=None, category: str = "") -> list[dict]:
-    google_available = prefer_google and google_search.google_search_configured_and_available(quota_guard)
+    google_available = (
+        prefer_google
+        and not google_cse_is_broken()
+        and google_search.google_search_configured_and_available(quota_guard)
+    )
 
     if google_available and budget.google_has_budget(category):
         budget.record_google_query()
@@ -558,6 +585,10 @@ async def search_web(query: str, budget: SearchBudget, max_results: int = 6,
                 google_search.google_search_web(query, max_results=max_results, quota_guard=quota_guard),
                 timeout=SEARCH_TASK_TIMEOUT_SECONDS,
             )
+        except google_search.GoogleCseInvalidArgumentError as exc:
+            async with _GOOGLE_CSE_BROKEN_LOCK:
+                _mark_google_cse_broken(str(exc))
+            results = []
         except asyncio.TimeoutError:
             logger.warning("google search timed out query=%r", query)
             results = []
@@ -567,6 +598,9 @@ async def search_web(query: str, budget: SearchBudget, max_results: int = 6,
         if not budget.ddgs_has_budget():
             return []
         return await ddgs_search_web(query, budget, max_results=max_results)
+
+    if prefer_google and google_cse_is_broken():
+        logger.info("google search skipped, CSE marked broken this run query=%r category=%r", query, category)
 
     if google_available and not budget.google_has_budget(category):
         logger.info("google search skipped, company budget exhausted query=%r category=%r", query, category)
@@ -1504,15 +1538,23 @@ async def _run_linkedin_query_batch(company: str, queries: list[str], search_cfg
             break
         if not budget.google_has_budget("people_search"):
             break
+        if google_cse_is_broken():
+            logger.info("linkedin people search skipped, CSE marked broken this run query=%r", query_template)
+            break
         role_hint = ""
         if '"' in query_template:
             parts = query_template.split('"')
             if len(parts) >= 4:
                 role_hint = parts[3]
         budget.record_google_query()
-        profiles = await google_search.google_search_linkedin_profiles(
-            company, role_hint=role_hint, max_results=8, quota_guard=quota_guard,
-        )
+        try:
+            profiles = await google_search.google_search_linkedin_profiles(
+                company, role_hint=role_hint, max_results=8, quota_guard=quota_guard,
+            )
+        except google_search.GoogleCseInvalidArgumentError as exc:
+            async with _GOOGLE_CSE_BROKEN_LOCK:
+                _mark_google_cse_broken(str(exc))
+            break
         for profile in profiles:
             url = profile.get("href", "")
             if not is_literal_linkedin_profile_url(url):

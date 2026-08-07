@@ -66,9 +66,13 @@
     <div class="report-head-top">
       <span class="eyebrow">{{ 'Prospect Screening' if mode == 'screen' else 'Deep Research' }}</span>
       {% if mode == 'screen' %}
-        <span class="status-pill status-{{ 'good' if fit >= 80 else ('mid' if fit >= 45 else 'low') }}">
-          {{ 'Qualify' if fit >= 80 else (tier.label if fit >= 45 else 'Skip') }}
-        </span>
+        {% if fit is none %}
+          <span class="status-pill status-low">{{ tier.label or 'Not scored' }}</span>
+        {% else %}
+          <span class="status-pill status-{{ 'good' if fit >= 80 else ('mid' if fit >= 45 else 'low') }}">
+            {{ 'Qualify' if fit >= 80 else (tier.label if fit >= 45 else 'Skip') }}
+          </span>
+        {% endif %}
       {% endif %}
     </div>
     <div class="company-title-row">
@@ -93,7 +97,7 @@
 
   <section class="summary-block">
     <div class="score-figure">
-      <div class="score-figure-num">{{ fit }}</div>
+      <div class="score-figure-num">{{ fit if fit is not none else 'N/A' }}</div>
       <div class="score-figure-max">/ 100</div>
     </div>
     <div class="summary-body">
@@ -478,7 +482,7 @@
           </div>
           <div class="meta-row">
             <span class="meta-key">Fit score</span>
-            <span class="meta-val">{{ fit }} / 100</span>
+            <span class="meta-val">{{ (fit ~ ' / 100') if fit is not none else 'Not scored' }}</span>
           </div>
           <div class="meta-row">
             <span class="meta-key">Tier</span>

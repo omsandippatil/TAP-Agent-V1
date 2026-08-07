@@ -21,13 +21,24 @@ LLM_SCORING_UNAVAILABLE_NOTE = (
 )
 
 OUTPUT_TOKEN_RESERVE = 6000
-EXTRACTION_OUTPUT_TOKEN_RESERVE = 3200
+EXTRACTION_OUTPUT_TOKEN_RESERVE = 4200
 MIN_EVIDENCE_TOKEN_BUDGET = 500
 ANTHROPIC_REQUEST_TIMEOUT_SECONDS = 120.0
 MIN_PROMPT_TRIM_CHARS = 150
 MAX_PROMPT_SHRINK_ATTEMPTS = 6
 PROMPT_SHRINK_SAFETY_MARGIN = 120
 DEFAULT_ANTHROPIC_CONTEXT_WINDOW = 200000
+
+EXTRACTION_PRIORITY_KEYS = [
+    "overall_authenticity_score",
+    "source_quality_assessment",
+    "evidence_recency",
+    "delivery_model",
+    "delivery_model_evidence",
+    "sector",
+    "eligibility",
+    "spend",
+]
 
 
 def _anthropic_context_window() -> int:
@@ -264,6 +275,17 @@ HIGHLIGHT_RULE = (
     "if the field is empty."
 )
 
+FIELD_ORDER_RULE = (
+    "FIELD ORDER: emit the JSON object's top-level keys in exactly the order shown in the JSON "
+    "shape below, with no exceptions. This matters because your reply can be cut off by an "
+    "output-length limit, and fields written first are the ones guaranteed to survive a cutoff — "
+    "so short, high-value summary fields (authenticity score, source quality, evidence recency, "
+    "delivery model, sector, eligibility, spend) are placed before the larger array fields "
+    "(programmes, partners, decision_makers, geographies, red_flags), which are placed last "
+    "since they are the most likely to be truncated safely without losing the fields other parts "
+    "of the pipeline depend on."
+)
+
 
 def _extraction_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
     return f"""You are a meticulous fact-extraction analyst. Extract every concrete, sourced fact about {company}'s India CSR activity from the evidence below. Do NOT score or judge fit — that happens in a separate pass. Your only job here is complete, accurate, well-cited extraction.
@@ -290,53 +312,55 @@ SOURCES:
 
 {EVIDENCE_STYLE_RULE}
 
-Extract, in this order:
-1. delivery_model (FUNDER/IMPLEMENTER/HYBRID/UNCLEAR) + delivery_model_evidence (1 sentence).
-2. spend — apply the SPEND VS REVENUE and EDUCATION SPEND rules strictly.
-3. programmes[] — apply the PROGRAMME rule.
-4. partners[] — apply the PARTNER rule, including similar_to_tap_profile.
-5. decision_makers[] — every named leader/exec/spokesperson in a CSR/sustainability context; title, public_facing_score 0-100, tenure_status, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence.
-6. geographies[] — every state/city explicitly named.
-7. rfp_signal — an explicit call for NGO partners; default false/empty unless stated.
-8. board_affinity — named board/promoter personal education-philanthropy history; default false/empty unless stated.
-9. volunteering — named employee volunteering/payroll-giving touching education; default false/empty unless stated.
-10. group_foundation — CSR run via a separate parent/group foundation, only if explicitly named.
-11. eligibility — Section 135 applicability (LIKELY/UNLIKELY/UNKNOWN) from net worth/turnover/profit figures (kept separate from spend), plus the plain numeric business-scale fields.
-12. sector — from company-description language; UNKNOWN only if truly no clue.
-13. red_flags[] — genuine contradictions or marketing-not-substance signals, severity low/medium/high. Missing/undocumented details are NOT red flags.
-14. contact_pathway — the single most concrete real channel; "Not identified" if nothing exists.
-15. evidence_recency — one sentence on how current the evidence appears.
-16. csr_head_note — one sentence, only from actual named-person context, never speculation from a bare title.
-17. source_quality_assessment — 1-2 sentences: primary (company/regulator) vs secondary (press/snippets) sourcing.
-18. overall_authenticity_score (0-100) — reflects sourcing quality (primary vs secondary, how many sources actually returned usable text), not evidence volume.
-19. open_questions[] — up to 5 short, concrete, searchable items to verify.
-20. key_facts_summary — 3-6 short bullet-style facts (as a single string, one per line prefixed with "- ") that most directly bear on education-CSR fit — this feeds directly into the scoring pass, so include anything that would move a fit judgment either up or down.
+{FIELD_ORDER_RULE}
+
+Extract, matching the JSON shape's key order exactly:
+1. overall_authenticity_score (0-100) — reflects sourcing quality (primary vs secondary, how many sources actually returned usable text), not evidence volume.
+2. source_quality_assessment — 1-2 sentences: primary (company/regulator) vs secondary (press/snippets) sourcing.
+3. evidence_recency — one sentence on how current the evidence appears.
+4. csr_head_note — one sentence, only from actual named-person context, never speculation from a bare title.
+5. delivery_model (FUNDER/IMPLEMENTER/HYBRID/UNCLEAR) + delivery_model_evidence (1 sentence).
+6. sector — from company-description language; UNKNOWN only if truly no clue.
+7. eligibility — Section 135 applicability (LIKELY/UNLIKELY/UNKNOWN) from net worth/turnover/profit figures (kept separate from spend), plus the plain numeric business-scale fields.
+8. spend — apply the SPEND VS REVENUE and EDUCATION SPEND rules strictly.
+9. rfp_signal — an explicit call for NGO partners; default false/empty unless stated.
+10. board_affinity — named board/promoter personal education-philanthropy history; default false/empty unless stated.
+11. volunteering — named employee volunteering/payroll-giving touching education; default false/empty unless stated.
+12. group_foundation — CSR run via a separate parent/group foundation, only if explicitly named.
+13. key_facts_summary — 3-6 short bullet-style facts (as a single string, one per line prefixed with "- ") that most directly bear on education-CSR fit — this feeds directly into the scoring pass, so include anything that would move a fit judgment either up or down.
+14. open_questions[] — up to 5 short, concrete, searchable items to verify.
+15. programmes[] — apply the PROGRAMME rule.
+16. partners[] — apply the PARTNER rule, including similar_to_tap_profile.
+17. decision_makers[] — every named leader/exec/spokesperson in a CSR/sustainability context; title, public_facing_score 0-100, tenure_status, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence.
+18. geographies[] — every state/city explicitly named.
+19. red_flags[] — genuine contradictions or marketing-not-substance signals, severity low/medium/high. Missing/undocumented details are NOT red flags.
+20. contact_pathway — the single most concrete real channel; "Not identified" if nothing exists.
 
 Reply with ONE JSON object, nothing else, no markdown fences.
 
 JSON shape:
 {{
+  "overall_authenticity_score": <int 0-100>,
+  "source_quality_assessment": "<1-2 sentences>",
+  "evidence_recency": "<one sentence>",
+  "csr_head_note": "<one sentence>",
   "delivery_model": "<FUNDER|IMPLEMENTER|HYBRID|UNCLEAR>",
   "delivery_model_evidence": "<sentence>",
+  "sector": {{"sector": "<sector>", "sub_sector": "<or empty>", "reasoning": "<short>"}},
+  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number or null>, "net_profit_inr_crore": <number or null>}},
   "spend": {{"inr_crore": <number or null, education-specific only>, "display": "<exact CSR-labeled education figure or empty>", "fiscal_year": "<if stated>", "is_education_specific": <bool>, "education_pct_of_total_csr": <number or null>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number or null>, "display": "<as stated>", "source_excerpt": "<short>"}}], "total_csr_inr_crore": <number or null>, "total_csr_display": "<as stated or empty>", "total_csr_fiscal_year": "<if stated>"}},
+  "rfp_signal": {{"present": <bool>, "channel": "<short>", "evidence": "<short>"}},
+  "board_affinity": {{"present": <bool>, "person_name": "<name or empty>", "connection": "<short>", "source_excerpt": "<short>"}},
+  "volunteering": {{"present": <bool>, "programme_name": "<name or empty>", "description": "<short>", "source_excerpt": "<short>"}},
+  "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>", "source_excerpt": "<short>"}},
+  "key_facts_summary": "<3-6 lines, each starting with '- '>",
+  "open_questions": ["<short item>", "..."],
   "programmes": [{{"name": "<exact name>", "what_is_funded": "<precise funded activity>", "beneficiary_group": "<named beneficiary group>", "beneficiary_type": "<SCHOOL_CHILDREN_CURRICULUM|ADULT|OTHER>", "description": "<short>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "source_excerpt": "<short>", "confidence": "<confirmed|probable>"}}],
   "partners": [{{"name": "<exact org name>", "relationship_type": "<funder|implementer|co-design|unclear>", "programme": "<or empty>", "year": "<or empty>", "geography": "<or empty>", "similar_to_tap_profile": <bool>, "source_excerpt": "<short, must show relationship language>", "confidence": "<confirmed|probable>"}}],
   "decision_makers": [{{"name": "<n>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "source_excerpt": "<short>", "linkedin_url": "<url or empty>"}}],
   "geographies": [{{"place": "<place>", "source_excerpt": "<short>"}}],
   "red_flags": [{{"flag": "<short label>", "severity": "<low|medium|high>", "explanation": "<short>"}}],
-  "contact_pathway": {{"channel": "<sentence>", "evidence": "<short>"}},
-  "rfp_signal": {{"present": <bool>, "channel": "<short>", "evidence": "<short>"}},
-  "board_affinity": {{"present": <bool>, "person_name": "<name or empty>", "connection": "<short>", "source_excerpt": "<short>"}},
-  "volunteering": {{"present": <bool>, "programme_name": "<name or empty>", "description": "<short>", "source_excerpt": "<short>"}},
-  "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>", "source_excerpt": "<short>"}},
-  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number or null>, "net_profit_inr_crore": <number or null>}},
-  "sector": {{"sector": "<sector>", "sub_sector": "<or empty>", "reasoning": "<short>"}},
-  "evidence_recency": "<one sentence>",
-  "csr_head_note": "<one sentence>",
-  "source_quality_assessment": "<1-2 sentences>",
-  "overall_authenticity_score": <int 0-100>,
-  "open_questions": ["<short item>", "..."],
-  "key_facts_summary": "<3-6 lines, each starting with '- '>"
+  "contact_pathway": {{"channel": "<sentence>", "evidence": "<short>"}}
 }}"""
 
 
@@ -631,21 +655,29 @@ async def call_anthropic_chat(
     return "{" + "".join(text_parts)
 
 
-def parse_json_response(raw_text: str | None) -> dict:
+def parse_json_response(raw_text: str | None, expected_keys: list[str] | None = None, caller: str = "unknown") -> dict:
     if not raw_text:
         return {}
     cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
     cleaned = re.sub(r"\s*```$", "", cleaned)
     try:
         parsed = json.loads(cleaned)
-        return parsed if isinstance(parsed, dict) else {}
+        if isinstance(parsed, dict):
+            return parsed
     except (json.JSONDecodeError, TypeError):
         pass
     recovered = _recover_partial_json(cleaned)
     if recovered:
-        logger.info("parse_json_response recovered via partial-json fallback chars=%d", len(cleaned))
+        logger.info("parse_json_response recovered via partial-json fallback caller=%s chars=%d", caller, len(cleaned))
+        if expected_keys:
+            missing = [key for key in expected_keys if key not in recovered]
+            if missing:
+                logger.warning(
+                    "parse_json_response recovered object is missing expected keys caller=%s missing=%s",
+                    caller, missing,
+                )
         return recovered
-    logger.error("parse_json_response failed to recover any JSON chars=%d", len(cleaned))
+    logger.error("parse_json_response failed to recover any JSON caller=%s chars=%d", caller, len(cleaned))
     return {}
 
 
@@ -812,8 +844,16 @@ def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode:
     return final_score
 
 
-def _repair_extraction(parsed: dict) -> dict:
+def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
     parsed = dict(parsed) if isinstance(parsed, dict) else {}
+
+    missing_priority = [key for key in EXTRACTION_PRIORITY_KEYS if key not in parsed]
+    if missing_priority:
+        logger.warning(
+            "_repair_extraction missing priority keys, defaults will be used caller=%s missing=%s",
+            caller, missing_priority,
+        )
+
     sanitized = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
 
     if isinstance(parsed.get("decision_makers"), list):
@@ -1078,12 +1118,12 @@ async def extract_company_facts(
         logger.error("extract_company_facts got no reply company=%r", company)
         return None
 
-    parsed = parse_json_response(raw_reply)
+    parsed = parse_json_response(raw_reply, expected_keys=EXTRACTION_PRIORITY_KEYS, caller=f"extract_facts:{company}")
     if not parsed:
         logger.error("extract_company_facts empty parse company=%r", company)
         return None
 
-    extraction = _repair_extraction(parsed)
+    extraction = _repair_extraction(parsed, caller=f"extract_facts:{company}")
 
     valid_sources = _valid_source_lookup(sources_manifest)
     extraction["delivery_model_source"] = _sanitize_source(extraction.get("delivery_model_source", ""), valid_sources)
@@ -1167,7 +1207,7 @@ async def score_extracted_facts(
         logger.error("score_extracted_facts got no reply company=%r", company)
         return None
 
-    parsed = parse_json_response(raw_reply)
+    parsed = parse_json_response(raw_reply, expected_keys=["criteria", "fit_score"], caller=f"score_facts:{company}")
     if not parsed:
         logger.error("score_extracted_facts empty parse company=%r", company)
         return None
