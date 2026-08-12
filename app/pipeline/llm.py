@@ -20,8 +20,8 @@ LLM_SCORING_UNAVAILABLE_NOTE = (
     "successfully extracted from the fetched sources — verify and score manually."
 )
 
-OUTPUT_TOKEN_RESERVE = 6000
 EXTRACTION_OUTPUT_TOKEN_RESERVE = 4200
+SCORING_OUTPUT_TOKEN_RESERVE = 4200
 MIN_EVIDENCE_TOKEN_BUDGET = 500
 ANTHROPIC_REQUEST_TIMEOUT_SECONDS = 120.0
 MIN_PROMPT_TRIM_CHARS = 150
@@ -114,12 +114,6 @@ CRITERIA_WEIGHTS = {
 assert set(CRITERIA_WEIGHTS) == set(CRITERIA_IDS)
 assert sum(CRITERIA_WEIGHTS.values()) == 100
 
-# NOTE ON RUBRIC WORDING: each rubric line is deliberately anchored to an observable
-# fact pattern (named programme, named person, stated figure) rather than to a vague
-# impression, precisely so that two independent runs over the SAME evidence converge
-# on the same score. Vague, impression-based rubric lines are the main way scoring
-# drifts between runs even at temperature=0 — the model has more freedom to "vibe"
-# a score when the rubric doesn't pin it to a concrete artifact in the evidence.
 _RUBRIC = {
     "education_intervention": "hands-on programme, not a scholarship or one-off donation",
     "stem": "named STEM/coding/robotics/science exposure",
@@ -202,11 +196,6 @@ SCORING_PHILOSOPHY = (
     "honestly, just as evidence that supports fit should bring them up."
 )
 
-# CONSISTENCY RULE (feedback item 1): the single largest driver of run-to-run score
-# drift is the model picking a "vibe" score instead of deriving it mechanically from
-# the rubric anchors below. This block forces every score to cite the specific fact
-# pattern behind it, which is both more auditable and more repeatable across runs
-# that see the same evidence.
 SCORING_CONSISTENCY_RULE = (
     "CONSISTENCY (read before scoring): scores must be repeatable — if this exact evidence "
     "were scored again, you should land on the same numbers. To guarantee that, never assign "
@@ -226,16 +215,12 @@ SPEND_VS_REVENUE_RULE = (
     "in spend.display or spend.inr_crore, and never call them CSR spend/budget/fund. Set "
     "spend.has_disclosed_budget=true only for a figure explicitly labeled as CSR "
     "expenditure/spend/budget, or a stated CSR-mandate percentage applied to a stated profit "
-    "figure. Otherwise has_disclosed_budget=false and inr_crore=null. Put any business-scale "
+    "figure. Otherwise has_disclosed_budget=false and inr_crore=0. Put any business-scale "
     "figures only in eligibility.net_worth_turnover_signal (as text) and the "
     "eligibility.net_worth_turnover_inr_crore / eligibility.net_profit_inr_crore numeric fields "
     "— never in spend."
 )
 
-# EDUCATION SPEND RULE (feedback item 2): fundraisers said the overall CSR total is not
-# useful on its own — they need the education-specific slice AND a 2-3 year trend AND an
-# explicit up/down/flat read. The additions below make trend-hunting mandatory rather
-# than opportunistic, and make total-only figures clearly secondary in the output.
 EDUCATION_SPEND_RULE = (
     "EDUCATION SPEND VS TOTAL CSR (second common error): most companies run CSR across several "
     "causes, not just education. spend.inr_crore / spend.display / spend.fiscal_year / "
@@ -280,9 +265,6 @@ PARTNER_RULE = (
     "this lets the reader see the funding pattern over time."
 )
 
-# PROGRAMME RULE (feedback items 3 + 6): the #1 complaint was that focus-area labels like
-# "financial literacy" are useless without knowing exactly what's funded, who benefits, and
-# through what delivery channel — because that determines real overlap with TAP's model.
 PROGRAMME_RULE = (
     "PROGRAMMES: include a named programme only if you can state what is funded and who "
     "benefits, using whatever specificity the evidence actually gives — ordinary phrasing like "
@@ -320,10 +302,6 @@ SOURCE_INTEGRITY_RULE = (
     "programme."
 )
 
-# DECISION-MAKER RULE (feedback item 8): the tool was surfacing people whose job has nothing
-# to do with CSR (engineers, regional ops) just because their name appeared near CSR content
-# on a page. This is now a standalone, explicit exclusion rule referenced from both the
-# extraction prompt and the rubric line for decision_maker_accessibility.
 DECISION_MAKER_RULE = (
     "DECISION-MAKERS — RELEVANCE FILTER (feedback priority, check this carefully): only include "
     "a person if their TITLE or the EVIDENCE CONTEXT around their name specifically ties them to "
@@ -360,8 +338,6 @@ HIGHLIGHT_RULE = (
     "if the field is empty."
 )
 
-# GEOGRAPHY RULE (feedback item 7): fundraisers need state/city level detail to know if TAP
-# already operates there — country-level or vague "pan-India" mentions don't answer that.
 GEOGRAPHY_RULE = (
     "GEOGRAPHIES: capture every state/city explicitly named in the evidence as a separate "
     "entry — prefer this granular level over country-level ('India') or vague scope phrases "
@@ -449,8 +425,8 @@ JSON shape:
   "delivery_model": "<FUNDER|IMPLEMENTER|HYBRID|UNCLEAR>",
   "delivery_model_evidence": "<sentence>",
   "sector": {{"sector": "<sector>", "sub_sector": "<or empty>", "reasoning": "<short>"}},
-  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number or null>, "net_profit_inr_crore": <number or null>}},
-  "spend": {{"inr_crore": <number or null, education-specific only>, "display": "<exact CSR-labeled education figure or empty>", "fiscal_year": "<if stated>", "is_education_specific": <bool>, "education_pct_of_total_csr": <number or null>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short, verbatim ok>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number or null>, "display": "<as stated>", "source_excerpt": "<short, verbatim ok>"}}], "total_csr_inr_crore": <number or null>, "total_csr_display": "<as stated or empty>", "total_csr_fiscal_year": "<if stated>"}},
+  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number, 0 if unknown>, "net_profit_inr_crore": <number, 0 if unknown>}},
+  "spend": {{"inr_crore": <number, 0 if unknown, education-specific only>, "display": "<exact CSR-labeled education figure or empty>", "fiscal_year": "<if stated>", "is_education_specific": <bool>, "education_pct_of_total_csr": <number, 0 if unknown>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short, verbatim ok>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number, 0 if unknown>, "display": "<as stated>", "source_excerpt": "<short, verbatim ok>"}}], "total_csr_inr_crore": <number, 0 if unknown>, "total_csr_display": "<as stated or empty>", "total_csr_fiscal_year": "<if stated>"}},
   "rfp_signal": {{"present": <bool>, "channel": "<short>", "evidence": "<short>"}},
   "board_affinity": {{"present": <bool>, "person_name": "<name or empty>", "connection": "<short>", "source_excerpt": "<short, verbatim ok>"}},
   "volunteering": {{"present": <bool>, "programme_name": "<name or empty>", "description": "<short>", "source_excerpt": "<short, verbatim ok>"}},
@@ -517,8 +493,8 @@ JSON shape:
 class CriterionResultSchema(BaseModel):
     id: str
     name: str = ""
-    score: float = Field(ge=0, le=5)
-    confidence: int = Field(ge=0, le=100)
+    score: float = Field(ge=0, le=5, default=0)
+    confidence: int = Field(ge=0, le=100, default=0)
     evidence: str = Field(default="", max_length=240)
     reasoning: str = Field(default="", max_length=240)
     source: str = Field(default="")
@@ -526,18 +502,18 @@ class CriterionResultSchema(BaseModel):
 
 class SpendYearSchema(BaseModel):
     fiscal_year: str = ""
-    inr_crore: float | None = None
+    inr_crore: float = 0.0
     display: str = ""
     source: str = ""
     source_excerpt: str = Field(default="", max_length=260)
 
 
 class SpendSchema(BaseModel):
-    inr_crore: float | None = None
+    inr_crore: float = 0.0
     display: str = ""
     fiscal_year: str = ""
     is_education_specific: bool = False
-    education_pct_of_total_csr: float | None = None
+    education_pct_of_total_csr: float = 0.0
     has_disclosed_budget: bool = False
     confidence: int = Field(ge=0, le=100, default=0)
     source_excerpt: str = Field(default="", max_length=260)
@@ -546,10 +522,10 @@ class SpendSchema(BaseModel):
     trend_evidence: str = Field(default="", max_length=240)
     trend_source: str = ""
     history: list[SpendYearSchema] = Field(default_factory=list)
-    total_csr_inr_crore: float | None = None
+    total_csr_inr_crore: float = 0.0
     total_csr_display: str = ""
     total_csr_fiscal_year: str = ""
-    estimated_min_inr_crore: float | None = None
+    estimated_min_inr_crore: float = 0.0
     estimated_basis: str = Field(default="", max_length=200)
     estimated_is_computed: bool = False
 
@@ -644,8 +620,8 @@ class EligibilitySchema(BaseModel):
     plausibly_mandated: str = "UNKNOWN"
     reasoning: str = Field(default="", max_length=280)
     net_worth_turnover_signal: str = Field(default="", max_length=200)
-    net_worth_turnover_inr_crore: float | None = None
-    net_profit_inr_crore: float | None = None
+    net_worth_turnover_inr_crore: float = 0.0
+    net_profit_inr_crore: float = 0.0
     source: str = ""
 
 
@@ -882,8 +858,9 @@ def _sanitize_value_for_field(value, field):
         return bool(value) if value is not None else False
 
     if unwrapped in (int, float):
-        if not isinstance(value, (int, float)):
-            return None
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            fallback = field.default
+            value = fallback if isinstance(fallback, (int, float)) and not isinstance(fallback, bool) else 0
         lower, upper = _field_numeric_bounds(field)
         if lower is not None and value < lower:
             value = lower
@@ -934,14 +911,6 @@ def _apply_authenticity_ceiling(fit_score: float, authenticity_score: int, mode:
 
 def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode: str,
                              model_reported_score: int | None = None) -> int:
-    """
-    The deterministic weighted score (from criteria[] × CRITERIA_WEIGHTS) is always the
-    source of truth for fit_score — this is the key consistency guarantee (feedback item 1):
-    since criteria are now required to be evidence-anchored (see SCORING_CONSISTENCY_RULE),
-    the same evidence should reliably produce the same weighted score, regardless of what
-    holistic number the model separately reports. model_reported_score is used only as a
-    drift signal for logging/QA, never to override the computed value.
-    """
     weighted = _compute_weighted_fit_score(criteria)
     calibrated = _apply_authenticity_ceiling(weighted, authenticity_score, mode)
     final_score = int(round(max(0.0, min(100.0, calibrated))))
@@ -1294,8 +1263,7 @@ async def score_extracted_facts(
     }
     prompt = _scoring_prompt(company, mission, mode, scoring_facts, sources_manifest)
     prompt_tokens = estimate_tokens(prompt)
-    output_reserve = OUTPUT_TOKEN_RESERVE - EXTRACTION_OUTPUT_TOKEN_RESERVE
-    output_ceiling = _anthropic_context_window() - output_reserve
+    output_ceiling = _anthropic_context_window() - SCORING_OUTPUT_TOKEN_RESERVE
 
     if prompt_tokens > output_ceiling:
         trimmed_facts = dict(scoring_facts)
@@ -1315,7 +1283,7 @@ async def score_extracted_facts(
     raw_reply = await call_anthropic_chat(
         prompt,
         temperature=0.0,
-        max_tokens=output_reserve,
+        max_tokens=SCORING_OUTPUT_TOKEN_RESERVE,
         caller=f"score_facts:{company}",
     )
     if raw_reply is None:
