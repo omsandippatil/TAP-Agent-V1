@@ -1,1899 +1,1381 @@
-import asyncio
-import gc
+import json
 import logging
 import re
-import time
-from urllib.parse import urljoin, urlparse
+import typing
 
-from bs4 import BeautifulSoup
+import httpx
+from pydantic import BaseModel, Field, ValidationError
 
-from app.pipeline import google_search
-from app.pipeline.people_parser import parse_linkedin_hit
-from app.pipeline.search_budget import SearchBudget, ddgs_global_lock, ddgs_pace
-from app.pipeline.source_registry import SourceRegistry
-from app.pipeline.utils import (
-    classify_fetch_error,
-    clean_text,
-    domain_resolves,
-    extract_main_text,
-    get_session,
-    get_with_referer_fallback,
-    make_source,
+from app.config import settings
+from app.pipeline.textproc import combine_evidence_text, estimate_tokens
+
+logger = logging.getLogger("tap.llm")
+
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_VERSION = "2023-06-01"
+
+LLM_UNAVAILABLE_EVIDENCE = "LLM unavailable — unable to generate evidence"
+LLM_SCORING_UNAVAILABLE_NOTE = (
+    "Automated scoring could not complete for this run, but the facts below were "
+    "successfully extracted from the fetched sources — verify and score manually."
 )
 
-logger = logging.getLogger("tap.scraper")
+EXTRACTION_OUTPUT_TOKEN_RESERVE = 4200
+SCORING_OUTPUT_TOKEN_RESERVE = 4200
+MIN_EVIDENCE_TOKEN_BUDGET = 500
+ANTHROPIC_REQUEST_TIMEOUT_SECONDS = 120.0
+MIN_PROMPT_TRIM_CHARS = 150
+MAX_PROMPT_SHRINK_ATTEMPTS = 6
+PROMPT_SHRINK_SAFETY_MARGIN = 120
+DEFAULT_ANTHROPIC_CONTEXT_WINDOW = 200000
 
-GENERIC_COMPANY_TOKENS = {
-    "india", "limited", "ltd", "private", "pvt", "the", "and", "of",
-    "company", "corp", "corporation", "inc", "group", "technologies",
-    "solutions", "services", "international", "holdings", "enterprises",
-    "industries", "systems", "global",
-}
-
-AGGREGATOR_DOMAINS = (
-    "youtube.", "twitter.", "x.com", "facebook.", "instagram.", "linkedin.",
-    "wikipedia.", "glassdoor.", "indeed.", "crunchbase.", "bloomberg.",
-    "zaubacorp", "tofler.", "justdial.", "indiamart.", "ambitionbox.",
-    "moneycontrol.", "economictimes.", "livemint.", "reuters.",
-    "apkpure.", "h1bgrader.", "quora.", "reddit.", "pinterest.",
-    "medium.com", "slideshare.", "scribd.", "vimeo.", "tiktok.",
-    "naukri.", "shine.com", "timesjobs.", "monsterindia.", "tracxn.",
-)
-
-BLOCKED_403_DOMAINS = (
-    "zaubacorp.", "tracxn.",
-)
-
-_DYNAMIC_BLOCKED_DOMAINS: dict[str, int] = {}
-_DYNAMIC_BLOCK_THRESHOLD = 3
-
-_GOOGLE_CSE_BROKEN = False
-_GOOGLE_CSE_BROKEN_LOCK = asyncio.Lock()
-
-
-def _mark_google_cse_broken(reason: str) -> None:
-    global _GOOGLE_CSE_BROKEN
-    if not _GOOGLE_CSE_BROKEN:
-        _GOOGLE_CSE_BROKEN = True
-        logger.error(
-            "google CSE marked broken for rest of process, all further google calls will be skipped reason=%s",
-            reason,
-        )
-
-
-def google_cse_is_broken() -> bool:
-    return _GOOGLE_CSE_BROKEN
-
-
-def reset_google_cse_broken_flag_for_tests() -> None:
-    global _GOOGLE_CSE_BROKEN
-    _GOOGLE_CSE_BROKEN = False
-
-
-OFFICIAL_GOV_DOMAINS = (
-    "mca.gov.in", "csr.gov.in", "nic.in", "india.gov.in", "meity.gov.in",
-    "pib.gov.in", "sebi.gov.in", "rbi.org.in",
-)
-
-CSR_LINK_PATTERN = re.compile(
-    r"(csr|corporate[\s_-]?social|social[\s_-]?responsib|sustainab|esg|"
-    r"social[\s_-]?impact|citizenship|community[\s_-]?(initiativ|develop|engag|invest)|"
-    r"responsible[\s_-]?business|foundation|giving[\s_-]?back|annual[\s_-]?report|"
-    r"investor[\s_-]?relation|philanthrop|impact[\s_-]?report|esg[\s_-]?report|"
-    r"corporate[\s_-]?responsibilit)",
-    re.IGNORECASE,
-)
-
-NEGATIVE_LINK_PATTERN = re.compile(
-    r"(career|job|vacanc|recruit|login|sign-?in|privacy|cookie|terms|disclaimer|"
-    r"sitemap|contact-?us|unsubscribe|logout|register|password)",
-    re.IGNORECASE,
-)
-
-CSR_PAGE_PATHS = [
-    "/csr", "/corporate-social-responsibility", "/sustainability",
-    "/social-responsibility", "/esg", "/corporate-responsibility",
-    "/about/csr", "/about-us/csr", "/company/csr", "/in/en/about/csr",
-    "/india/csr", "/en/about/sustainability", "/about/sustainability",
-    "/social-impact", "/corporate-citizenship", "/en/sustainability",
-    "/sustainability/csr", "/about/corporate-responsibility",
-    "/investors/annual-reports", "/investor-relations/annual-reports",
-    "/csr-initiatives", "/csr-activities", "/csr-policy",
-    "/about-us/corporate-social-responsibility", "/community",
-    "/impact", "/responsibility", "/our-impact", "/csr-in-india",
-    "/india/about/csr", "/en-in/csr", "/en-in/sustainability",
+EXTRACTION_PRIORITY_KEYS = [
+    "overall_authenticity_score",
+    "source_quality_assessment",
+    "evidence_recency",
+    "delivery_model",
+    "delivery_model_evidence",
+    "sector",
+    "eligibility",
+    "spend",
 ]
 
-CSR_KEYWORDS = [
-    "csr", "corporate social", "philanthrop", "social responsibility",
-    "schedule vii", "csr spend", "csr expenditure", "csr budget",
-    "csr obligation", "csr fund", "community investment", "esg report",
-    "sustainability report", "impact report", "csr committee",
-]
 
-EDUCATION_KEYWORDS = [
-    "education", "school", "skilling", "skill development", "stem",
-    "digital literacy", "coding", "21st century skills", "21st-century skills",
-    "learning", "curriculum", "classroom", "student", "literacy",
-]
-
-CURRENCY_FIGURE_PATTERN = re.compile(
-    r"(?:(?:rs\.?|inr|₹)\s?[\d,]+(?:\.\d+)?\s?(?:crore|cr\.?|lakh|lac|million|mn|billion|bn|thousand)?"
-    r"|[\d,]+(?:\.\d+)?\s?(?:crore|cr\.?|lakh|lac)\b)",
-    re.IGNORECASE,
-)
-
-INDIA_STATE_PATTERN = re.compile(
-    r"\b(maharashtra|karnataka|tamil\s*nadu|gujarat|rajasthan|uttar\s*pradesh|"
-    r"west\s*bengal|telangana|kerala|punjab|haryana|bihar|odisha|orissa|assam|goa|"
-    r"jharkhand|chhattisgarh|uttarakhand|himachal\s*pradesh|andhra\s*pradesh|"
-    r"madhya\s*pradesh|manipur|meghalaya|mizoram|nagaland|sikkim|tripura|"
-    r"arunachal\s*pradesh|jammu\s*(?:and|&)\s*kashmir|ladakh|delhi|puducherry|"
-    r"chandigarh|andaman|lakshadweep|dadra|daman|diu)\b",
-    re.IGNORECASE,
-)
-
-INDIA_CITY_PATTERN = re.compile(
-    r"\b(mumbai|bombay|delhi|new\s*delhi|bengaluru|bangalore|chennai|madras|"
-    r"kolkata|calcutta|hyderabad|pune|ahmedabad|surat|jaipur|lucknow|kanpur|"
-    r"nagpur|indore|thane|bhopal|visakhapatnam|patna|vadodara|ghaziabad|"
-    r"ludhiana|agra|nashik|faridabad|meerut|rajkot|kalyan|vasai|varanasi|"
-    r"srinagar|aurangabad|dhanbad|amritsar|navi\s*mumbai|allahabad|prayagraj|"
-    r"ranchi|howrah|coimbatore|jabalpur|gwalior|vijayawada|jodhpur|madurai|"
-    r"raipur|kota|guwahati|chandigarh|solapur|hubli|mysore|mysuru|"
-    r"tiruchirappalli|trichy|bareilly|aligarh|gurgaon|gurugram|noida|"
-    r"moradabad|jalandhar|bhubaneswar|salem|warangal|thiruvananthapuram|"
-    r"trivandrum|kochi|cochin|dehradun|shimla|panaji|panjim|imphal|shillong|"
-    r"gangtok|itanagar|agartala|kohima|aizawl)\b",
-    re.IGNORECASE,
-)
-
-INDIA_COUNTRY_PATTERN = re.compile(r"\bindia\b|\bbharat\b", re.IGNORECASE)
-
-NEGATIVE_LOCATION_PATTERN = re.compile(
-    r"\b(united\s*states|u\.?s\.?a?\.?|united\s*kingdom|u\.?k\.?|australia|canada|"
-    r"singapore|germany|france|netherlands|u\.?a\.?e\.?|dubai|abu\s*dhabi|"
-    r"hong\s*kong|(?<!south )china|japan|south\s*africa|new\s*zealand|ireland|spain|italy|"
-    r"switzerland|sweden|norway|denmark|brazil|mexico)\b",
-    re.IGNORECASE,
-)
-
-LINKEDIN_PROFILE_PATTERN = re.compile(
-    r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[^/?#]+/?(?:[?#].*)?$", re.IGNORECASE
-)
-
-CIN_PATTERN = re.compile(r"\b[LUlu]\d{5}[A-Za-z]{2}\d{4}[A-Za-z]{3}\d{6}\b")
-
-INDIA_LEGAL_ENTITY_PATTERN = re.compile(
-    r"\b([A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,6}\s+India\s+"
-    r"(?:Private\s+Limited|Pvt\.?\s+Ltd\.?|Limited|Ltd\.?)|"
-    r"[A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,6}\s+(?:Technology|Technologies|Services|"
-    r"Solutions|Software|Systems)\s+India\s+(?:Private\s+Limited|Pvt\.?\s+Ltd\.?|Limited|Ltd\.?)|"
-    r"[A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,6}\s+India\s+"
-    r"(?:Foundation|Trust|Chapter))\b"
-)
-
-CURRENCY_NEAR_INDIA_WINDOW_CHARS = 200
-
-CURRENT_FY_LABEL = "FY2025-26"
-PRIOR_FY_LABELS = ["FY2024-25", "FY2023-24", "2024-25", "2023-24", "FY2022-23"]
-
-CSR_PAGE_QUERIES = [
-    'site:{d} CSR OR "corporate social responsibility" policy',
-    '"{c}" "corporate social responsibility" report annual site:{d}',
-]
-
-CSR_PAGE_FALLBACK_QUERIES = [
-    '"{c}" "CSR policy" filetype:pdf India',
-    '"{c}" sustainability report India filetype:pdf',
-    '"{c}" CSR India',
-    '"{c}" corporate social responsibility India',
-]
-
-MCA_CIN_QUERIES = [
-    '"{c}" CIN site:mca.gov.in',
-    '"{c}" "corporate identification number" India',
-]
-
-MCA_ENTITY_CIN_QUERIES = [
-    '"{legal_name}" CIN site:mca.gov.in',
-]
-
-MCA_FILING_QUERIES = [
-    '"{c}" "Form CSR-2" India filetype:pdf',
-    '"{c}" MCA annual filing CSR India',
-]
-
-MCA_ENTITY_FILING_QUERIES = [
-    '"{legal_name}" "Form CSR-2" filetype:pdf',
-]
-
-NATIONAL_CSR_PORTAL_QUERIES = [
-    'site:csr.gov.in "{c}"',
-]
-
-LEGAL_ENTITY_RESOLUTION_QUERIES = [
-    '"{c}" India "Private Limited" CIN MCA',
-    '"{c}" India Pvt Ltd registered company name MCA',
-]
-
-ANNUAL_REPORT_QUERIES = [
-    '"{c}" "annual report" {fy} India CSR crore filetype:pdf',
-    '"{c}" "business responsibility and sustainability report" India filetype:pdf',
-    '"{c}" annual report CSR India filetype:pdf',
-]
-
-ANNUAL_REPORT_ENTITY_QUERIES = [
-    '"{legal_name}" "annual report" {fy} CSR crore filetype:pdf',
-]
-
-CSR_SPEND_QUERIES = [
-    '"{c}" "CSR expenditure" crore India {fy}',
-]
-
-CSR_SPEND_ENTITY_QUERIES = [
-    '"{legal_name}" "CSR expenditure" crore {fy}',
-]
-
-PARTNER_QUERIES = [
-    '"{c}" CSR "implementation partner" OR "implementing partner" India NGO named',
-    '"{c}" foundation "grant recipients" OR "funded organisations" India CSR named',
-    '"{c}" CSR partnership "press release" OR "joint statement" NGO India announced',
-    'site:linkedin.com/company "{c}" "partnered with" OR "proud to partner" OR "MoU" NGO CSR India',
-    '"{c}" "memorandum of understanding" OR "MoU" NGO education CSR India',
-    '"{c}" CSR NGO partner India',
-]
-
-MAX_PARTNER_SOURCES = 4
-
-PLAN_QUERIES = [
-    '"{c}" CSR "partnered with" OR "partnership with" education India announced',
-]
-
-RFP_QUERIES = [
-    '"{c}" CSR "request for proposal" OR "call for proposals" India',
-]
-
-LINKEDIN_PEOPLE_QUERIES = [
-    'site:linkedin.com/in "{c}" "head of CSR" OR "CSR head"',
-    'site:linkedin.com/in "{c}" sustainability head OR director India',
-    'site:linkedin.com/in "{c}" CSR India',
-]
-
-LINKEDIN_PEOPLE_GLOBAL_FALLBACK_QUERIES = [
-    'site:linkedin.com/in "{c}" "head of sustainability" OR "chief sustainability officer"',
-]
-
-EDUCATION_PROGRAMME_QUERIES = [
-    '"{c}" CSR "digital literacy" OR STEM OR coding OR skilling India students',
-    '"{c}" "21st century skills" OR "21st-century skills" India CSR',
-    '"{c}" CSR education programme India',
-]
-
-SECTOR_QUERIES = [
-    '"{c}" India sector industry business overview annual report',
-]
-
-GROUP_FOUNDATION_QUERIES = [
-    '"{c}" "group foundation" CSR India',
-]
-
-FOLLOWUP_QUERY_TEMPLATES = {
-    "education_programme": [
-        '"{c}" education OR skilling OR STEM programme India named',
-    ],
-    "csr_budget": [
-        '"{c}" "CSR expenditure" OR "amount spent" crore India annual report',
-    ],
-    "decision_maker": [
-        'site:linkedin.com/in "{c}" CSR OR sustainability OR ESG head India',
-    ],
-    "ngo_partner": [
-        '"{c}" CSR "implementation partner" OR "implementing partner" education named',
-    ],
-    "csr_policy": [
-        '"{c}" "CSR policy" OR "CSR annual report" India filetype:pdf',
-    ],
-}
-
-MAX_PAGE_TEXT_CHARS = 6000
-MAX_PDF_TEXT_CHARS = 10000
-MAX_PDF_PAGES = 15
-FINANCIAL_PDF_SCAN_PAGES = 25
-CANDIDATE_EVAL_LIMIT = 3
-MIN_ACCEPT_SCORE = 4
-STRONG_ACCEPT_SCORE = 10
-
-PAGE_FETCH_TIMEOUT_SECONDS = 8
-PDF_FETCH_TIMEOUT_SECONDS = 10
-HOMEPAGE_FETCH_TIMEOUT_SECONDS = 6
-DNS_CHECK_TIMEOUT_SECONDS = 1.5
-DDGS_TOTAL_BUDGET_SECONDS = 4
-DDGS_BACKENDS = ("duckduckgo", "brave", "mojeek")
-SEARCH_TASK_TIMEOUT_SECONDS = 6
-FETCH_TASK_TIMEOUT_SECONDS = 10
-SOURCE_DEADLINE_SECONDS = 18
-FOLLOWUP_DEADLINE_SECONDS = 10
-CONCURRENT_FETCH_LIMIT = 2
-
-DEEP_JOB_HARD_DEADLINE_SECONDS = 110
-MAX_PDF_DOWNLOAD_BYTES = 15 * 1024 * 1024
-PDF_STREAM_CHUNK_BYTES = 262144
-MAX_PDF_PAGES_HARD_CAP = 40
-
-_FETCH_SEMAPHORE = asyncio.Semaphore(CONCURRENT_FETCH_LIMIT)
-
-
-class DeepJobDeadlineExceeded(Exception):
-    pass
-
-
-def pdf_is_csr_relevant(text: str) -> bool:
-    if not text:
-        return False
-    lowered = text.lower()
-    csr_hits = sum(1 for kw in CSR_KEYWORDS if kw in lowered)
-    return csr_hits >= 1 or is_csr_relevant(text)
-
-
-def is_literal_linkedin_profile_url(url: str) -> bool:
-    return bool(url) and bool(LINKEDIN_PROFILE_PATTERN.match(url.strip()))
-
-
-def mentions_csr_context(snippet: str) -> bool:
-    lowered = snippet.lower()
-    return any(kw in lowered for kw in CSR_KEYWORDS)
-
-
-def is_csr_relevant(text: str) -> bool:
-    lowered = text.lower()
-    relevance_keywords = [
-        "csr", "corporate social", "sustainability", "philanthrop",
-        "community", "crore", "education", "skill", "digital",
-        "social responsibility", "esg", "impact report",
-    ]
-    return sum(1 for kw in relevance_keywords if kw in lowered) >= 2
-
-
-def has_financial_figures(text: str) -> bool:
-    return bool(CURRENCY_FIGURE_PATTERN.search(text))
-
-
-def count_financial_figures(text: str) -> int:
-    return len(CURRENCY_FIGURE_PATTERN.findall(text))
-
-
-def find_india_location_mentions(text: str) -> list[dict]:
-    if not text:
-        return []
-    hits = []
-    for pattern, kind in (
-        (INDIA_COUNTRY_PATTERN, "country"),
-        (INDIA_STATE_PATTERN, "state"),
-        (INDIA_CITY_PATTERN, "city"),
-    ):
-        for match in pattern.finditer(text):
-            hits.append({
-                "text": re.sub(r"\s+", " ", match.group(0)).strip(),
-                "kind": kind,
-                "start": match.start(),
-                "end": match.end(),
-            })
-    hits.sort(key=lambda h: h["start"])
-    return hits
-
-
-def has_india_location_signal(text: str) -> bool:
-    return bool(find_india_location_mentions(text))
-
-
-def has_india_specific_financial_figure(text: str, window_chars: int = CURRENCY_NEAR_INDIA_WINDOW_CHARS) -> bool:
-    if not text:
-        return False
-    location_hits = find_india_location_mentions(text)
-    if not location_hits:
-        return False
-    location_positions = [hit["start"] for hit in location_hits]
-    for match in CURRENCY_FIGURE_PATTERN.finditer(text):
-        if any(abs(match.start() - pos) <= window_chars for pos in location_positions):
-            return True
-    return False
-
-
-def company_name_tokens(company: str) -> list[str]:
-    return [
-        token for token in re.sub(r"[^a-z0-9 ]", " ", company.lower()).split()
-        if len(token) > 2 and token not in GENERIC_COMPANY_TOKENS
-    ]
-
-
-def mentions_company(company: str, text: str) -> bool:
-    if not text:
-        return False
-    lowered = text.lower()
-    tokens = company_name_tokens(company)
-    if not tokens:
-        return company.lower() in lowered
-    return any(token in lowered for token in tokens)
-
-
-def candidate_domains(company: str) -> list[str]:
-    tokens = company_name_tokens(company) or [re.sub(r"[^a-z0-9]", "", company.lower())]
-    slugs = list(dict.fromkeys(["".join(tokens), tokens[0]]))
-    ordered = []
-    for tld in (".com", ".in", ".co.in", ".org"):
-        for slug in slugs:
-            if slug:
-                ordered.append(f"www.{slug}{tld}")
-
-    verified = [d for d in ordered if domain_resolves(d, timeout=DNS_CHECK_TIMEOUT_SECONDS)]
-    if not verified:
-        logger.info("candidate_domains: none of %d guessed domains resolved for company=%r", len(ordered), company)
-    return verified
-
-
-def url_belongs_to_company(company: str, url: str, known_domains: list[str] | None = None) -> bool:
-    if not url:
-        return False
-    host = urlparse(url).netloc.lower()
-    if not host:
-        return False
-    if any(gov in host for gov in OFFICIAL_GOV_DOMAINS):
-        return True
-    if known_domains and any(host == d or host.endswith("." + d) for d in known_domains):
-        return True
-    tokens = company_name_tokens(company)
-    if not tokens:
-        return False
-    host_base = host.replace("www.", "")
-    return any(token in host_base for token in tokens)
-
-
-def is_known_blocked_domain(url: str) -> bool:
-    if not url:
-        return False
-    host = urlparse(url).netloc.lower()
-    if any(domain in host for domain in BLOCKED_403_DOMAINS):
-        return True
-    return _DYNAMIC_BLOCKED_DOMAINS.get(host, 0) >= _DYNAMIC_BLOCK_THRESHOLD
-
-
-def _record_blocked_response(url: str, status_code: int | None) -> None:
-    if status_code != 403:
-        return
-    host = urlparse(url).netloc.lower()
-    if not host:
-        return
-    count = _DYNAMIC_BLOCKED_DOMAINS.get(host, 0) + 1
-    _DYNAMIC_BLOCKED_DOMAINS[host] = count
-    if count == _DYNAMIC_BLOCK_THRESHOLD:
+def _anthropic_context_window() -> int:
+    value = getattr(settings, "anthropic_context_window", None)
+    if not isinstance(value, int) or value <= 0:
         logger.warning(
-            "domain dynamically denylisted after %d consecutive 403s this session domain=%s",
-            count, host,
+            "settings.anthropic_context_window missing or invalid (%r) — falling back to default=%d. "
+            "Add anthropic_context_window to app.config.Settings to remove this warning.",
+            value, DEFAULT_ANTHROPIC_CONTEXT_WINDOW,
         )
+        return DEFAULT_ANTHROPIC_CONTEXT_WINDOW
+    return value
+
+DEFAULT_MISSION = (
+    "The Apprentice Project (TAP) develops 21st-century skills (critical thinking, "
+    "creativity, confidence, communication, problem-solving, self-awareness, "
+    "financial literacy) for low-income middle and high school students in India, "
+    "delivered through TAP Buddy — an AI-powered WhatsApp chatbot with video "
+    "electives (Coding, Science, Visual Arts, Financial Literacy). TAP works "
+    "exclusively in government schools with partners like MCD, DoE Delhi, BMC "
+    "Mumbai and SCERT Maharashtra. TAP does NOT run vocational training or job "
+    "placement."
+)
+
+CRITERIA_IDS = [
+    "education_intervention",
+    "stem",
+    "tech_21cs",
+    "public_schooling",
+    "systems_change",
+    "programme_depth",
+    "partnership_quality",
+    "decision_maker_accessibility",
+    "csr_trajectory",
+    "delivery_model_fit",
+    "outreach_readiness",
+    "funding_capacity",
+    "csr_spend_trend",
+    "decision_maker_tenure",
+    "group_foundation_routing",
+    "board_education_affinity",
+    "employee_volunteering",
+]
+
+CRITERIA_TITLES = {
+    "education_intervention": "Education: intervention not scholarship",
+    "stem": "STEM exposure",
+    "tech_21cs": "Technology & 21st-century skills",
+    "public_schooling": "Public-schooling understanding",
+    "systems_change": "Systems-change orientation",
+    "programme_depth": "Programme maturity & depth",
+    "partnership_quality": "NGO partnership quality",
+    "decision_maker_accessibility": "Decision-maker accessibility",
+    "csr_trajectory": "CSR trajectory (growing / flat / shrinking)",
+    "delivery_model_fit": "Delivery-model fit for TAP entry",
+    "outreach_readiness": "Outreach readiness (open call / RFP / warm channel)",
+    "funding_capacity": "Funding capacity vs TAP's typical ask size",
+    "csr_spend_trend": "Multi-year CSR spend trend",
+    "decision_maker_tenure": "CSR-head tenure (newly appointed vs entrenched)",
+    "group_foundation_routing": "CSR routed through a group/parent foundation",
+    "board_education_affinity": "Board or promoter personal education-philanthropy ties",
+    "employee_volunteering": "Employee volunteering / payroll-giving programmes",
+}
+
+CRITERIA_WEIGHTS = {
+    "education_intervention": 12, "stem": 8, "tech_21cs": 10, "public_schooling": 10,
+    "systems_change": 8, "programme_depth": 8, "partnership_quality": 6,
+    "decision_maker_accessibility": 4, "csr_trajectory": 4, "delivery_model_fit": 8,
+    "outreach_readiness": 4, "funding_capacity": 4, "csr_spend_trend": 4,
+    "decision_maker_tenure": 3, "group_foundation_routing": 3,
+    "board_education_affinity": 2, "employee_volunteering": 2,
+}
+assert set(CRITERIA_WEIGHTS) == set(CRITERIA_IDS)
+assert sum(CRITERIA_WEIGHTS.values()) == 100
+
+_RUBRIC = {
+    "education_intervention": "hands-on programme, not a scholarship or one-off donation",
+    "stem": "named STEM/coding/robotics/science exposure",
+    "tech_21cs": "tech-delivered learning or 21st-century-skills content",
+    "public_schooling": "explicit government-school work; absence alone doesn't disqualify",
+    "systems_change": "teacher training, measured outcomes, scale, or policy influence",
+    "programme_depth": "one-off activity scores lower; named multi-year programme scores higher",
+    "partnership_quality": "named, multi-year NGO partner scores higher; give real credit if the company already funds other education/skilling-adjacent NGOs, even ones unrelated to TAP",
+    "decision_maker_accessibility": "a named individual whose title or evidence context is specifically CSR/education/foundation-related, not merely any employee — see decision-maker exclusion rule",
+    "csr_trajectory": "expansion scores higher, flat scores medium, contraction scores lower, no signal takes the sector default",
+    "delivery_model_fit": "how cleanly TAP could enter as a grantee or as a delivery partner",
+    "outreach_readiness": "an open call or RFP scores high; a closed/invite-only programme scores low",
+    "funding_capacity": "whether the disclosed or plausibly-estimated CSR budget could cover a TAP-sized grant",
+    "csr_spend_trend": "rising multi-year spend scores high, flat scores medium, declining scores low, no data takes the sector default",
+    "decision_maker_tenure": "a recently appointed CSR head is a positive signal (new mandate); entrenched or unknown tenure is neutral",
+    "group_foundation_routing": "a named parent/group foundation handling CSR scores high; no signal is a low but non-zero baseline",
+    "board_education_affinity": "a named board/promoter personal history with education philanthropy scores high; generic or none is a low baseline, not zero",
+    "employee_volunteering": "an actively named education-linked volunteering programme scores high; generic or none is a low baseline, not zero",
+}
 
 
-def accept_fetched_text(company: str, text: str, min_len: int = 400) -> bool:
-    return bool(text) and len(text) > min_len and is_csr_relevant(text) and mentions_company(company, text)
+def _rubric_block() -> str:
+    return "\n".join(f"- {key}: {value}" for key, value in _RUBRIC.items())
 
 
-def score_candidate_text(company: str, text: str, url: str = "") -> float:
-    if not text:
-        return -1.0
-    if not mentions_company(company, text):
-        return -1.0
-    csr_hits = sum(1 for kw in CSR_KEYWORDS if kw in text.lower())
-    if csr_hits == 0 and not is_csr_relevant(text):
-        return -1.0
-    figure_hits = count_financial_figures(text)
-    india_figure_bonus = 4.0 if has_india_specific_financial_figure(text) else 0.0
-    india_location_bonus = 2.0 if has_india_location_signal(text) else 0.0
-    length_bonus = min(len(text) / 2000.0, 4.0)
-    domain_bonus = 6.0 if url and any(gov in url.lower() for gov in OFFICIAL_GOV_DOMAINS) else 0.0
-    pdf_bonus = 1.5 if url.lower().endswith(".pdf") else 0.0
-    return (
-        csr_hits * 2.0 + figure_hits * 5.0 + india_figure_bonus + india_location_bonus
-        + length_bonus + domain_bonus + pdf_bonus
+def _criteria_json_template() -> str:
+    return ",\n".join(
+        f'    {{"id": "{cid}", "name": "{CRITERIA_TITLES[cid]}", "score": <0-5>, "confidence": <0-100>, "evidence": "<short paraphrase>", "reasoning": "<short>"}}'
+        for cid in CRITERIA_IDS
     )
 
 
-def is_plausible_legal_entity_name(company: str, candidate: str) -> bool:
-    if not candidate:
-        return False
-    if len(candidate) > 120:
-        return False
-    if candidate.count(".") > 3:
-        return False
-    lowered = candidate.lower()
-    if " ahmedabad" in lowered or " mumbai" in lowered or " bangalore" in lowered:
-        return False
-    if not re.search(r"(private\s+limited|pvt\.?\s*ltd\.?|limited|ltd\.?|foundation|trust)$", lowered.strip(), re.IGNORECASE):
-        return False
-    word_count = len(candidate.split())
-    if word_count > 9:
-        return False
-    tokens = company_name_tokens(company)
-    if tokens and not any(token in lowered for token in tokens):
-        return False
-    return True
+MODE_CALIBRATION = {
+    "screen": {
+        "stance": (
+            "MODE: SCREEN (triage pass). Your job is to judge whether {company} is worth a "
+            "full deep-research pass, not to produce a final outreach-ready verdict. Screen "
+            "mode structurally sees fewer sources than deep mode — that is expected, not a "
+            "flaw in the company. Read genuinely promising but thinly-documented signals "
+            "generously: a company with clear education/CSR activity and no disqualifying "
+            "red flag should score in a range that reads as 'worth a deep dive', even if "
+            "spend figures, named partners, or a named decision-maker haven't surfaced yet. "
+            "Reserve low scores for cases with an actual negative signal (no CSR at all, "
+            "explicitly non-education CSR, or a stated policy against NGO partnerships) — "
+            "thin sourcing alone is never sufficient reason for a low score in screen mode."
+        ),
+        "authenticity_cap_threshold": 15,
+        "authenticity_cap_ceiling": 78,
+    },
+    "deep": {
+        "stance": (
+            "MODE: DEEP RESEARCH (outreach-ready brief). This analysis will inform an actual "
+            "outreach decision, so hold evidence to a stricter standard than a triage pass — "
+            "undocumented should still be read generously per the philosophy below, but "
+            "claims should be well-grounded in what was actually fetched, since a person may "
+            "act on this directly."
+        ),
+        "authenticity_cap_threshold": 30,
+        "authenticity_cap_ceiling": 65,
+    },
+}
 
 
-async def ddgs_search_web(query: str, budget: SearchBudget | None, max_results: int = 5,
-                           total_budget_seconds: float = DDGS_TOTAL_BUDGET_SECONDS) -> list[dict]:
-    if budget is not None and not budget.ddgs_has_budget():
-        logger.info("ddgs skipped, budget exhausted query=%r", query)
-        return []
-
-    def _run_sync() -> tuple[list[dict], str]:
-        try:
-            from ddgs import DDGS
-        except Exception as exc:
-            logger.warning("ddgs import failed query=%r error=%s", query, exc)
-            return [], "import_failed"
-        deadline = time.monotonic() + total_budget_seconds
-        last_error = ""
-        for backend in DDGS_BACKENDS:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                logger.info("ddgs time budget exhausted query=%r", query)
-                break
-            try:
-                with DDGS(timeout=max(1, min(remaining, 5))) as ddgs:
-                    results = list(ddgs.text(query, max_results=max_results, backend=backend))
-                if results:
-                    return results, ""
-                last_error = "empty_result_set"
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                logger.info("ddgs backend failed backend=%s query=%r error=%s", backend, query, exc)
-                continue
-        return [], last_error
-
-    lock = ddgs_global_lock()
-    async with lock:
-        await ddgs_pace()
-        if budget is not None:
-            budget.record_ddgs_query()
-        try:
-            results, error_reason = await asyncio.wait_for(
-                asyncio.to_thread(_run_sync), timeout=SEARCH_TASK_TIMEOUT_SECONDS,
-            )
-            if not results:
-                logger.info(
-                    "ddgs_search_web no results query=%r reason=%s — likely rate-limited/blocked "
-                    "if this repeats across queries, not a genuine zero-result search",
-                    query, error_reason or "unknown",
-                )
-            return results
-        except asyncio.TimeoutError:
-            logger.warning("ddgs_search_web timed out query=%r", query)
-            return []
+def _mode_calibration(mode: str) -> dict:
+    return MODE_CALIBRATION.get(mode, MODE_CALIBRATION["deep"])
 
 
-async def search_web(query: str, budget: SearchBudget, max_results: int = 6,
-                      prefer_google: bool = True, quota_guard=None, category: str = "") -> list[dict]:
-    google_available = (
-        prefer_google
-        and not google_cse_is_broken()
-        and google_search.google_search_configured_and_available(quota_guard)
-    )
+SCORING_PHILOSOPHY = (
+    "SCORING PHILOSOPHY: most CSR activity in India is only partially documented online. "
+    "Silence about something is not evidence against it. Never score a criterion at 0, and "
+    "never treat a company as a poor fit, purely because a fact wasn't surfaced by the sources "
+    "you were given — reserve 0 only for evidence that actively contradicts fit (e.g. an "
+    "explicit statement the company does not run education CSR). Where the record is quiet on "
+    "a criterion, score it from sector, scale, and adjacent CSR behavior visible elsewhere in "
+    "the evidence, and label it in your `evidence` text as an inferred estimate, not a "
+    "confirmed absence. When genuinely torn between two adjacent scores for a criterion, prefer "
+    "the higher one — undocumented should never read as a negative signal. This applies "
+    "per-criterion; it does not mean invent facts, and it does not mean treat every company as "
+    "a great fit — evidence that actively points away from fit should bring scores down "
+    "honestly, just as evidence that supports fit should bring them up."
+)
 
-    if google_available and budget.google_has_budget(category):
-        budget.record_google_query()
-        try:
-            results = await asyncio.wait_for(
-                google_search.google_search_web(query, max_results=max_results, quota_guard=quota_guard),
-                timeout=SEARCH_TASK_TIMEOUT_SECONDS,
-            )
-        except google_search.GoogleCseInvalidArgumentError as exc:
-            async with _GOOGLE_CSE_BROKEN_LOCK:
-                _mark_google_cse_broken(str(exc))
-            results = []
-        except asyncio.TimeoutError:
-            logger.warning("google search timed out query=%r", query)
-            results = []
-        if results:
-            return results
-        logger.info("google search returned empty query=%r category=%r", query, category)
-        if not budget.ddgs_has_budget():
-            return []
-        return await ddgs_search_web(query, budget, max_results=max_results)
+SCORING_CONSISTENCY_RULE = (
+    "CONSISTENCY (read before scoring): scores must be repeatable — if this exact evidence "
+    "were scored again, you should land on the same numbers. To guarantee that, never assign "
+    "a criterion score from general impression, company reputation, or brand size. For every "
+    "criterion, first identify the single most relevant fact/quote in the extracted evidence, "
+    "then map that fact to a score using the rubric line for that criterion, and write that "
+    "fact (not a vibe) into the `evidence` field. If two criteria could plausibly take the same "
+    "score for the same underlying reason, they should — do not vary scores across similar "
+    "criteria without a distinct evidentiary reason for each. Do not let overall enthusiasm "
+    "about the company inflate individual criterion scores beyond what each one's own evidence "
+    "supports."
+)
 
-    if prefer_google and google_cse_is_broken():
-        logger.info("google search skipped, CSE marked broken this run query=%r category=%r", query, category)
+SPEND_VS_REVENUE_RULE = (
+    "SPEND VS REVENUE (common error, check this carefully): revenue, turnover, net worth, "
+    "profit, market cap, and EBITDA describe business SCALE, never CSR spend. Never place them "
+    "in spend.display or spend.inr_crore, and never call them CSR spend/budget/fund. Set "
+    "spend.has_disclosed_budget=true only for a figure explicitly labeled as CSR "
+    "expenditure/spend/budget, or a stated CSR-mandate percentage applied to a stated profit "
+    "figure. Otherwise has_disclosed_budget=false and inr_crore=0. Put any business-scale "
+    "figures only in eligibility.net_worth_turnover_signal (as text) and the "
+    "eligibility.net_worth_turnover_inr_crore / eligibility.net_profit_inr_crore numeric fields "
+    "— never in spend."
+)
 
-    if google_available and not budget.google_has_budget(category):
-        logger.info("google search skipped, company budget exhausted query=%r category=%r", query, category)
+EDUCATION_SPEND_RULE = (
+    "EDUCATION SPEND VS TOTAL CSR (second common error): most companies run CSR across several "
+    "causes, not just education. spend.inr_crore / spend.display / spend.fiscal_year / "
+    "spend.trend_* must hold ONLY the education-specific slice — set is_education_specific=true "
+    "and populate these only when the evidence states an education-specific figure or "
+    "percentage. If the evidence only gives a TOTAL CSR figure with no education breakdown, "
+    "leave spend.is_education_specific=false and spend.inr_crore/display/fiscal_year empty, and "
+    "put that total in total_csr_inr_crore / total_csr_display / total_csr_fiscal_year instead, "
+    "clearly labeled as total CSR, never as the education budget. "
+    "TREND IS MANDATORY WHENEVER POSSIBLE: actively scan the evidence for figures from more "
+    "than one fiscal year — annual/CSR reports often disclose 2-3 years side by side even when "
+    "only the latest year is prominently mentioned. Populate spend.history[] with every "
+    "distinct (fiscal_year, figure) pair you find, education-specific if available, else total "
+    "CSR clearly marked as such via is_education_specific=false entries. Set trend_direction to "
+    "RISING/FLAT/DECLINING whenever two or more years of figures exist anywhere in the evidence "
+    "— UNKNOWN should only be used when truly one data point, or none, is available. A single "
+    "year's figure with no trend is materially less useful to a fundraiser than a 2-3 year "
+    "trend, so treat finding the trend as equally important as finding the headline number."
+)
 
-    if not budget.ddgs_has_budget():
-        return []
-    return await ddgs_search_web(query, budget, max_results=max_results)
+PARTNER_RULE = (
+    "PARTNERS: include a named third-party organisation as a partner only if the evidence shows "
+    "an actual relationship (funds, co-designs, implements with, partners with, delivers via, "
+    "works with). Use confidence='confirmed' if the relationship verb is explicit and clear, "
+    "confidence='probable' if the org is named alongside the company in a CSR/education context "
+    "but the relationship language is vague or implied. Do not include internal campaign names "
+    "(they are not organisations), generic unnamed government references, or award/certifying "
+    "bodies. For each partner, also fill programme/year/geography if the evidence states them "
+    "(leave empty otherwise — never guess), and set similar_to_tap_profile=true if the partner "
+    "org is itself an education/skilling/government-school-facing NGO or intermediary (even if "
+    "unrelated to TAP) — this is a genuine positive signal for partnership_quality and "
+    "delivery_model_fit, so weigh it there yourself. If your own fit_rationale or "
+    "delivery_model_evidence text names a third-party org the company works with, that same org "
+    "must also appear in the partners array — never describe a partnership in prose while "
+    "leaving it out of the structured list. "
+    "PARTNER HISTORY DEPTH (feedback priority): a partner list is far more valuable to a "
+    "fundraiser when it spans multiple years, because it reveals whether the relationship is "
+    "one-off or sustained, and what scale of grant the company typically gives. Actively check "
+    "the evidence for partner mentions across different fiscal years / annual reports, not just "
+    "the most recent one, and include each distinct (partner, year) combination you find as a "
+    "separate entry rather than collapsing multi-year partners into a single undated entry — "
+    "this lets the reader see the funding pattern over time."
+)
 
+PROGRAMME_RULE = (
+    "PROGRAMMES: include a named programme only if you can state what is funded and who "
+    "benefits, using whatever specificity the evidence actually gives — ordinary phrasing like "
+    "'government-school students' or 'children' is fine, it doesn't need to be unusually "
+    "precise. A bare theme mention with no named programme and nothing else to anchor it (e.g. "
+    "just 'the company supports financial literacy', no name, no beneficiary, no funded "
+    "activity) should be left out rather than invented into a full entry. confidence='confirmed' "
+    "if there's one additional concrete supporting detail (scale, duration, since-when) beyond "
+    "name/what's-funded/beneficiary; confidence='probable' otherwise. If your own fit_rationale "
+    "or delivery_model_evidence names a specific initiative, it must also appear in the "
+    "programmes array. "
+    "GO BEYOND THE THEME LABEL: a theme word ('financial literacy', 'skill development', "
+    "'life skills') is not on its own useful for a fundraising decision, because the same theme "
+    "can mean completely different things in practice — e.g. banking-awareness workshops for "
+    "unemployed adults versus a curriculum-embedded financial-literacy module for school "
+    "children are both 'financial literacy' but have opposite relevance to TAP. For every "
+    "programme, the `description` field must therefore state, wherever the evidence allows: "
+    "(a) the delivery channel — in-school/curriculum-embedded, standalone adult workshop, "
+    "digital/app-based, vocational/on-the-job, or other, (b) the concrete beneficiary (school-"
+    "going children vs out-of-school youth vs adults vs teachers), and (c) whether it is "
+    "one-off or ongoing. If the evidence truly does not support any of (a)-(c) beyond the theme "
+    "name, say so explicitly in `description` (e.g. 'delivery channel not stated in evidence') "
+    "rather than silently omitting the distinction — the goal is that no programme entry reads "
+    "as just a repeated theme word."
+)
 
-def _fetch_page_text_sync(url: str, max_chars: int, verify_ssl: bool) -> tuple[str, str]:
-    if is_known_blocked_domain(url):
-        return "", "known_blocked_domain"
-    try:
-        response = get_with_referer_fallback(url, timeout=PAGE_FETCH_TIMEOUT_SECONDS, verify=verify_ssl)
-        _record_blocked_response(url, response.status_code)
-        if response.status_code == 403:
-            snippet = response.text[:200] if response.text else ""
-            logger.info("fetch_page_text 403 url=%s body_snippet=%r", url, snippet)
-            return "", "http_4xx_403"
-        response.raise_for_status()
-        content_length = response.headers.get("Content-Length")
-        if content_length and int(content_length) > MAX_PDF_DOWNLOAD_BYTES:
-            logger.info("fetch_page_text skipped oversized_response url=%s bytes=%s", url, content_length)
-            return "", "oversized_response"
-        soup = BeautifulSoup(response.text, "lxml")
-        text = extract_main_text(soup, max_chars)
-        del soup
-        return text, ""
-    except Exception as exc:
-        error_type = classify_fetch_error(exc)
-        if error_type == "dns":
-            logger.info("fetch_page_text dns_failure url=%s error_type=%s", url, error_type)
-        else:
-            logger.info("fetch_page_text failed url=%s error_type=%s error=%s", url, error_type, exc)
-        return "", error_type
-    finally:
-        gc.collect()
+SOURCE_INTEGRITY_RULE = (
+    "SOURCE INTEGRITY: before treating a fragment as evidence, confirm it's a genuine "
+    "descriptive sentence about the company's own activity — not a nav menu, link list, or "
+    "heading run-on. Confirm any excerpt is actually about the company being analysed and not a "
+    "different entity that happens to share the page (this matters especially for "
+    "people-search/LinkedIn snippets — if a profile's employer is a different company, that "
+    "text is not evidence about this company even if this company's name appears elsewhere on "
+    "the page). A person's individual career history describes that person, never a company "
+    "programme."
+)
 
+DECISION_MAKER_RULE = (
+    "DECISION-MAKERS — RELEVANCE FILTER (feedback priority, check this carefully): only include "
+    "a person if their TITLE or the EVIDENCE CONTEXT around their name specifically ties them to "
+    "CSR, sustainability, corporate foundation, community/social impact, or education/skilling "
+    "partnerships. Merely being named on the same page, in the same press release, or in the "
+    "same annual-report section as CSR content is NOT sufficient if their stated role is "
+    "unrelated (e.g. software engineer, sales/regional head, plant operations, unrelated "
+    "business-unit leadership). When uncertain whether a role qualifies, prefer to leave the "
+    "person out rather than include a functionally-irrelevant name — a fundraiser needs a "
+    "person they can credibly reach out to about CSR/education, and a wrong name wastes an "
+    "outreach attempt and damages credibility. The CEO/MD/Chairperson may be included only if "
+    "the evidence shows them personally quoted or credited on CSR/foundation matters, not by "
+    "default just for holding the top role."
+)
 
-async def fetch_page_text(url: str, max_chars: int = MAX_PAGE_TEXT_CHARS, verify_ssl: bool = True) -> str:
-    async with _FETCH_SEMAPHORE:
-        try:
-            text, _error_type = await asyncio.wait_for(
-                asyncio.to_thread(_fetch_page_text_sync, url, max_chars, verify_ssl),
-                timeout=FETCH_TASK_TIMEOUT_SECONDS,
-            )
-            return text
-        except asyncio.TimeoutError:
-            logger.info("fetch_page_text timed out url=%s error_type=timeout", url)
-            return ""
+EVIDENCE_STYLE_RULE = (
+    "EVERY field must trace to the evidence you were given — never invent facts, and state "
+    "partial evidence as partial. Evidence/reasoning fields used for SCORING (criteria[].evidence, "
+    "criteria[].reasoning, fit_rationale, alignment_rationale) are short paraphrases (under 20 "
+    "words), never verbatim quotes except for exact figures, partner names, or programme names. "
+    "source_excerpt fields (feedback priority: these are shown directly to the user as supporting "
+    "evidence, not just used internally for scoring) may instead be a short, exact, verbatim "
+    "excerpt from the source — up to about 25 words — so the user can see the actual sentence a "
+    "finding is based on rather than a re-paraphrased version of it; still keep it tight and drop "
+    "surrounding boilerplate."
+)
 
+HIGHLIGHT_RULE = (
+    "HIGHLIGHT: in fit_rationale, alignment_rationale, delivery_model_evidence, "
+    "source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, "
+    "strategic_insight, and each criterion's evidence — bold exactly one 2-3 word "
+    "decision-relevant phrase with **asterisks**. Never bold a full sentence, a lone number, or "
+    "more than 3 words. Never bold names, titles, sources, URLs, booleans, or enums. Skip only "
+    "if the field is empty."
+)
 
-def _select_financial_pdf_pages(pdf, max_pages: int, max_scan: int) -> list[int]:
-    total_pages = len(pdf.pages)
-    scan_upper = min(total_pages, max_scan)
-    if total_pages <= max_pages:
-        return list(range(total_pages))
+GEOGRAPHY_RULE = (
+    "GEOGRAPHIES: capture every state/city explicitly named in the evidence as a separate "
+    "entry — prefer this granular level over country-level ('India') or vague scope phrases "
+    "('across India', 'pan-India', 'multiple states') whenever ANY more specific place is named "
+    "anywhere in the evidence, since state/city is what tells a fundraiser whether this overlaps "
+    "with TAP's existing footprint. If the evidence genuinely only supports a vague scope with no "
+    "state/city named anywhere, include that vague entry rather than omitting geography "
+    "entirely, but do not let a vague entry substitute for specific ones that are available "
+    "elsewhere in the evidence — include both if both exist."
+)
 
-    scored_indices = []
-    for idx in range(scan_upper):
-        try:
-            snippet = pdf.pages[idx].extract_text() or ""
-        except Exception:
-            snippet = ""
-        if not snippet:
-            continue
-        lowered = snippet.lower()
-        score = count_financial_figures(snippet) * 3
-        if has_india_location_signal(snippet):
-            score += 2
-        if "csr" in lowered:
-            score += 2
-        if any(term in lowered for term in ("schedule vii", "annexure", "amount spent", "csr expenditure", "csr committee")):
-            score += 3
-        if score > 0:
-            scored_indices.append((score, idx))
-
-    if not scored_indices:
-        return list(range(min(max_pages, total_pages)))
-
-    scored_indices.sort(key=lambda pair: pair[0], reverse=True)
-    return sorted(idx for _, idx in scored_indices[:max_pages])
-
-
-def _download_pdf_bytes(url: str) -> tuple[bytes, str]:
-    response = get_with_referer_fallback(url, timeout=PDF_FETCH_TIMEOUT_SECONDS, stream=True)
-    _record_blocked_response(url, response.status_code)
-    if response.status_code == 403:
-        snippet = response.text[:200] if getattr(response, "text", None) else ""
-        logger.info("fetch_pdf_text 403 url=%s body_snippet=%r", url, snippet)
-        response.close()
-        return b"", "http_4xx_403"
-    response.raise_for_status()
-
-    content_length = response.headers.get("Content-Length")
-    if content_length and int(content_length) > MAX_PDF_DOWNLOAD_BYTES:
-        logger.info("fetch_pdf_text skipped oversized_pdf url=%s bytes=%s", url, content_length)
-        response.close()
-        return b"", "oversized_pdf"
-
-    chunks = []
-    total = 0
-    for chunk in response.iter_content(chunk_size=PDF_STREAM_CHUNK_BYTES):
-        if not chunk:
-            continue
-        total += len(chunk)
-        if total > MAX_PDF_DOWNLOAD_BYTES:
-            logger.info("fetch_pdf_text aborted oversized_pdf_stream url=%s bytes_read=%d", url, total)
-            response.close()
-            return b"", "oversized_pdf"
-        chunks.append(chunk)
-    response.close()
-    return b"".join(chunks), ""
-
-
-def _fetch_pdf_text_sync(url: str, max_chars: int, max_pages: int) -> tuple[str, str]:
-    if is_known_blocked_domain(url):
-        return "", "known_blocked_domain"
-    try:
-        import io
-        import pdfplumber
-
-        pdf_bytes, error = _download_pdf_bytes(url)
-        if error:
-            return "", error
-        if not pdf_bytes:
-            return "", "empty_response"
-
-        capped_pages = min(max_pages, MAX_PDF_PAGES_HARD_CAP)
-        pages_text = []
-        total_len = 0
-        buffer = io.BytesIO(pdf_bytes)
-        try:
-            with pdfplumber.open(buffer) as pdf:
-                selected_indices = _select_financial_pdf_pages(pdf, capped_pages, FINANCIAL_PDF_SCAN_PAGES)
-                for idx in selected_indices:
-                    page = pdf.pages[idx]
-                    page_text = page.extract_text() or ""
-                    page.flush_cache()
-                    if page_text:
-                        pages_text.append(page_text)
-                        total_len += len(page_text)
-                    if total_len >= max_chars:
-                        break
-        finally:
-            buffer.close()
-            del pdf_bytes
-
-        return clean_text(" ".join(pages_text), max_chars), ""
-    except Exception as exc:
-        error_type = classify_fetch_error(exc)
-        logger.info("fetch_pdf_text failed url=%s error_type=%s error=%s", url, error_type, exc)
-        return "", error_type
-    finally:
-        gc.collect()
+FIELD_ORDER_RULE = (
+    "FIELD ORDER: emit the JSON object's top-level keys in exactly the order shown in the JSON "
+    "shape below, with no exceptions. This matters because your reply can be cut off by an "
+    "output-length limit, and fields written first are the ones guaranteed to survive a cutoff — "
+    "so short, high-value summary fields (authenticity score, source quality, evidence recency, "
+    "delivery model, sector, eligibility, spend) are placed before the larger array fields "
+    "(programmes, partners, decision_makers, geographies, red_flags), which are placed last "
+    "since they are the most likely to be truncated safely without losing the fields other parts "
+    "of the pipeline depend on."
+)
 
 
-async def fetch_pdf_text(url: str, max_chars: int = MAX_PDF_TEXT_CHARS, max_pages: int = MAX_PDF_PAGES) -> str:
-    async with _FETCH_SEMAPHORE:
-        try:
-            text, _error_type = await asyncio.wait_for(
-                asyncio.to_thread(_fetch_pdf_text_sync, url, max_chars, max_pages),
-                timeout=FETCH_TASK_TIMEOUT_SECONDS,
-            )
-            return text
-        except asyncio.TimeoutError:
-            logger.info("fetch_pdf_text timed out url=%s error_type=timeout", url)
-            return ""
+def _extraction_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
+    return f"""You are a meticulous fact-extraction analyst. Extract every concrete, sourced fact about {company}'s India CSR activity from the evidence below. Do NOT score or judge fit — that happens in a separate pass. Your only job here is complete, accurate, well-cited extraction.
+
+NGO MISSION (context only, for judging what counts as education-relevant — do not score against it here): {mission}
+
+EVIDENCE (from sources actually fetched for {company} — numbered sources below can be cited):
+\"\"\"
+{evidence_text}
+\"\"\"
+
+SOURCES:
+{sources_manifest}
+
+{SPEND_VS_REVENUE_RULE}
+
+{EDUCATION_SPEND_RULE}
+
+{PARTNER_RULE}
+
+{PROGRAMME_RULE}
+
+{DECISION_MAKER_RULE}
+
+{GEOGRAPHY_RULE}
+
+{SOURCE_INTEGRITY_RULE}
+
+{EVIDENCE_STYLE_RULE}
+
+{FIELD_ORDER_RULE}
+
+Extract, matching the JSON shape's key order exactly:
+1. overall_authenticity_score (0-100) — reflects sourcing quality (primary vs secondary, how many sources actually returned usable text), not evidence volume.
+2. source_quality_assessment — 1-2 sentences: primary (company/regulator) vs secondary (press/snippets) sourcing.
+3. evidence_recency — one sentence on how current the evidence appears.
+4. csr_head_note — one sentence, only from actual named-person context, never speculation from a bare title.
+5. delivery_model (FUNDER/IMPLEMENTER/HYBRID/UNCLEAR) + delivery_model_evidence (1 sentence).
+6. sector — from company-description language; UNKNOWN only if truly no clue.
+7. eligibility — Section 135 applicability (LIKELY/UNLIKELY/UNKNOWN) from net worth/turnover/profit figures (kept separate from spend), plus the plain numeric business-scale fields.
+8. spend — apply the SPEND VS REVENUE and EDUCATION SPEND rules strictly, including the mandatory multi-year trend search.
+9. rfp_signal — an explicit call for NGO partners; default false/empty unless stated.
+10. board_affinity — named board/promoter personal education-philanthropy history; default false/empty unless stated.
+11. volunteering — named employee volunteering/payroll-giving touching education; default false/empty unless stated.
+12. group_foundation — CSR run via a separate parent/group foundation, only if explicitly named.
+13. key_facts_summary — 3-6 short bullet-style facts (as a single string, one per line prefixed with "- ") that most directly bear on education-CSR fit — this feeds directly into the scoring pass, so include anything that would move a fit judgment either up or down.
+14. open_questions[] — up to 5 short, concrete, searchable items to verify.
+15. programmes[] — apply the PROGRAMME rule, including the delivery-channel/beneficiary specificity requirement.
+16. partners[] — apply the PARTNER rule, including similar_to_tap_profile and multi-year history.
+17. decision_makers[] — apply the DECISION-MAKER relevance filter strictly; title, public_facing_score 0-100, tenure_status, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence.
+18. geographies[] — apply the GEOGRAPHY rule; prefer state/city over country/vague-region entries.
+19. red_flags[] — genuine contradictions or marketing-not-substance signals, severity low/medium/high. Missing/undocumented details are NOT red flags.
+20. contact_pathway — the single most concrete real channel; "Not identified" if nothing exists.
+
+Reply with ONE JSON object, nothing else, no markdown fences.
+
+JSON shape:
+{{
+  "overall_authenticity_score": <int 0-100>,
+  "source_quality_assessment": "<1-2 sentences>",
+  "evidence_recency": "<one sentence>",
+  "csr_head_note": "<one sentence>",
+  "delivery_model": "<FUNDER|IMPLEMENTER|HYBRID|UNCLEAR>",
+  "delivery_model_evidence": "<sentence>",
+  "sector": {{"sector": "<sector>", "sub_sector": "<or empty>", "reasoning": "<short>"}},
+  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number, 0 if unknown>, "net_profit_inr_crore": <number, 0 if unknown>}},
+  "spend": {{"inr_crore": <number, 0 if unknown, education-specific only>, "display": "<exact CSR-labeled education figure or empty>", "fiscal_year": "<if stated>", "is_education_specific": <bool>, "education_pct_of_total_csr": <number, 0 if unknown>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short, verbatim ok>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number, 0 if unknown>, "display": "<as stated>", "source_excerpt": "<short, verbatim ok>"}}], "total_csr_inr_crore": <number, 0 if unknown>, "total_csr_display": "<as stated or empty>", "total_csr_fiscal_year": "<if stated>"}},
+  "rfp_signal": {{"present": <bool>, "channel": "<short>", "evidence": "<short>"}},
+  "board_affinity": {{"present": <bool>, "person_name": "<name or empty>", "connection": "<short>", "source_excerpt": "<short, verbatim ok>"}},
+  "volunteering": {{"present": <bool>, "programme_name": "<name or empty>", "description": "<short>", "source_excerpt": "<short, verbatim ok>"}},
+  "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>", "source_excerpt": "<short, verbatim ok>"}},
+  "key_facts_summary": "<3-6 lines, each starting with '- '>",
+  "open_questions": ["<short item>", "..."],
+  "programmes": [{{"name": "<exact name>", "what_is_funded": "<precise funded activity>", "beneficiary_group": "<named beneficiary group>", "beneficiary_type": "<SCHOOL_CHILDREN_CURRICULUM|ADULT|OTHER>", "description": "<short, must cover delivery channel + beneficiary + one-off-vs-ongoing per PROGRAMME rule>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "source_excerpt": "<short, verbatim ok>", "confidence": "<confirmed|probable>"}}],
+  "partners": [{{"name": "<exact org name>", "relationship_type": "<funder|implementer|co-design|unclear>", "programme": "<or empty>", "year": "<or empty>", "geography": "<or empty>", "similar_to_tap_profile": <bool>, "source_excerpt": "<short, verbatim ok, must show relationship language>", "confidence": "<confirmed|probable>"}}],
+  "decision_makers": [{{"name": "<n>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "source_excerpt": "<short, verbatim ok>", "linkedin_url": "<url or empty>"}}],
+  "geographies": [{{"place": "<state/city preferred>", "source_excerpt": "<short, verbatim ok>"}}],
+  "red_flags": [{{"flag": "<short label>", "severity": "<low|medium|high>", "explanation": "<short>"}}],
+  "contact_pathway": {{"channel": "<sentence>", "evidence": "<short>"}}
+}}"""
 
 
-def csr_links_from_html(base_url: str, html: str, limit: int = 10) -> list[str]:
-    scored_links = []
-    try:
-        soup = BeautifulSoup(html, "lxml")
-        for anchor_tag in soup.find_all("a", href=True):
-            href = anchor_tag["href"]
-            if href.startswith(("#", "mailto:", "javascript:", "tel:")):
-                continue
-            anchor_text = anchor_tag.get_text(" ", strip=True)[:80]
-            if NEGATIVE_LINK_PATTERN.search(href) or NEGATIVE_LINK_PATTERN.search(anchor_text):
-                continue
-            score = (2 if CSR_LINK_PATTERN.search(href) else 0) + (1 if CSR_LINK_PATTERN.search(anchor_text) else 0)
-            if href.lower().endswith(".pdf") and CSR_LINK_PATTERN.search(anchor_text + href):
-                score += 2
-            if score:
-                scored_links.append((score, urljoin(base_url, href)))
-        del soup
-    except Exception as exc:
-        logger.info("csr_links_from_html parse failed base_url=%s error=%s", base_url, exc)
-    scored_links.sort(key=lambda item: -item[0])
-    seen_urls, ordered_urls = set(), []
-    for _, url in scored_links:
-        if url not in seen_urls:
-            seen_urls.add(url)
-            ordered_urls.append(url)
-        if len(ordered_urls) >= limit:
-            break
-    return ordered_urls
+def _scoring_prompt(company: str, mission: str, mode: str, extraction: dict, sources_manifest: str) -> str:
+    calibration = _mode_calibration(mode)
+    extraction_json = json.dumps(extraction, ensure_ascii=False, indent=2)
+    return f"""You are a careful, fair-minded CSR partnerships analyst judging whether {company} is a good funding/partnership fit for an Indian education NGO. A separate extraction pass already pulled every fact below from the fetched evidence — do not re-extract or add new facts, only score against what's here and write the narrative fields.
+
+{calibration['stance']}
+
+NGO MISSION: {mission}
+
+EXTRACTED FACTS FOR {company} (already verified against evidence — numbered sources below can be cited):
+\"\"\"
+{extraction_json}
+\"\"\"
+
+SOURCES:
+{sources_manifest}
+
+{SCORING_PHILOSOPHY}
+
+{SCORING_CONSISTENCY_RULE}
+
+{HIGHLIGHT_RULE}
+
+Produce, in this order:
+1. criteria[] — all 17 ids below, in order, each with id, name (copy exactly as given), score 0-5, confidence 0-100, short evidence, short reasoning, drawn only from the extracted facts above. Follow the CONSISTENCY rule above for every score:
+{_rubric_block()}
+2. fit_score (int 0-100) — compute this yourself as the weighted average of the criteria scores you just wrote (score/5 × weight for each, summed across all 17). Do this arithmetically from your own criteria, not as a separate holistic guess, so it matches what the system independently computes from the same criteria.
+3. fit_rationale (2-4 sentences): justify the scoring from the extracted facts, stating plainly what's confirmed vs inferred vs undocumented. If a named partner/programme suggests a plausible but unconfirmed entry path, you may add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme — never invent one not in the extracted facts. If decision_makers and/or partners/programmes are non-empty, end with one short sentence "Key contacts: A (Title), B (Title); Key partners: X, Y" using only names from the extracted facts. Omit that closing sentence if both lists are empty.
+4. overall_semantic_alignment (0-100) + alignment_rationale (1-2 sentences) — how well the company's actual activity matches the NGO mission semantically, independent of documentation completeness.
+5. strategic_insight — a 150-280 word standalone narrative (this is the lead summary shown to the user first, and should read as usable outreach material, not just an internal note): measured and evidence-grounded, leading with genuine strengths before caveats, stating plainly whether/why this is a good fit, naming strongest/weakest dimensions without dwelling on the weakest, flagging group-foundation routing if present, noting eligibility if uncertain, and giving one concrete next step. When spend is discussed, lead with the education-specific figure/trend over the total CSR figure if both are available. When a specific programme or partner is TAP-relevant, name its delivery channel explicitly (in-school/curriculum vs adult/standalone vs digital, etc.) and state concretely how TAP's own model (AI-enabled WhatsApp delivery, government-school, curriculum-embedded electives) does or doesn't overlap with it — write this so a sentence could be lifted directly into an outreach email, rather than a generic theme match like "both work in education." If TAP-similar partners exist, mention that positively. {"Since this is a screen-mode pass, if the signal is promising but sourcing is thin, say plainly that a deep-research pass would surface more (spend figures, named partners, a decision-maker) rather than treating the gap as a weakness." if mode == "screen" else ""} End with the same "Key contacts: ...; Key partners: ..." sentence format as fit_rationale (only using names from the extracted facts), omitted if both lists are empty.
+
+All criteria ids appear exactly once, in the order listed, each with its name copied exactly as given above. Keep every string concise so the full reply fits comfortably in your output budget.
+
+Reply with ONE JSON object, nothing else, no markdown fences.
+
+JSON shape:
+{{
+  "criteria": [
+{_criteria_json_template()}
+  ],
+  "fit_score": <int 0-100>,
+  "fit_rationale": "<2-4 sentences, one **2-3 word** highlight, optional Inference/Key-contacts clauses>",
+  "overall_semantic_alignment": <int 0-100>,
+  "alignment_rationale": "<1-2 sentences, one **2-3 word** highlight>",
+  "strategic_insight": "<150-280 word narrative, one **2-3 word** highlight, optional Inference/Key-contacts clauses>"
+}}"""
 
 
-def _sitemap_csr_urls_sync(domain: str, limit: int) -> list[str]:
-    try:
-        response = get_session().get(f"https://{domain}/sitemap.xml", timeout=PAGE_FETCH_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        urls = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", response.text)[:1200]
-        matched = [url for url in urls if CSR_LINK_PATTERN.search(url)]
-        if matched:
-            return matched[:limit]
-        nested_sitemaps = [url for url in urls if url.endswith(".xml")][:4]
-        for nested_url in nested_sitemaps:
-            try:
-                nested_response = get_session().get(nested_url, timeout=PAGE_FETCH_TIMEOUT_SECONDS)
-                nested_response.raise_for_status()
-                nested_urls = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", nested_response.text)[:1200]
-                nested_matched = [url for url in nested_urls if CSR_LINK_PATTERN.search(url)]
-                if nested_matched:
-                    return nested_matched[:limit]
-            except Exception as exc:
-                logger.info("sitemap nested fetch failed url=%s error=%s", nested_url, exc)
-                continue
-    except Exception as exc:
-        logger.info("sitemap fetch failed domain=%s error_type=%s error=%s", domain, classify_fetch_error(exc), exc)
-    return []
+class CriterionResultSchema(BaseModel):
+    id: str
+    name: str = ""
+    score: float = Field(ge=0, le=5, default=0)
+    confidence: int = Field(ge=0, le=100, default=0)
+    evidence: str = Field(default="", max_length=240)
+    reasoning: str = Field(default="", max_length=240)
+    source: str = Field(default="")
 
 
-async def sitemap_csr_urls(domain: str, limit: int = 8) -> list[str]:
-    async with _FETCH_SEMAPHORE:
-        try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(_sitemap_csr_urls_sync, domain, limit),
-                timeout=FETCH_TASK_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.info("sitemap_csr_urls timed out domain=%s", domain)
-            return []
+class SpendYearSchema(BaseModel):
+    fiscal_year: str = ""
+    inr_crore: float = 0.0
+    display: str = ""
+    source: str = ""
+    source_excerpt: str = Field(default="", max_length=260)
 
 
-async def discover_company_domain(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None) -> str:
-    domains = await discover_company_domains(company, search_cfg, budget, quota_guard)
-    return domains[0] if domains else ""
+class SpendSchema(BaseModel):
+    inr_crore: float = 0.0
+    display: str = ""
+    fiscal_year: str = ""
+    is_education_specific: bool = False
+    education_pct_of_total_csr: float = 0.0
+    has_disclosed_budget: bool = False
+    confidence: int = Field(ge=0, le=100, default=0)
+    source_excerpt: str = Field(default="", max_length=260)
+    source: str = ""
+    trend_direction: str = "UNKNOWN"
+    trend_evidence: str = Field(default="", max_length=240)
+    trend_source: str = ""
+    history: list[SpendYearSchema] = Field(default_factory=list)
+    total_csr_inr_crore: float = 0.0
+    total_csr_display: str = ""
+    total_csr_fiscal_year: str = ""
+    estimated_min_inr_crore: float = 0.0
+    estimated_basis: str = Field(default="", max_length=200)
+    estimated_is_computed: bool = False
 
 
-async def _direct_dotcom_probe(company: str) -> str:
-    tokens = company_name_tokens(company)
-    if not tokens:
-        return ""
-    slug = "".join(tokens)
-    if not slug:
-        return ""
-    domain = f"www.{slug}.com"
-    if not domain_resolves(domain, timeout=DNS_CHECK_TIMEOUT_SECONDS):
-        return ""
-
-    def _probe() -> bool:
-        try:
-            response = get_session().get(f"https://{domain}", timeout=HOMEPAGE_FETCH_TIMEOUT_SECONDS)
-            return bool(response.ok)
-        except Exception as exc:
-            logger.info("direct_dotcom_probe failed domain=%s error_type=%s", domain, classify_fetch_error(exc))
-            return False
-
-    try:
-        confirmed = await asyncio.wait_for(asyncio.to_thread(_probe), timeout=FETCH_TASK_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        return ""
-    return domain if confirmed else ""
+class ProgrammeSchema(BaseModel):
+    name: str = ""
+    what_is_funded: str = Field(default="", max_length=200)
+    beneficiary_group: str = Field(default="", max_length=160)
+    beneficiary_type: str = "OTHER"
+    description: str = Field(default="", max_length=260)
+    is_multi_year: bool = False
+    cohort_or_scale: str = ""
+    source_excerpt: str = Field(default="", max_length=260)
+    source: str = ""
+    confidence: str = "confirmed"
 
 
-async def discover_company_domains(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None) -> list[str]:
-    tokens = company_name_tokens(company)
-    acronym = "".join(token[0] for token in tokens) if len(tokens) >= 2 else ""
-
-    matched_domains: list[str] = []
-
-    direct_hit = await _direct_dotcom_probe(company)
-    if direct_hit:
-        matched_domains.append(direct_hit)
-
-    results = await search_web(
-        f'"{company}" official website India',
-        budget,
-        max_results=6,
-        prefer_google=search_cfg.get("csr_pages", True),
-        quota_guard=quota_guard,
-    )
-    for result in results:
-        host = urlparse(result.get("href", "")).netloc.lower()
-        if not host or any(domain in host for domain in AGGREGATOR_DOMAINS):
-            continue
-        if NEGATIVE_LINK_PATTERN.search(host):
-            continue
-        host_base = host.replace("www.", "").split(".")[0]
-        if any(token in host for token in tokens) or (acronym and host_base == acronym):
-            if host not in matched_domains:
-                matched_domains.append(host)
-
-    return matched_domains[:4]
+class PartnerSchema(BaseModel):
+    name: str = ""
+    relationship_type: str = ""
+    programme: str = Field(default="", max_length=160)
+    year: str = ""
+    geography: str = Field(default="", max_length=120)
+    similar_to_tap_profile: bool = False
+    source_excerpt: str = Field(default="", max_length=260)
+    source: str = ""
+    confidence: str = "confirmed"
 
 
-async def resolve_india_legal_entity_name(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None) -> str:
-    if budget.legal_entity_name_resolved:
-        return budget.legal_entity_name_cache or ""
-
-    resolved_name = ""
-    for query_template in LEGAL_ENTITY_RESOLUTION_QUERIES:
-        if not budget.google_has_budget("legal_entity") and not budget.ddgs_has_budget():
-            break
-        query = query_template.format(c=company)
-        results = await search_web(
-            query, budget, max_results=6, prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
-            category="legal_entity",
-        )
-        for result in results:
-            haystack = f"{result.get('title', '')} {result.get('body', '')}"
-            match = INDIA_LEGAL_ENTITY_PATTERN.search(haystack)
-            if match:
-                candidate = re.sub(r"\s+", " ", match.group(1)).strip()
-                if is_plausible_legal_entity_name(company, candidate):
-                    resolved_name = candidate
-                    break
-        if resolved_name:
-            break
-
-    budget.legal_entity_name_resolved = True
-    budget.legal_entity_name_cache = resolved_name
-    logger.info("resolve_india_legal_entity_name DONE company=%r resolved=%r", company, resolved_name or None)
-    return resolved_name
+class DecisionMakerSchema(BaseModel):
+    name: str = ""
+    title: str = ""
+    public_facing_score: int = Field(ge=0, le=100, default=0)
+    tenure_status: str = "UNKNOWN"
+    tenure_evidence: str = Field(default="", max_length=200)
+    source_excerpt: str = Field(default="", max_length=260)
+    source: str = ""
+    linkedin_url: str = ""
 
 
-async def _within_deadline(deadline: float) -> bool:
-    return time.monotonic() < deadline
+class GeographySchema(BaseModel):
+    place: str = ""
+    source_excerpt: str = Field(default="", max_length=200)
+    source: str = ""
 
 
-async def _check_job_deadline(job_deadline: float | None) -> None:
-    if job_deadline is not None and time.monotonic() >= job_deadline:
-        raise DeepJobDeadlineExceeded()
+class RedFlagSchema(BaseModel):
+    flag: str = ""
+    severity: str = ""
+    explanation: str = Field(default="", max_length=220)
+    source: str = ""
 
 
-async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                max_fetches: int = 20, registry: SourceRegistry | None = None,
-                                job_deadline: float | None = None) -> dict:
-    await _check_job_deadline(job_deadline)
-    deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    if job_deadline is not None:
-        deadline = min(deadline, job_deadline)
-    tried_urls = set()
-    remaining_budget = [max_fetches]
-    resolved_domain = [""]
-    best_candidate = [None]
-    weak_snippet_fallback = [None]
+class ContactPathwaySchema(BaseModel):
+    channel: str = ""
+    evidence: str = Field(default="", max_length=200)
+    source: str = ""
 
-    def consider(url: str, method: str, text: str):
-        if accept_fetched_text(company, text, 250):
-            score = score_candidate_text(company, text, url)
-            if best_candidate[0] is None or score > best_candidate[0][0]:
-                source = make_source("india_csr_page", 1, url, text, "FOUND", method)
-                source["domain"] = urlparse(url).netloc.lower()
-                source["india_location_hits"] = find_india_location_mentions(text)[:10]
-                best_candidate[0] = (score, source)
-            return
-        if text and len(text) > 80 and mentions_company(company, text) and mentions_csr_context(text):
-            score = score_candidate_text(company, text, url)
-            if weak_snippet_fallback[0] is None or score > weak_snippet_fallback[0][0]:
-                source = make_source("india_csr_page", 1, url, text, "FOUND", method + "_snippet")
-                source["domain"] = urlparse(url).netloc.lower()
-                weak_snippet_fallback[0] = (score, source)
 
-    async def try_fetch(url: str, method: str, is_pdf: bool = False):
-        if not url or url in tried_urls or remaining_budget[0] <= 0 or not await _within_deadline(deadline):
-            return
-        tried_urls.add(url)
-        remaining_budget[0] -= 1
-        text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url))
-        consider(url, method, text)
+class RfpSignalSchema(BaseModel):
+    present: bool = False
+    channel: str = ""
+    evidence: str = Field(default="", max_length=220)
+    source: str = ""
 
-    discovered_domains = await discover_company_domains(company, search_cfg, budget, quota_guard)
-    domains = list(dict.fromkeys(discovered_domains + candidate_domains(company)))
-    logger.info("india_csr_page discovered_domains company=%r domains=%s", company, domains)
 
-    async def check_homepage(domain: str):
-        try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(get_session().get, f"https://{domain}", timeout=HOMEPAGE_FETCH_TIMEOUT_SECONDS),
-                timeout=FETCH_TASK_TIMEOUT_SECONDS,
-            )
-            if response.ok:
-                if mentions_company(company, response.text):
-                    return domain, response.text
-                logger.info(
-                    "homepage fetch live but no literal company mention, treating as tentative "
-                    "domain=%s status=%s", domain, response.status_code,
-                )
-                return domain, response.text
-        except Exception as exc:
-            logger.info("homepage fetch failed domain=%s error_type=%s error=%s", domain, classify_fetch_error(exc), exc)
+class BoardAffinitySchema(BaseModel):
+    present: bool = False
+    person_name: str = ""
+    connection: str = Field(default="", max_length=220)
+    source_excerpt: str = Field(default="", max_length=260)
+    source: str = ""
+
+
+class VolunteeringSchema(BaseModel):
+    present: bool = False
+    programme_name: str = ""
+    description: str = Field(default="", max_length=220)
+    source_excerpt: str = Field(default="", max_length=260)
+    source: str = ""
+
+
+class GroupFoundationSchema(BaseModel):
+    routed_through_group: bool = False
+    foundation_name: str = ""
+    explanation: str = Field(default="", max_length=240)
+    source_excerpt: str = Field(default="", max_length=260)
+    source: str = ""
+
+
+class EligibilitySchema(BaseModel):
+    plausibly_mandated: str = "UNKNOWN"
+    reasoning: str = Field(default="", max_length=280)
+    net_worth_turnover_signal: str = Field(default="", max_length=200)
+    net_worth_turnover_inr_crore: float = 0.0
+    net_profit_inr_crore: float = 0.0
+    source: str = ""
+
+
+class SectorSchema(BaseModel):
+    sector: str = "UNKNOWN"
+    sub_sector: str = ""
+    reasoning: str = Field(default="", max_length=200)
+
+
+class FullAnalysisSchema(BaseModel):
+    fit_score: int = Field(ge=0, le=100, default=0)
+    fit_rationale: str = Field(default="", max_length=600)
+    overall_semantic_alignment: int = Field(ge=0, le=100, default=0)
+    alignment_rationale: str = Field(default="", max_length=500)
+    delivery_model: str = "UNCLEAR"
+    delivery_model_evidence: str = Field(default="", max_length=220)
+    delivery_model_source: str = ""
+    spend: SpendSchema = SpendSchema()
+    programmes: list[ProgrammeSchema] = Field(default_factory=list)
+    partners: list[PartnerSchema] = Field(default_factory=list)
+    decision_makers: list[DecisionMakerSchema] = Field(default_factory=list)
+    geographies: list[GeographySchema] = Field(default_factory=list)
+    criteria: list[CriterionResultSchema] = Field(default_factory=list)
+    red_flags: list[RedFlagSchema] = Field(default_factory=list)
+    contact_pathway: ContactPathwaySchema = ContactPathwaySchema()
+    rfp_signal: RfpSignalSchema = RfpSignalSchema()
+    board_affinity: BoardAffinitySchema = BoardAffinitySchema()
+    volunteering: VolunteeringSchema = VolunteeringSchema()
+    group_foundation: GroupFoundationSchema = GroupFoundationSchema()
+    eligibility: EligibilitySchema = EligibilitySchema()
+    sector: SectorSchema = SectorSchema()
+    evidence_recency: str = Field(default="", max_length=160)
+    csr_head_note: str = Field(default="", max_length=320)
+    source_quality_assessment: str = Field(default="", max_length=320)
+    overall_authenticity_score: int = Field(ge=0, le=100, default=0)
+    open_questions: list[str] = Field(default_factory=list)
+    strategic_insight: str = Field(default="", max_length=2200)
+    scoring_incomplete: bool = False
+
+
+async def call_anthropic_chat(
+    prompt: str,
+    max_tokens: int = 1400,
+    temperature: float = 0.0,
+    model: str | None = None,
+    caller: str = "unknown",
+) -> str | None:
+    if not settings.anthropic_configured:
+        logger.warning("anthropic call skipped caller=%s reason=not_configured", caller)
         return None
 
-    live_homepages = []
-    for domain in domains[:6]:
-        await _check_job_deadline(job_deadline)
-        result = await check_homepage(domain)
-        if result:
-            live_homepages.append(result)
-        if len(live_homepages) >= 3:
-            break
-    logger.info("india_csr_page live_homepages company=%r count=%d", company, len(live_homepages))
-
-    if live_homepages:
-        resolved_domain[0] = live_homepages[0][0]
-
-    candidates_checked = 0
-    for domain, homepage_html in live_homepages:
-        if not await _within_deadline(deadline):
-            break
-        links = csr_links_from_html(f"https://{domain}", homepage_html)
-        for link in links:
-            if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
-                break
-            if candidates_checked >= CANDIDATE_EVAL_LIMIT and best_candidate[0]:
-                break
-            await try_fetch(link, "homepage_link", is_pdf=link.lower().endswith(".pdf"))
-            candidates_checked += 1
-        for path in CSR_PAGE_PATHS[:16]:
-            if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
-                break
-            if candidates_checked >= CANDIDATE_EVAL_LIMIT and best_candidate[0]:
-                break
-            await try_fetch(f"https://{domain}{path}", "direct")
-            candidates_checked += 1
-        if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
-            break
-        for sitemap_url in await sitemap_csr_urls(domain):
-            if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
-                break
-            await try_fetch(sitemap_url, "sitemap", is_pdf=sitemap_url.lower().endswith(".pdf"))
-            candidates_checked += 1
-        if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
-            break
-
-    remaining_budget[0] = max(remaining_budget[0], 8)
-    if (not best_candidate[0] or best_candidate[0][0] < MIN_ACCEPT_SCORE) and await _within_deadline(deadline):
-        query_pool = []
-        for domain, _ in live_homepages[:1]:
-            for template in CSR_PAGE_QUERIES:
-                query_pool.append(template.format(c=company, d=domain))
-        query_pool.extend(template.format(c=company) for template in CSR_PAGE_FALLBACK_QUERIES)
-
-        for query in query_pool:
-            if not await _within_deadline(deadline):
-                break
-            if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
-                break
-            results = await search_web(
-                query, budget, max_results=6, prefer_google=search_cfg.get("csr_pages", True), quota_guard=quota_guard,
-                category="csr_page",
-            )
-            for result in results:
-                url = result.get("href", "")
-                title = result.get("title", "")
-                snippet_body = result.get("body", "")
-                if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
-                    continue
-                if not mentions_company(company, f"{title} {snippet_body}"):
-                    continue
-                consider(url, "snippet", snippet_body)
-                if not url_belongs_to_company(company, url, list(dict.fromkeys(discovered_domains))):
-                    continue
-                await try_fetch(url, "search", is_pdf=url.lower().endswith(".pdf"))
-                if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
-                    break
-
-    chosen = best_candidate[0] or weak_snippet_fallback[0]
-    if chosen:
-        logger.info(
-            "india_csr_page DONE company=%r found=True score=%.1f url=%s used_snippet_fallback=%s",
-            company, chosen[0], chosen[1].get("url", ""), best_candidate[0] is None,
-        )
-        result_source = chosen[1]
-        if registry is not None:
-            registry.register_core_source(result_source)
-        return result_source
-
-    logger.info("india_csr_page DONE company=%r found=False", company)
-    fallback = make_source("india_csr_page", 1, status="NOT_FOUND")
-    fallback["domain"] = resolved_domain[0]
-    return fallback
-
-
-async def find_company_cin(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                            legal_name: str = "", deadline: float | None = None) -> str:
-    templates = list(MCA_CIN_QUERIES)
-    if legal_name:
-        templates = [t.format(legal_name=legal_name, c="{c}") for t in MCA_ENTITY_CIN_QUERIES] + templates
-    for query_template in templates:
-        if deadline is not None and not await _within_deadline(deadline):
-            break
-        query = query_template if legal_name and "{legal_name}" not in query_template else query_template.format(c=company)
-        results = await search_web(
-            query, budget, max_results=5, prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
-            category="cin",
-        )
-        for result in results:
-            body = result.get("body", "") + " " + result.get("title", "") + " " + result.get("href", "")
-            match = CIN_PATTERN.search(body)
-            if match:
-                logger.info("find_company_cin DONE company=%r cin=%s query=%r", company, match.group(0).upper(), query)
-                return match.group(0).upper()
-    return ""
-
-
-async def fetch_mca_company_data_gov_page(cin: str) -> str:
-    if not cin:
-        return ""
-    candidate_urls = [
-        f"https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do?cid={cin}",
-        f"https://www.mca.gov.in/content/mca/global/en/mca/master-data/MDS.html?cin={cin}",
-    ]
-    for url in candidate_urls:
-        text = await fetch_page_text(url)
-        if text and len(text) > 150:
-            return text
-    return ""
-
-
-async def fetch_mca_portal(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                            registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
-    await _check_job_deadline(job_deadline)
-    deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    if job_deadline is not None:
-        deadline = min(deadline, job_deadline)
-    legal_name = await resolve_india_legal_entity_name(company, search_cfg, budget, quota_guard)
-    cin = await find_company_cin(company, search_cfg, budget, quota_guard, legal_name=legal_name, deadline=deadline)
-
-    if cin:
-        mca_text = await fetch_mca_company_data_gov_page(cin)
-        if mca_text and mentions_company(company, mca_text):
-            source = make_source(
-                "mca_portal", 2,
-                f"https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do?cid={cin}",
-                mca_text, "FOUND", "direct",
-            )
-            source["cin"] = cin
-            if legal_name:
-                source["legal_entity_name"] = legal_name
-            if registry is not None:
-                registry.register_core_source(source)
-            return source
-        if cin:
-            synthetic_text = (
-                f"{company} is registered in India with Corporate Identification Number (CIN) "
-                f"{cin}."
-                + (f" Registered legal entity name: {legal_name}." if legal_name else "")
-            )
-            source = make_source(
-                "mca_portal", 2,
-                f"https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do?cid={cin}",
-                synthetic_text, "FOUND", "cin_confirmed_portal_blocked",
-            )
-            source["cin"] = cin
-            if legal_name:
-                source["legal_entity_name"] = legal_name
-            if registry is not None:
-                registry.register_core_source(source)
-            logger.info("mca_portal DONE company=%r found=True (cin_only, portal_blocked) cin=%s", company, cin)
-            return source
-
-    best_candidate = None
-    filing_templates = list(MCA_FILING_QUERIES)
-    if legal_name:
-        filing_templates = [t.format(legal_name=legal_name) for t in MCA_ENTITY_FILING_QUERIES] + filing_templates
-    for query_template in filing_templates:
-        if not await _within_deadline(deadline):
-            break
-        if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
-            break
-        query = query_template if "{c}" not in query_template else query_template.format(c=company)
-        results = await search_web(
-            query, budget, max_results=6,
-            prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
-            category="mca_filing",
-        )
-        for result in results:
-            url = result.get("href", "")
-            body = result.get("body", "")
-            if not url:
-                continue
-            text = await (fetch_pdf_text(url) if url.lower().endswith(".pdf") else fetch_page_text(url))
-            if not text:
-                text = body
-            if not (text and is_csr_relevant(text) and mentions_company(company, text)):
-                continue
-            score = score_candidate_text(company, text, url)
-            if best_candidate is None or score > best_candidate[0]:
-                found_cin = cin or ""
-                if not found_cin:
-                    cin_match = CIN_PATTERN.search(text) or CIN_PATTERN.search(body)
-                    if cin_match:
-                        found_cin = cin_match.group(0).upper()
-                source = make_source("mca_via_search", 2, url, text, "FOUND", "search_proxy")
-                if found_cin:
-                    source["cin"] = found_cin
-                if legal_name:
-                    source["legal_entity_name"] = legal_name
-                best_candidate = (score, source)
-            if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
-                break
-
-    if best_candidate:
-        logger.info(
-            "mca_portal DONE company=%r found=True cin=%s legal_name=%r",
-            company, cin or best_candidate[1].get("cin", ""), legal_name,
-        )
-        if registry is not None:
-            registry.register_core_source(best_candidate[1])
-        return best_candidate[1]
-
-    logger.info("mca_portal DONE company=%r found=False cin=%s legal_name=%r", company, cin, legal_name)
-    return make_source("mca_portal", 2, status="NOT_FOUND")
-
-
-async def fetch_national_csr_portal(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                     registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
-    await _check_job_deadline(job_deadline)
-    deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    if job_deadline is not None:
-        deadline = min(deadline, job_deadline)
-    company_query = company.replace(" ", "+")
-    direct_urls = [
-        f"https://www.csr.gov.in/content/csr/global/master/home/companydetail.html?companyName={company_query}",
-    ]
-    for url in direct_urls:
-        text = await fetch_page_text(url)
-        if text and len(text) > 250 and mentions_company(company, text):
-            source = make_source("national_csr_portal", 3, url, text, "FOUND", "direct")
-            if registry is not None:
-                registry.register_core_source(source)
-            return source
-
-    best_candidate = None
-    for query_template in NATIONAL_CSR_PORTAL_QUERIES:
-        if not await _within_deadline(deadline):
-            break
-        results = await search_web(
-            query_template.format(c=company), budget, max_results=6,
-            prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
-            category="national_csr_portal",
-        )
-        for result in results[:6]:
-            url = result.get("href", "")
-            body = result.get("body", "")
-            if not url:
-                continue
-            text = await fetch_page_text(url) or body
-            if text and mentions_company(company, text) and ("csr.gov.in" in url.lower() or is_csr_relevant(text)):
-                score = score_candidate_text(company, text, url)
-                if best_candidate is None or score > best_candidate[0]:
-                    best_candidate = (score, make_source("national_csr_portal", 3, url, text, "FOUND", "search"))
-        if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
-            break
-
-    if best_candidate:
-        logger.info("national_csr_portal DONE company=%r found=True", company)
-        if registry is not None:
-            registry.register_core_source(best_candidate[1])
-        return best_candidate[1]
-
-    logger.info("national_csr_portal DONE company=%r found=False", company)
-    return make_source("national_csr_portal", 3, status="NOT_FOUND")
-
-
-async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                               registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
-    await _check_job_deadline(job_deadline)
-    deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    if job_deadline is not None:
-        deadline = min(deadline, job_deadline)
-    legal_name = await resolve_india_legal_entity_name(company, search_cfg, budget, quota_guard)
-    best_candidate = None
-    weak_candidate = None
-    urls_tried = 0
-    rejected_non_india_specific = 0
-
-    query_templates = [(t, False) for t in ANNUAL_REPORT_QUERIES]
-    if legal_name:
-        query_templates = [(t, True) for t in ANNUAL_REPORT_ENTITY_QUERIES] + query_templates
-
-    for template, is_entity_query in query_templates:
-        if not await _within_deadline(deadline):
-            break
-        if best_candidate and best_candidate[0] >= STRONG_ACCEPT_SCORE:
-            break
-        query = template.format(legal_name=legal_name, fy=CURRENT_FY_LABEL) if is_entity_query \
-            else template.format(c=company, fy=CURRENT_FY_LABEL)
-        results = await search_web(
-            query,
-            budget,
-            max_results=8,
-            prefer_google=search_cfg.get("annual_reports", True),
-            quota_guard=quota_guard,
-            category="annual_report",
-        )
-        for result in results:
-            if not await _within_deadline(deadline):
-                break
-            url = result.get("href", "")
-            title = result.get("title", "")
-            body = result.get("body", "")
-            if not url:
-                continue
-            if not mentions_company(company, f"{title} {body}"):
-                continue
-            if not url_belongs_to_company(company, url):
-                continue
-            urls_tried += 1
-            fetch_failed = False
-            if url.lower().endswith(".pdf"):
-                text = await fetch_pdf_text(url)
-                if not text:
-                    fetch_failed = True
-                    text = body if body and len(body) > 100 and mentions_company(company, body) else ""
-                if text and not pdf_is_csr_relevant(text) and not fetch_failed:
-                    logger.info("annual_report rejected non-csr pdf company=%r url=%s", company, url)
-                    continue
-                is_india_specific = has_india_specific_financial_figure(text) if text else False
-                if text and count_financial_figures(text) > 0 and not is_india_specific and not fetch_failed:
-                    rejected_non_india_specific += 1
-                    score = score_candidate_text(company, text, url)
-                    if weak_candidate is None or score > weak_candidate[0]:
-                        weak_candidate = (score, make_source("annual_report", 4, url, text, "FOUND", "pdf_weak_locale"))
-                    continue
-            else:
-                text = await fetch_page_text(url) or body
-            if not (text and len(text) > 200 and mentions_company(company, text)):
-                continue
-            if not is_csr_relevant(text) and not has_financial_figures(text):
-                continue
-            score = score_candidate_text(company, text, url)
-            if best_candidate is None or score > best_candidate[0]:
-                fetch_method = "pdf" if url.lower().endswith(".pdf") else "search"
-                best_candidate = (score, make_source("annual_report", 4, url, text, "FOUND", fetch_method))
-            if best_candidate and best_candidate[0] >= STRONG_ACCEPT_SCORE:
-                break
-
-    if (not best_candidate or count_financial_figures(best_candidate[1].get("text", "")) == 0) and await _within_deadline(deadline):
-        for fy in PRIOR_FY_LABELS[:2]:
-            if not await _within_deadline(deadline):
-                break
-            if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
-                break
-            query = f'"{company}" "annual report" {fy} CSR filetype:pdf'
-            results = await search_web(
-                query, budget, max_results=6, prefer_google=search_cfg.get("annual_reports", True), quota_guard=quota_guard,
-                category="annual_report",
-            )
-            for result in results:
-                if not await _within_deadline(deadline):
-                    break
-                url = result.get("href", "")
-                title = result.get("title", "")
-                body = result.get("body", "")
-                if not url or not url.lower().endswith(".pdf"):
-                    continue
-                if not mentions_company(company, f"{title} {body}") or not url_belongs_to_company(company, url):
-                    continue
-                text = await fetch_pdf_text(url)
-                if not text:
-                    continue
-                if not pdf_is_csr_relevant(text):
-                    continue
-                if has_financial_figures(text) and mentions_company(company, text):
-                    score = score_candidate_text(company, text, url)
-                    if best_candidate is None or score > best_candidate[0]:
-                        best_candidate = (score, make_source("annual_report", 4, url, text, "FOUND", "pdf_prior_fy"))
-            if best_candidate and count_financial_figures(best_candidate[1].get("text", "")) > 0:
-                break
-
-    chosen = best_candidate or weak_candidate
-    logger.info(
-        "annual_report DONE company=%r urls_tried=%d rejected_non_india_specific=%d found=%s used_weak=%s legal_name=%r",
-        company, urls_tried, rejected_non_india_specific, bool(chosen), chosen is weak_candidate and chosen is not None, legal_name,
-    )
-
-    if chosen:
-        if registry is not None:
-            registry.register_core_source(chosen[1])
-        return chosen[1]
-
-    return make_source("annual_report", 4, status="NOT_FOUND")
-
-
-_PARTNER_RELEVANCE_KEYWORD_PATTERN = re.compile(
-    r"\b(partner|partnered|partnership|ngo|foundation|mou|memorandum|collaborat|"
-    r"implement|grant|csr)\b", re.IGNORECASE,
-)
-
-
-async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
-    await _check_job_deadline(job_deadline)
-    deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    if job_deadline is not None:
-        deadline = min(deadline, job_deadline)
-    candidates: list[tuple[float, str, str]] = []
-    seen_urls: set[str] = set()
-    urls_tried = 0
-
-    for template in PARTNER_QUERIES:
-        if not await _within_deadline(deadline):
-            break
-        query = template.format(c=company)
-        results = await search_web(
-            query, budget, max_results=6, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard,
-            category="partner_search",
-        )
-        for result in results:
-            if not await _within_deadline(deadline):
-                break
-            url = result.get("href", "")
-            title = result.get("title", "")
-            body = result.get("body", "")
-            if not url or url in seen_urls:
-                continue
-            if not mentions_company(company, f"{title} {body}"):
-                continue
-
-            if "linkedin.com" in url:
-                snippet_text = f"{title}. {body}".strip()
-                if len(snippet_text) < 40 or not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(snippet_text):
-                    continue
-                seen_urls.add(url)
-                urls_tried += 1
-                score = score_candidate_text(company, snippet_text, url)
-                candidates.append((score, url, snippet_text))
-                continue
-
-            if any(domain in url for domain in AGGREGATOR_DOMAINS):
-                continue
-            seen_urls.add(url)
-            urls_tried += 1
-            is_pdf = url.lower().endswith(".pdf")
-            text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
-            if is_pdf and text and not pdf_is_csr_relevant(text):
-                continue
-            if not text or len(text) < 150 or not mentions_company(company, text):
-                continue
-            if not is_csr_relevant(text) and not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(text):
-                continue
-            score = score_candidate_text(company, text, url)
-            candidates.append((score, url, text))
-
-        if len(candidates) >= MAX_PARTNER_SOURCES * 2:
-            break
-
-    logger.info("partner_search DONE company=%r urls_tried=%d candidates_found=%d", company, urls_tried, len(candidates))
-
-    if not candidates:
-        return make_source("partner_search", 5, status="NOT_FOUND")
-
-    candidates.sort(key=lambda c: c[0], reverse=True)
-    top = candidates[:MAX_PARTNER_SOURCES]
-    combined_text = "\n\n---\n\n".join(f"[{url}]\n{text[:2500]}" for _, url, text in top)
-    primary_url = top[0][1]
-    source = make_source("partner_search", 5, primary_url, clean_text(combined_text, 8000), "FOUND", "search")
-
-    if registry is not None:
-        registry.register_core_source(source)
-        for _, url, text in top[1:]:
-            registry.register_child_hit(
-                source_name="partner_search", url=url,
-                label="Partner search result", excerpt=text[:200],
-            )
-
-    return source
-
-
-async def fetch_education_programme_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                            registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
-    await _check_job_deadline(job_deadline)
-    deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    if job_deadline is not None:
-        deadline = min(deadline, job_deadline)
-    best_candidate = None
-    urls_tried = 0
-    for template in EDUCATION_PROGRAMME_QUERIES:
-        if not await _within_deadline(deadline):
-            break
-        if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
-            break
-        query = template.format(c=company)
-        results = await search_web(
-            query, budget, max_results=6, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard,
-            category="education_programme_search",
-        )
-        for result in results:
-            if not await _within_deadline(deadline):
-                break
-            url = result.get("href", "")
-            title = result.get("title", "")
-            body = result.get("body", "")
-            if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
-                continue
-            if not mentions_company(company, f"{title} {body}"):
-                continue
-            urls_tried += 1
-            is_pdf = url.lower().endswith(".pdf")
-            text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
-            if not text or len(text) < 150 or not mentions_company(company, text):
-                continue
-            if "education" not in text.lower() and not any(kw in text.lower() for kw in EDUCATION_KEYWORDS):
-                continue
-            score = score_candidate_text(company, text, url) + 5.0
-            if best_candidate is None or score > best_candidate[0]:
-                best_candidate = (score, make_source("education_programme_search", 9, url, text, "FOUND", "search"))
-            if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
-                break
+    estimated_prompt_tokens = estimate_tokens(prompt)
+    resolved_model = model or settings.anthropic_model
+    payload = {
+        "model": resolved_model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "{"},
+        ],
+    }
 
     logger.info(
-        "education_programme_search DONE company=%r urls_tried=%d found=%s",
-        company, urls_tried, bool(best_candidate),
+        "anthropic request caller=%s model=%s max_tokens=%d estimated_prompt_tokens=%d temperature=%.2f",
+        caller, resolved_model, max_tokens, estimated_prompt_tokens, temperature,
     )
-
-    if best_candidate:
-        if registry is not None:
-            registry.register_core_source(best_candidate[1])
-        return best_candidate[1]
-
-    return make_source("education_programme_search", 9, status="NOT_FOUND")
-
-
-async def _run_linkedin_query_batch(company: str, queries: list[str], search_cfg: dict, budget: SearchBudget,
-                                     quota_guard, deadline: float, add_hit_fn, max_hits: int) -> int:
-    collected = 0
-    for query_template in queries:
-        if not await _within_deadline(deadline) or collected >= max_hits:
-            break
-        if not budget.google_has_budget("people_search"):
-            break
-        if google_cse_is_broken():
-            logger.info("linkedin people search skipped, CSE marked broken this run query=%r", query_template)
-            break
-        role_hint = ""
-        if '"' in query_template:
-            parts = query_template.split('"')
-            if len(parts) >= 4:
-                role_hint = parts[3]
-        budget.record_google_query()
-        try:
-            profiles = await google_search.google_search_linkedin_profiles(
-                company, role_hint=role_hint, max_results=8, quota_guard=quota_guard,
-            )
-        except google_search.GoogleCseInvalidArgumentError as exc:
-            async with _GOOGLE_CSE_BROKEN_LOCK:
-                _mark_google_cse_broken(str(exc))
-            break
-        for profile in profiles:
-            url = profile.get("href", "")
-            if not is_literal_linkedin_profile_url(url):
-                continue
-            if add_hit_fn(profile.get("title", ""), profile.get("body", ""), url):
-                collected += 1
-    return collected
-
-
-async def fetch_linkedin_people(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                 registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
-    await _check_job_deadline(job_deadline)
-    deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    if job_deadline is not None:
-        deadline = min(deadline, job_deadline)
-    hits: list[dict] = []
-    seen_urls: set[str] = set()
-
-    def _add_hit(raw_title: str, snippet: str, url: str) -> bool:
-        if url in seen_urls:
-            return False
-        parsed = parse_linkedin_hit(raw_title, snippet, url, company)
-        if not parsed["name"] or not parsed["has_csr_signal"]:
-            return False
-        seen_urls.add(url)
-        if registry is not None:
-            parsed["source_number"] = registry.register_child_hit(
-                source_name="people_search",
-                url=url,
-                label=f"LinkedIn — {parsed['name']}",
-                excerpt=f"{parsed['title']} — {parsed['snippet']}"[:280],
-            )
-        hits.append(parsed)
-        return True
-
-    if search_cfg.get("linkedin_people", True):
-        await _run_linkedin_query_batch(company, LINKEDIN_PEOPLE_QUERIES, search_cfg, budget, quota_guard, deadline, _add_hit, 15)
-
-    india_signal_hits = [h for h in hits if h.get("india_location_signal")]
-    if not india_signal_hits and await _within_deadline(deadline):
-        logger.info(
-            "fetch_linkedin_people no india-scoped hits, trying global CSR contact fallback company=%r",
-            company,
-        )
-        await _run_linkedin_query_batch(
-            company, LINKEDIN_PEOPLE_GLOBAL_FALLBACK_QUERIES, search_cfg, budget, quota_guard, deadline, _add_hit, 10
-        )
-
-    if not hits:
-        return make_source("people_search", 6, status="NOT_FOUND")
-
-    hits.sort(key=lambda h: (h.get("confidence") != "HIGH", h.get("confidence") != "MEDIUM"))
-    high_confidence_hits = [h for h in hits if h.get("confidence") == "HIGH"]
-    medium_confidence_hits = [h for h in hits if h.get("confidence") == "MEDIUM"]
-    final_hits = (high_confidence_hits + medium_confidence_hits)[:10] or hits[:6]
-
-    combined_text = " || ".join(
-        f"{hit['name']} — {hit['title']} — {hit['snippet']}" for hit in final_hits
-    )
-    source = make_source("people_search", 6, final_hits[0]["url"], clean_text(combined_text, 4000), "FOUND", "search_snippets")
-    source["people_hits"] = final_hits
-    source["used_global_fallback"] = not bool(india_signal_hits) and bool(final_hits)
-    if registry is not None:
-        registry.register_core_source(source)
-    logger.info(
-        "people_search DONE company=%r hits_total=%d high_confidence=%d medium_confidence=%d used_global_fallback=%s",
-        company, len(hits), len(high_confidence_hits), len(medium_confidence_hits), source["used_global_fallback"],
-    )
-    return source
-
-
-async def fetch_plans_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                              max_pages: int = 3, registry: SourceRegistry | None = None,
-                              job_deadline: float | None = None) -> dict:
-    await _check_job_deadline(job_deadline)
-    deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    if job_deadline is not None:
-        deadline = min(deadline, job_deadline)
-    hits, fetched_texts, first_url = [], [], ""
-    all_queries = PLAN_QUERIES + RFP_QUERIES
-    for query_template in all_queries:
-        if not await _within_deadline(deadline):
-            break
-        if len(fetched_texts) >= max_pages:
-            break
-        query = query_template.format(c=company)
-        results = await search_web(
-            query, budget, max_results=5, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard,
-            category="plans_search",
-        )
-        for result in results:
-            if not await _within_deadline(deadline):
-                break
-            url = result.get("href", "")
-            title = result.get("title", "")
-            body = result.get("body", "")
-            if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
-                continue
-            if not mentions_company(company, f"{title} {body}"):
-                continue
-            source_number = None
-            if registry is not None:
-                source_number = registry.register_child_hit(
-                    source_name="plans_search", url=url, label=title or url, excerpt=body,
-                )
-            hits.append({"title": title, "snippet": body, "url": url, "source_number": source_number})
-            if len(fetched_texts) < max_pages:
-                text = await (fetch_pdf_text(url) if url.lower().endswith(".pdf") else fetch_page_text(url)) or body
-                if text and len(text) > 200 and is_csr_relevant(text) and mentions_company(company, text):
-                    fetched_texts.append(text)
-                    first_url = first_url or url
-
-    if not hits and not fetched_texts:
-        return make_source("plans_search", 7, status="NOT_FOUND")
-
-    combined_text = " || ".join(fetched_texts) if fetched_texts else " || ".join(f"{hit['title']} — {hit['snippet']}" for hit in hits)
-    source = make_source(
-        "plans_search", 7, first_url or hits[0]["url"], clean_text(combined_text, 7000), "FOUND",
-        "search" if fetched_texts else "search_snippets",
-    )
-    source["plan_hits"] = hits[:10]
-    if registry is not None:
-        registry.register_core_source(source)
-    return source
-
-
-async def fetch_sector_eligibility_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                           registry: SourceRegistry | None = None,
-                                           job_deadline: float | None = None) -> dict:
-    await _check_job_deadline(job_deadline)
-    deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
-    if job_deadline is not None:
-        deadline = min(deadline, job_deadline)
-    hits, fetched_texts, first_url = [], [], ""
-    queries = [t.format(c=company, fy=CURRENT_FY_LABEL) for t in SECTOR_QUERIES] + \
-              [t.format(c=company) for t in GROUP_FOUNDATION_QUERIES]
-    for query in queries:
-        if not await _within_deadline(deadline):
-            break
-        if len(fetched_texts) >= 3:
-            break
-        results = await search_web(
-            query, budget, max_results=5,
-            prefer_google=search_cfg.get("mca", True), quota_guard=quota_guard,
-            category="sector_eligibility_search",
-        )
-        for result in results:
-            if not await _within_deadline(deadline):
-                break
-            url = result.get("href", "")
-            title = result.get("title", "")
-            body = result.get("body", "")
-            if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
-                continue
-            if not mentions_company(company, f"{title} {body}"):
-                continue
-            hits.append({"title": title, "snippet": body, "url": url})
-            if len(fetched_texts) < 3:
-                text = await fetch_page_text(url) or body
-                if text and len(text) > 150 and mentions_company(company, text):
-                    fetched_texts.append(text)
-                    first_url = first_url or url
-
-    if not hits and not fetched_texts:
-        return make_source("sector_eligibility_search", 8, status="NOT_FOUND")
-
-    combined_text = " || ".join(fetched_texts) if fetched_texts else " || ".join(f"{hit['title']} — {hit['snippet']}" for hit in hits)
-    source = make_source(
-        "sector_eligibility_search", 8, first_url or hits[0]["url"], clean_text(combined_text, 6000), "FOUND",
-        "search" if fetched_texts else "search_snippets",
-    )
-    if registry is not None:
-        registry.register_core_source(source)
-    return source
-
-
-async def run_targeted_queries(company: str, question_category: str, search_cfg: dict, budget: SearchBudget,
-                                quota_guard=None, registry: SourceRegistry | None = None, max_fetches: int = 4,
-                                deadline_seconds: float = FOLLOWUP_DEADLINE_SECONDS) -> dict:
-    templates = FOLLOWUP_QUERY_TEMPLATES.get(question_category, [])
-    if not templates:
-        return make_source(f"followup_{question_category}", 10, status="NOT_TRIED")
-
-    deadline = time.monotonic() + deadline_seconds
-    best_candidate = None
-    fetches_done = 0
-
-    for template in templates:
-        if not await _within_deadline(deadline) or fetches_done >= max_fetches:
-            break
-        query = template.format(c=company, fy=CURRENT_FY_LABEL)
-        results = await search_web(
-            query, budget, max_results=5, prefer_google=True, quota_guard=quota_guard,
-            category=f"followup_{question_category}",
-        )
-        for result in results:
-            if not await _within_deadline(deadline):
-                break
-            url = result.get("href", "")
-            title = result.get("title", "")
-            body = result.get("body", "")
-            if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
-                continue
-            if not mentions_company(company, f"{title} {body}"):
-                continue
-            if fetches_done >= max_fetches:
-                break
-            fetches_done += 1
-            is_pdf = url.lower().endswith(".pdf")
-            text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
-            if not text or len(text) < 150 or not mentions_company(company, text):
-                continue
-            score = score_candidate_text(company, text, url)
-            if best_candidate is None or score > best_candidate[0]:
-                best_candidate = (score, make_source(f"followup_{question_category}", 10, url, text, "FOUND", "followup_search"))
-        if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
-            break
-
-    if best_candidate:
-        if registry is not None:
-            registry.register_core_source(best_candidate[1])
-        return best_candidate[1]
-
-    return make_source(f"followup_{question_category}", 10, status="NOT_FOUND")
-
-
-async def fetch_screen_sources(company: str, search_cfg: dict, quota_guard=None,
-                                registry: SourceRegistry | None = None) -> list[dict]:
-    registry = registry or SourceRegistry(company)
-    budget = SearchBudget(company, max_google_queries=12, max_ddgs_queries=6)
-
-    source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry)
-    source_4 = await fetch_annual_report(company, search_cfg, budget, quota_guard, registry=registry)
-    source_2 = await fetch_mca_portal(company, search_cfg, budget, quota_guard, registry=registry)
-    source_5 = await fetch_partner_source(company, search_cfg, budget, quota_guard, registry=registry)
-    source_6 = await fetch_linkedin_people(company, search_cfg, budget, quota_guard, registry=registry)
-    source_9 = await fetch_education_programme_source(company, search_cfg, budget, quota_guard, registry=registry)
-
-    source_3 = make_source("national_csr_portal", 3, status="NOT_TRIED")
-    source_7 = make_source("plans_search", 7, status="NOT_TRIED")
-    source_8 = make_source("sector_eligibility_search", 8, status="NOT_TRIED")
-
-    sources = [source_1, source_2, source_3, source_4, source_5, source_6, source_7, source_8, source_9]
-    found_count = sum(1 for s in sources if s.get("status") == "FOUND")
-    logger.info(
-        "fetch_screen_sources DONE company=%r found=%d/9 google_used=%d ddgs_used=%d",
-        company, found_count, budget.google_queries_used, budget.ddgs_queries_used,
-    )
-    return sources
-
-
-async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, progress_cb=None,
-                              registry: SourceRegistry | None = None) -> list[dict]:
-    registry = registry or SourceRegistry(company)
-    budget = SearchBudget(company)
-    job_deadline = time.monotonic() + DEEP_JOB_HARD_DEADLINE_SECONDS
-
-    def not_tried(name: str, num: int) -> dict:
-        return make_source(name, num, status="NOT_TRIED")
-
-    async def advance_step(message: str):
-        if progress_cb:
-            await progress_cb(message)
 
     try:
-        await advance_step("Sources 1-4/9 — CSR page, MCA, National CSR Portal, annual report...")
-        source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
-        source_2 = await fetch_mca_portal(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
-        source_3 = await fetch_national_csr_portal(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
-        source_4 = await fetch_annual_report(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
-        logger.info(
-            "deep sources 1-4 company=%r csr_page=%s mca=%s national=%s annual=%s google_used=%d ddgs_used=%d",
-            company, source_1.get("status"), source_2.get("status"), source_3.get("status"), source_4.get("status"),
-            budget.google_queries_used, budget.ddgs_queries_used,
+        async with httpx.AsyncClient(timeout=ANTHROPIC_REQUEST_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                ANTHROPIC_MESSAGES_URL,
+                headers={
+                    "x-api-key": settings.anthropic_api_key,
+                    "anthropic-version": ANTHROPIC_API_VERSION,
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+    except httpx.HTTPError as exc:
+        logger.error("anthropic transport error caller=%s error=%s", caller, exc)
+        return None
+
+    if response.status_code == 429:
+        logger.warning(
+            "anthropic 429 caller=%s retry_after=%s body=%s",
+            caller, response.headers.get("retry-after", "unknown"), response.text[:200],
+        )
+        return None
+
+    if response.status_code >= 400:
+        logger.error("anthropic http error caller=%s status=%d body=%s", caller, response.status_code, response.text[:400])
+        return None
+
+    try:
+        body = response.json()
+    except ValueError:
+        logger.error("anthropic non-json response caller=%s", caller)
+        return None
+
+    logger.info("anthropic response caller=%s status=%d", caller, response.status_code)
+
+    if body.get("stop_reason") == "max_tokens":
+        logger.warning("anthropic response TRUNCATED caller=%s max_tokens=%d", caller, max_tokens)
+
+    content_blocks = body.get("content") or []
+    text_parts = [block.get("text", "") for block in content_blocks if block.get("type") == "text"]
+    if not text_parts:
+        logger.error("anthropic malformed response caller=%s", caller)
+        return None
+    return "{" + "".join(text_parts)
+
+
+def parse_json_response(raw_text: str | None, expected_keys: list[str] | None = None, caller: str = "unknown") -> dict:
+    if not raw_text:
+        return {}
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    recovered = _recover_partial_json(cleaned)
+    if recovered:
+        logger.info("parse_json_response recovered via partial-json fallback caller=%s chars=%d", caller, len(cleaned))
+        if expected_keys:
+            missing = [key for key in expected_keys if key not in recovered]
+            if missing:
+                logger.warning(
+                    "parse_json_response recovered object is missing expected keys caller=%s missing=%s",
+                    caller, missing,
+                )
+        return recovered
+    logger.error("parse_json_response failed to recover any JSON caller=%s chars=%d", caller, len(cleaned))
+    return {}
+
+
+def _recover_partial_json(cleaned: str, required_key: str | None = None) -> dict:
+    decoder = json.JSONDecoder()
+    for cut_point in range(len(cleaned), 0, -1):
+        candidate = cleaned[:cut_point].rstrip()
+        if not candidate:
+            continue
+        trimmed = candidate.rstrip(",")
+        for closers in ("", "}", "]}", "]}}", "}]}", "}]}}"):
+            attempt = trimmed + closers
+            try:
+                parsed = decoder.decode(attempt)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(parsed, dict) and (required_key is None or parsed.get(required_key) is not None):
+                return parsed
+        if cut_point < len(cleaned) - 4000:
+            break
+    return {}
+
+
+_STRAY_MARKER = re.compile(r"\*{3,}")
+_DOUBLE_STAR = re.compile(r"\*\*")
+_LINKEDIN_PROFILE_URL = re.compile(r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[^/?#\s]+/?(?:[?#].*)?$", re.IGNORECASE)
+
+
+def _normalize_highlight_markers(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _STRAY_MARKER.sub("**", text)
+    if len(_DOUBLE_STAR.findall(cleaned)) % 2 != 0:
+        cleaned = cleaned.replace("**", "")
+    return cleaned
+
+
+def _sanitize_linkedin_url(url: str) -> str:
+    cleaned = (url or "").strip()
+    return cleaned if _LINKEDIN_PROFILE_URL.match(cleaned) else ""
+
+
+def _field_max_length(field) -> int | None:
+    for constraint in field.metadata:
+        if hasattr(constraint, "max_length"):
+            return constraint.max_length
+    return None
+
+
+def _field_numeric_bounds(field) -> tuple[float | None, float | None]:
+    lower, upper = None, None
+    for constraint in field.metadata:
+        if hasattr(constraint, "ge"):
+            lower = constraint.ge
+        if hasattr(constraint, "gt"):
+            lower = constraint.gt
+        if hasattr(constraint, "le"):
+            upper = constraint.le
+        if hasattr(constraint, "lt"):
+            upper = constraint.lt
+    return lower, upper
+
+
+def _sanitize_value_for_field(value, field):
+    annotation = field.annotation
+    origin = typing.get_origin(annotation)
+
+    if origin is list:
+        if not isinstance(value, list):
+            return []
+        (item_type,) = typing.get_args(annotation)
+        if isinstance(item_type, type) and issubclass(item_type, BaseModel):
+            return [_sanitize_dict_for_model(item, item_type) for item in value if isinstance(item, dict)]
+        if item_type is str:
+            return [str(item)[:2000] for item in value if isinstance(item, str) and item.strip()]
+        return value
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return _sanitize_dict_for_model(value if isinstance(value, dict) else {}, annotation)
+
+    unwrapped = annotation
+    type_args = typing.get_args(annotation)
+    if type_args and type(None) in type_args:
+        non_none = [a for a in type_args if a is not type(None)]
+        unwrapped = non_none[0] if non_none else annotation
+
+    if unwrapped is str:
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            value = str(value)
+        max_length = _field_max_length(field)
+        if max_length is not None and len(value) > max_length:
+            return value[: max_length - 1].rstrip() + "…" if max_length > 1 else value[:max_length]
+        return value
+
+    if unwrapped is bool:
+        return bool(value) if value is not None else False
+
+    if unwrapped in (int, float):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            fallback = field.default
+            value = fallback if isinstance(fallback, (int, float)) and not isinstance(fallback, bool) else 0
+        lower, upper = _field_numeric_bounds(field)
+        if lower is not None and value < lower:
+            value = lower
+        if upper is not None and value > upper:
+            value = upper
+        return int(value) if unwrapped is int else float(value)
+
+    return value
+
+
+def _sanitize_dict_for_model(data: dict, model: type[BaseModel]) -> dict:
+    if not isinstance(data, dict):
+        data = {}
+    sanitized = {}
+    for field_name, field in model.model_fields.items():
+        if field_name not in data:
+            continue
+        sanitized[field_name] = _sanitize_value_for_field(data[field_name], field)
+    return sanitized
+
+
+def _compute_weighted_fit_score(criteria: list[dict]) -> float:
+    if not criteria:
+        return 0.0
+    total_weight = 0.0
+    weighted_sum = 0.0
+    for entry in criteria:
+        criterion_id = entry.get("id", "")
+        weight = CRITERIA_WEIGHTS.get(criterion_id)
+        if weight is None:
+            continue
+        score_0_to_5 = max(0.0, min(5.0, float(entry.get("score", 0) or 0)))
+        weighted_sum += (score_0_to_5 / 5.0) * weight
+        total_weight += weight
+    if total_weight == 0:
+        return 0.0
+    return (weighted_sum / total_weight) * 100.0
+
+
+def _apply_authenticity_ceiling(fit_score: float, authenticity_score: int, mode: str) -> float:
+    calibration = _mode_calibration(mode)
+    threshold = calibration["authenticity_cap_threshold"]
+    ceiling = calibration["authenticity_cap_ceiling"]
+    if authenticity_score < threshold and fit_score > ceiling:
+        return float(ceiling)
+    return fit_score
+
+
+def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode: str,
+                             model_reported_score: int | None = None) -> int:
+    weighted = _compute_weighted_fit_score(criteria)
+    calibrated = _apply_authenticity_ceiling(weighted, authenticity_score, mode)
+    final_score = int(round(max(0.0, min(100.0, calibrated))))
+    if model_reported_score is not None:
+        drift = abs(model_reported_score - weighted)
+        if drift > 15:
+            logger.warning(
+                "fit_score drift flagged: model_reported=%s weighted_from_criteria=%.1f "
+                "final=%d mode=%s authenticity=%d drift=%.1f — final score always uses the "
+                "deterministic weighted value, this log is for prompt-quality monitoring only",
+                model_reported_score, weighted, final_score, mode, authenticity_score, drift,
+            )
+    return final_score
+
+
+def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
+    parsed = dict(parsed) if isinstance(parsed, dict) else {}
+
+    missing_priority = [key for key in EXTRACTION_PRIORITY_KEYS if key not in parsed]
+    if missing_priority:
+        logger.warning(
+            "_repair_extraction missing priority keys, defaults will be used caller=%s missing=%s",
+            caller, missing_priority,
         )
 
-        await advance_step("Sources 5-9/9 — partners, decision-makers, plans, sector, education programmes...")
-        source_5 = await fetch_partner_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
-        source_6 = await fetch_linkedin_people(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
-        source_7 = await fetch_plans_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
-        source_8 = await fetch_sector_eligibility_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
-        source_9 = await fetch_education_programme_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
-    except DeepJobDeadlineExceeded:
-        logger.warning("fetch_deep_sources hit hard job deadline company=%r seconds=%d", company, DEEP_JOB_HARD_DEADLINE_SECONDS)
-        existing = locals()
-        source_1 = existing.get("source_1") or not_tried("india_csr_page", 1)
-        source_2 = existing.get("source_2") or not_tried("mca_portal", 2)
-        source_3 = existing.get("source_3") or not_tried("national_csr_portal", 3)
-        source_4 = existing.get("source_4") or not_tried("annual_report", 4)
-        source_5 = existing.get("source_5") or not_tried("partner_search", 5)
-        source_6 = existing.get("source_6") or not_tried("people_search", 6)
-        source_7 = existing.get("source_7") or not_tried("plans_search", 7)
-        source_8 = existing.get("source_8") or not_tried("sector_eligibility_search", 8)
-        source_9 = existing.get("source_9") or not_tried("education_programme_search", 9)
+    sanitized = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
 
-    sources = [source_1, source_2, source_3, source_4, source_5, source_6, source_7, source_8, source_9]
+    if isinstance(parsed.get("decision_makers"), list):
+        for entry in sanitized.get("decision_makers", []):
+            if isinstance(entry, dict) and entry.get("linkedin_url"):
+                entry["linkedin_url"] = _sanitize_linkedin_url(entry["linkedin_url"])
 
-    total_figures = sum(count_financial_figures(s.get("text", "")) for s in sources)
-    if total_figures == 0 and budget.google_has_budget("csr_budget") and time.monotonic() < job_deadline:
-        legal_name = await resolve_india_legal_entity_name(company, search_cfg, budget, quota_guard)
-        spend_templates = [(t, True) for t in CSR_SPEND_ENTITY_QUERIES] if legal_name else []
-        spend_templates += [(t, False) for t in CSR_SPEND_QUERIES]
-        spend_deadline = min(time.monotonic() + SOURCE_DEADLINE_SECONDS, job_deadline)
-        for template, is_entity_query in spend_templates:
-            if time.monotonic() >= spend_deadline or not budget.google_has_budget("csr_budget"):
-                break
-            query = template.format(legal_name=legal_name, fy=CURRENT_FY_LABEL) if is_entity_query \
-                else template.format(c=company, fy=CURRENT_FY_LABEL)
-            results = await search_web(
-                query, budget, max_results=6,
-                prefer_google=search_cfg.get("csr_pages", True), quota_guard=quota_guard,
-                category="csr_budget",
-            )
-            for result in results:
-                if time.monotonic() >= spend_deadline:
-                    break
-                url = result.get("href", "")
-                body = result.get("body", "")
-                if not url or not mentions_company(company, body):
-                    continue
-                text = await (fetch_pdf_text(url) if url.lower().endswith(".pdf") else fetch_page_text(url)) or body
-                if text and has_financial_figures(text) and mentions_company(company, text):
-                    source_4 = make_source("annual_report", 4, url, text, "FOUND", "spend_fallback")
-                    registry.register_core_source(source_4)
-                    sources[3] = source_4
-                    logger.info(
-                        "deep fallback spend search recovered figures company=%r url=%s legal_name=%r",
-                        company, url, legal_name,
-                    )
-                    break
-            if count_financial_figures(sources[3].get("text", "")) > 0:
-                break
+    sanitized["key_facts_summary"] = str(parsed.get("key_facts_summary", "") or "")[:1500]
+    sanitized["open_questions"] = [
+        str(q).strip()[:200] for q in (parsed.get("open_questions") or []) if q and str(q).strip()
+    ][:5]
+    return sanitized
 
-    found_count = sum(1 for s in sources if s.get("status") == "FOUND")
-    logger.info(
-        "fetch_deep_sources DONE company=%r found=%d/9 total_financial_figures=%d source_bank_entries=%d "
-        "google_used=%d ddgs_used=%d",
-        company, found_count, sum(count_financial_figures(s.get("text", "")) for s in sources),
-        len(registry.entries()), budget.google_queries_used, budget.ddgs_queries_used,
+
+def _empty_criteria() -> list[dict]:
+    return [
+        {
+            "id": criterion_id, "name": CRITERIA_TITLES[criterion_id],
+            "score": 0.0, "confidence": 0,
+            "evidence": "No signal returned for this criterion", "reasoning": "", "source": "",
+        }
+        for criterion_id in CRITERIA_IDS
+    ]
+
+
+def build_extraction_only_result(extraction: dict, mode: str) -> dict:
+    merged = dict(extraction)
+    merged.pop("key_facts_summary", None)
+    merged["criteria"] = _empty_criteria()
+    merged["fit_score"] = 0
+    merged["fit_rationale"] = ""
+    merged["overall_semantic_alignment"] = 0
+    merged["alignment_rationale"] = ""
+    merged["strategic_insight"] = LLM_SCORING_UNAVAILABLE_NOTE
+    merged["scoring_incomplete"] = True
+
+    validated = _repair_analysis(merged)
+    result = validated.model_dump()
+    result["scoring_incomplete"] = True
+    result["open_questions"] = [q.strip()[:200] for q in extraction.get("open_questions", []) if q and q.strip()][:5]
+
+    logger.warning(
+        "build_extraction_only_result company_facts_preserved mode=%r authenticity=%d "
+        "partners=%d programmes=%d decision_makers=%d",
+        mode, result["overall_authenticity_score"], len(result["partners"]),
+        len(result["programmes"]), len(result["decision_makers"]),
     )
-    gc.collect()
-    return sources
+    return result
+
+
+def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
+    parsed = dict(parsed) if isinstance(parsed, dict) else {}
+    parsed = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
+
+    raw_criteria = parsed.get("criteria") if isinstance(parsed.get("criteria"), list) else []
+    repaired_criteria, seen_ids = [], set()
+    for entry in raw_criteria:
+        if not isinstance(entry, dict):
+            continue
+        criterion_id = entry.get("id")
+        if criterion_id not in CRITERIA_IDS or criterion_id in seen_ids:
+            continue
+        seen_ids.add(criterion_id)
+        repaired_criteria.append({
+            "id": criterion_id,
+            "name": CRITERIA_TITLES[criterion_id],
+            "score": min(max(float(entry.get("score", 0) or 0), 0), 5),
+            "confidence": int(min(max(entry.get("confidence", 0) or 0, 0), 100)),
+            "evidence": str(entry.get("evidence", ""))[:240],
+            "reasoning": str(entry.get("reasoning", ""))[:240],
+            "source": str(entry.get("source", "")),
+        })
+    for criterion_id in CRITERIA_IDS:
+        if criterion_id not in seen_ids:
+            repaired_criteria.append({
+                "id": criterion_id, "name": CRITERIA_TITLES[criterion_id],
+                "score": 0.0, "confidence": 0,
+                "evidence": "No signal returned for this criterion", "reasoning": "", "source": "",
+            })
+    ordered = {c["id"]: c for c in repaired_criteria}
+    parsed["criteria"] = [ordered[cid] for cid in CRITERIA_IDS]
+
+    for field_name in ("fit_rationale", "alignment_rationale", "delivery_model_evidence",
+                       "csr_head_note", "evidence_recency", "source_quality_assessment",
+                       "strategic_insight"):
+        if isinstance(parsed.get(field_name), str):
+            parsed[field_name] = _normalize_highlight_markers(parsed[field_name])
+    if isinstance(parsed.get("contact_pathway"), dict) and isinstance(parsed["contact_pathway"].get("channel"), str):
+        parsed["contact_pathway"]["channel"] = _normalize_highlight_markers(parsed["contact_pathway"]["channel"])
+
+    if isinstance(parsed.get("decision_makers"), list):
+        for entry in parsed["decision_makers"]:
+            if isinstance(entry, dict) and entry.get("linkedin_url"):
+                entry["linkedin_url"] = _sanitize_linkedin_url(entry["linkedin_url"])
+
+    try:
+        return FullAnalysisSchema.model_validate(parsed)
+    except ValidationError as exc:
+        logger.warning("analysis validation failed, repairing containers error=%s", exc)
+        for container_field, default in (
+            ("spend", {}), ("contact_pathway", {}), ("rfp_signal", {}), ("board_affinity", {}),
+            ("volunteering", {}), ("group_foundation", {}), ("eligibility", {}), ("sector", {}),
+            ("programmes", []), ("partners", []), ("decision_makers", []), ("geographies", []),
+            ("red_flags", []), ("open_questions", []),
+        ):
+            current = parsed.get(container_field)
+            expected_type = list if isinstance(default, list) else dict
+            if not isinstance(current, expected_type):
+                parsed[container_field] = default
+        try:
+            return FullAnalysisSchema.model_validate(parsed)
+        except ValidationError as exc2:
+            logger.error(
+                "analysis validation failed even after container repair error=%s — "
+                "salvaging each nested item independently rather than discarding the whole analysis",
+                exc2,
+            )
+            safe_kwargs: dict = {
+                "fit_score": int(min(max(parsed.get("fit_score", 0) or 0, 0), 100)),
+                "criteria": [CriterionResultSchema(**c) for c in repaired_criteria],
+            }
+            for scalar_field in (
+                "fit_rationale", "overall_semantic_alignment", "alignment_rationale",
+                "delivery_model", "delivery_model_evidence", "evidence_recency",
+                "csr_head_note", "source_quality_assessment", "overall_authenticity_score",
+                "strategic_insight", "scoring_incomplete",
+            ):
+                if scalar_field in parsed:
+                    safe_kwargs[scalar_field] = parsed[scalar_field]
+            for object_field, schema in (
+                ("spend", SpendSchema), ("contact_pathway", ContactPathwaySchema),
+                ("rfp_signal", RfpSignalSchema), ("board_affinity", BoardAffinitySchema),
+                ("volunteering", VolunteeringSchema), ("group_foundation", GroupFoundationSchema),
+                ("eligibility", EligibilitySchema), ("sector", SectorSchema),
+            ):
+                candidate = parsed.get(object_field)
+                if isinstance(candidate, dict):
+                    try:
+                        safe_kwargs[object_field] = schema(**_sanitize_dict_for_model(candidate, schema))
+                    except ValidationError:
+                        continue
+            for list_field, schema in (
+                ("programmes", ProgrammeSchema), ("partners", PartnerSchema),
+                ("decision_makers", DecisionMakerSchema), ("geographies", GeographySchema),
+                ("red_flags", RedFlagSchema),
+            ):
+                candidates = parsed.get(list_field)
+                kept = []
+                if isinstance(candidates, list):
+                    for item in candidates:
+                        if isinstance(item, dict):
+                            try:
+                                kept.append(schema(**_sanitize_dict_for_model(item, schema)))
+                            except ValidationError:
+                                continue
+                safe_kwargs[list_field] = kept
+            if isinstance(parsed.get("open_questions"), list):
+                safe_kwargs["open_questions"] = [q for q in parsed["open_questions"] if isinstance(q, str)]
+            try:
+                return FullAnalysisSchema(**safe_kwargs)
+            except ValidationError:
+                logger.error("analysis validation failed even after item-level salvage — using minimal fallback")
+                return FullAnalysisSchema(
+                    fit_score=int(min(max(parsed.get("fit_score", 0) or 0, 0), 100)),
+                    criteria=[CriterionResultSchema(**c) for c in repaired_criteria],
+                )
+
+
+def _valid_source_lookup(sources_manifest: str) -> set[str]:
+    valid = set()
+    for line in sources_manifest.splitlines():
+        parts = line.split("|")
+        if parts and parts[0].strip():
+            valid.add(parts[0].strip())
+    return valid
+
+
+def _sanitize_source(value: str, valid_sources: set[str]) -> str:
+    cleaned = (value or "").strip()
+    return cleaned if cleaned in valid_sources else ""
+
+
+def anthropic_cooldown_remaining_seconds() -> float:
+    return 0.0
+
+
+def evidence_token_budget(company: str, mission: str, sources_manifest: str) -> int:
+    scaffold_tokens = estimate_tokens(_extraction_prompt(company, mission, "", sources_manifest))
+    reserved_for_output = EXTRACTION_OUTPUT_TOKEN_RESERVE
+    ceiling = _anthropic_context_window() - reserved_for_output - scaffold_tokens
+    return max(MIN_EVIDENCE_TOKEN_BUDGET, ceiling)
+
+
+def _shrink_to_fit(company: str, mission: str, sources_manifest: str, cleaned_sources: list[dict],
+                    prompt_builder, output_ceiling: int) -> tuple[str, list[dict], int]:
+    evidence_text = combine_evidence_text(cleaned_sources)
+    prompt = prompt_builder(evidence_text)
+    prompt_tokens = estimate_tokens(prompt)
+    working_sources = cleaned_sources
+    shrink_attempts = 0
+
+    while prompt_tokens > output_ceiling and shrink_attempts < MAX_PROMPT_SHRINK_ATTEMPTS:
+        current_evidence_tokens = estimate_tokens(evidence_text)
+        if current_evidence_tokens <= 0:
+            break
+        overflow = prompt_tokens - output_ceiling
+        target_evidence_tokens = max(MIN_EVIDENCE_TOKEN_BUDGET, current_evidence_tokens - overflow - PROMPT_SHRINK_SAFETY_MARGIN)
+        overflow_ratio = target_evidence_tokens / current_evidence_tokens
+        working_sources = [
+            {**s, "text": s["text"][: max(MIN_PROMPT_TRIM_CHARS, int(len(s["text"]) * overflow_ratio))]}
+            if s.get("status") == "FOUND" else s
+            for s in working_sources
+        ]
+        evidence_text = combine_evidence_text(working_sources)
+        prompt = prompt_builder(evidence_text)
+        prompt_tokens = estimate_tokens(prompt)
+        shrink_attempts += 1
+
+    if shrink_attempts:
+        logger.info(
+            "shrink_to_fit trimmed evidence company=%r attempts=%d final_prompt_tokens=%d",
+            company, shrink_attempts, prompt_tokens,
+        )
+    return evidence_text, working_sources, prompt_tokens
+
+
+async def extract_company_facts(
+    company: str,
+    mission: str,
+    cleaned_sources: list[dict],
+    sources_manifest: str,
+) -> dict | None:
+    evidence_text = combine_evidence_text(cleaned_sources)
+    if not evidence_text.strip():
+        logger.info("extract_company_facts skipped company=%r reason=no_evidence_text", company)
+        return None
+
+    output_ceiling = _anthropic_context_window() - EXTRACTION_OUTPUT_TOKEN_RESERVE
+
+    def _build(evidence: str) -> str:
+        return _extraction_prompt(company, mission, evidence, sources_manifest)
+
+    evidence_text, working_sources, prompt_tokens = _shrink_to_fit(
+        company, mission, sources_manifest, cleaned_sources, _build, output_ceiling,
+    )
+
+    if prompt_tokens > output_ceiling:
+        logger.error(
+            "extract_company_facts could not fit prompt within context window company=%r prompt_tokens=%d ceiling=%d",
+            company, prompt_tokens, output_ceiling,
+        )
+        return None
+
+    prompt = _build(evidence_text)
+    raw_reply = await call_anthropic_chat(
+        prompt,
+        temperature=0.0,
+        max_tokens=EXTRACTION_OUTPUT_TOKEN_RESERVE,
+        caller=f"extract_facts:{company}",
+    )
+    if raw_reply is None:
+        logger.error("extract_company_facts got no reply company=%r", company)
+        return None
+
+    parsed = parse_json_response(raw_reply, expected_keys=EXTRACTION_PRIORITY_KEYS, caller=f"extract_facts:{company}")
+    if not parsed:
+        logger.error("extract_company_facts empty parse company=%r", company)
+        return None
+
+    extraction = _repair_extraction(parsed, caller=f"extract_facts:{company}")
+
+    valid_sources = _valid_source_lookup(sources_manifest)
+    extraction["delivery_model_source"] = _sanitize_source(extraction.get("delivery_model_source", ""), valid_sources)
+    extraction.setdefault("spend", {})
+    extraction["spend"]["source"] = _sanitize_source(extraction["spend"].get("source", ""), valid_sources)
+    extraction["spend"]["trend_source"] = _sanitize_source(extraction["spend"].get("trend_source", ""), valid_sources)
+    for entry in extraction["spend"].get("history", []) or []:
+        entry["source"] = _sanitize_source(entry.get("source", ""), valid_sources)
+    for programme in extraction.get("programmes", []) or []:
+        programme["source"] = _sanitize_source(programme.get("source", ""), valid_sources)
+    for partner in extraction.get("partners", []) or []:
+        partner["source"] = _sanitize_source(partner.get("source", ""), valid_sources)
+    for person in extraction.get("decision_makers", []) or []:
+        person["source"] = _sanitize_source(person.get("source", ""), valid_sources)
+        person["linkedin_url"] = _sanitize_linkedin_url(person.get("linkedin_url", ""))
+    for geography in extraction.get("geographies", []) or []:
+        geography["source"] = _sanitize_source(geography.get("source", ""), valid_sources)
+    for flag in extraction.get("red_flags", []) or []:
+        flag["source"] = _sanitize_source(flag.get("source", ""), valid_sources)
+    extraction.setdefault("contact_pathway", {})
+    extraction["contact_pathway"]["source"] = _sanitize_source(extraction["contact_pathway"].get("source", ""), valid_sources)
+    extraction.setdefault("rfp_signal", {})
+    extraction["rfp_signal"]["source"] = _sanitize_source(extraction["rfp_signal"].get("source", ""), valid_sources)
+    extraction.setdefault("board_affinity", {})
+    extraction["board_affinity"]["source"] = _sanitize_source(extraction["board_affinity"].get("source", ""), valid_sources)
+    extraction.setdefault("volunteering", {})
+    extraction["volunteering"]["source"] = _sanitize_source(extraction["volunteering"].get("source", ""), valid_sources)
+    extraction.setdefault("group_foundation", {})
+    extraction["group_foundation"]["source"] = _sanitize_source(extraction["group_foundation"].get("source", ""), valid_sources)
+    extraction.setdefault("eligibility", {})
+    extraction["eligibility"]["source"] = _sanitize_source(extraction["eligibility"].get("source", ""), valid_sources)
+
+    logger.info(
+        "extract_company_facts DONE company=%r authenticity=%d partners=%d programmes=%d decision_makers=%d red_flags=%d "
+        "spend_history_years=%d geographies=%d",
+        company, extraction.get("overall_authenticity_score", 0), len(extraction.get("partners", [])),
+        len(extraction.get("programmes", [])), len(extraction.get("decision_makers", [])),
+        len(extraction.get("red_flags", [])), len((extraction.get("spend") or {}).get("history", []) or []),
+        len(extraction.get("geographies", [])),
+    )
+    return extraction
+
+
+async def score_extracted_facts(
+    company: str,
+    mission: str,
+    mode: str,
+    extraction: dict,
+    sources_manifest: str,
+) -> dict | None:
+    scoring_facts = {
+        k: v for k, v in extraction.items()
+        if k not in ("open_questions", "key_facts_summary", "overall_authenticity_score",
+                      "evidence_recency", "source_quality_assessment", "csr_head_note")
+    }
+    prompt = _scoring_prompt(company, mission, mode, scoring_facts, sources_manifest)
+    prompt_tokens = estimate_tokens(prompt)
+    output_ceiling = _anthropic_context_window() - SCORING_OUTPUT_TOKEN_RESERVE
+
+    if prompt_tokens > output_ceiling:
+        trimmed_facts = dict(scoring_facts)
+        for list_field in ("programmes", "partners", "decision_makers", "geographies", "red_flags"):
+            if trimmed_facts.get(list_field):
+                trimmed_facts[list_field] = trimmed_facts[list_field][:5]
+        prompt = _scoring_prompt(company, mission, mode, trimmed_facts, sources_manifest)
+        prompt_tokens = estimate_tokens(prompt)
+
+    if prompt_tokens > output_ceiling:
+        logger.error(
+            "score_extracted_facts could not fit prompt within context window company=%r prompt_tokens=%d ceiling=%d",
+            company, prompt_tokens, output_ceiling,
+        )
+        return None
+
+    raw_reply = await call_anthropic_chat(
+        prompt,
+        temperature=0.0,
+        max_tokens=SCORING_OUTPUT_TOKEN_RESERVE,
+        caller=f"score_facts:{company}",
+    )
+    if raw_reply is None:
+        logger.error("score_extracted_facts got no reply company=%r", company)
+        return None
+
+    parsed = parse_json_response(raw_reply, expected_keys=["criteria", "fit_score"], caller=f"score_facts:{company}")
+    if not parsed:
+        logger.error("score_extracted_facts empty parse company=%r", company)
+        return None
+
+    logger.info(
+        "score_extracted_facts DONE company=%r model_reported_fit_score=%s",
+        company, parsed.get("fit_score"),
+    )
+    return parsed
+
+
+async def analyze_and_score_company(
+    company: str,
+    mission: str,
+    cleaned_sources: list[dict],
+    sources_manifest: str,
+    mode: str = "deep",
+) -> dict | None:
+    extraction = await extract_company_facts(company, mission, cleaned_sources, sources_manifest)
+    if not extraction:
+        return None
+
+    scoring = await score_extracted_facts(company, mission, mode, extraction, sources_manifest)
+    if not scoring:
+        logger.error(
+            "analyze_and_score_company scoring pass failed after successful extraction, "
+            "returning extraction-only result company=%r mode=%r",
+            company, mode,
+        )
+        return build_extraction_only_result(extraction, mode)
+
+    merged = dict(extraction)
+    merged.pop("key_facts_summary", None)
+    merged["criteria"] = scoring.get("criteria", [])
+    merged["fit_score"] = scoring.get("fit_score", 0)
+    merged["fit_rationale"] = scoring.get("fit_rationale", "")
+    merged["overall_semantic_alignment"] = scoring.get("overall_semantic_alignment", 0)
+    merged["alignment_rationale"] = scoring.get("alignment_rationale", "")
+    merged["strategic_insight"] = scoring.get("strategic_insight", "")
+    merged["scoring_incomplete"] = False
+
+    validated = _repair_analysis(merged)
+    result = validated.model_dump()
+
+    model_reported_score = result["fit_score"]
+    result["fit_score"] = compute_final_fit_score(
+        criteria=result["criteria"],
+        authenticity_score=result["overall_authenticity_score"],
+        mode=mode,
+        model_reported_score=model_reported_score,
+    )
+
+    if not result.get("strategic_insight", "").strip():
+        result["strategic_insight"] = result.get("fit_rationale", "") or LLM_UNAVAILABLE_EVIDENCE
+
+    result["open_questions"] = [q.strip()[:200] for q in extraction.get("open_questions", []) if q and q.strip()][:5]
+
+    logger.info(
+        "analyze_and_score_company DONE company=%r mode=%s model_reported_fit_score=%d final_fit_score=%d "
+        "authenticity=%d partners=%d programmes=%d decision_makers=%d",
+        company, mode, model_reported_score, result["fit_score"], result["overall_authenticity_score"],
+        len(result["partners"]), len(result["programmes"]), len(result["decision_makers"]),
+    )
+    logger.info(
+        "analyze_and_score_company criteria breakdown company=%r %s",
+        company, {c["id"]: c["score"] for c in result["criteria"]},
+    )
+
+    return result
+
+
+async def api_health_check() -> dict:
+    google_ok = settings.google_search_configured
+    if not settings.anthropic_configured:
+        anthropic_status = {"ok": False, "model": None, "message": "ANTHROPIC_API_KEY not set — analysis and scoring are unavailable"}
+    else:
+        reply = await call_anthropic_chat('Reply with JSON: {"status":"ok"}', max_tokens=20, caller="api_health_check")
+        if reply:
+            anthropic_status = {"ok": True, "model": settings.anthropic_model, "message": f"Claude connected ({settings.anthropic_model}) — full AI analysis active"}
+        else:
+            anthropic_status = {"ok": False, "model": None, "message": "Anthropic API unreachable — analysis and scoring are unavailable"}
+    return {
+        "anthropic": anthropic_status,
+        "google_search": {
+            "configured": google_ok,
+            "message": "Google Custom Search configured" if google_ok else "Google Search not configured — using DDGS fallback for all queries",
+        },
+    }
