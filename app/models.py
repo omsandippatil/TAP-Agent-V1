@@ -215,6 +215,8 @@ class CompanyAnalysis(BaseModel):
     source_quality_assessment: str = ""
     overall_authenticity_score: int = 0
     open_questions: list[str] = []
+    evidence_coverage_insufficient: bool = False
+    average_criteria_confidence_pct: float = 0.0
 
 
 class DecisionMaker(BaseModel):
@@ -241,7 +243,7 @@ class ImportantLink(BaseModel):
 
 class ScreeningResult(BaseModel):
     state: Literal["FOUND", "NOT_FOUND_IN_SOURCE", "CONFIRMED_ABSENT"] = "NOT_FOUND_IN_SOURCE"
-    fit_score: int = 0
+    fit_score: int | None = 0
     strategic_insight: str = ""
     band: ScoreBand = ScoreBand()
     scoring_tier: ScoringTier = ScoringTier()
@@ -252,6 +254,7 @@ class ScreeningResult(BaseModel):
     source_links: list[dict[str, Any]] = []
     important_links: list[ImportantLink] = []
     source_bank: list[SourceBankEntry] = []
+    evidence_coverage_insufficient: bool = False
     cache_key: tuple[str, str, str] | None = None
 
 

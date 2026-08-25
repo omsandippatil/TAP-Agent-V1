@@ -233,16 +233,18 @@ async def resolve_logo(company: str, sources: list, cfg: dict, quota_guard=None)
 
 
 def _unscored_result(state: str, insight: str, sources: list, source_links: list, logo_url: str,
-                      registry: SourceRegistry, existing_partner: bool = False) -> dict:
+                      registry: SourceRegistry, existing_partner: bool = False,
+                      analysis: dict | None = None, score_breakdown: dict | None = None,
+                      decision_makers: list | None = None) -> dict:
     return {
         "state": state,
         "fit_score": None,
         "strategic_insight": insight,
         "band": dict(BAND_UNSCORED),
         "scoring_tier": dict(TIER_UNSCORED),
-        "analysis": None,
-        "score_breakdown": {},
-        "decision_makers": [],
+        "analysis": analysis,
+        "score_breakdown": score_breakdown or {},
+        "decision_makers": decision_makers or [],
         "sources": sources,
         "source_links": source_links,
         "important_links": [],
@@ -316,6 +318,35 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             ) + insight
         logger.warning("score UNSCORED company=%r reason=analysis_call_failed", company)
         return _unscored_result(state, insight, sources, source_links, logo_url, registry, existing_partner)
+
+    if analysis.get("evidence_coverage_insufficient"):
+        avg_conf = analysis.get("average_criteria_confidence_pct", 0)
+        authenticity = analysis.get("overall_authenticity_score", 0)
+        insight = (
+            f"Evidence coverage for {company} was too thin to score fit confidently "
+            f"(average criteria confidence: {avg_conf:.0f}%, source authenticity: "
+            f"{authenticity}%). This means the research pass did not retrieve enough "
+            f"public evidence to judge fit either way — it is **not** a Low Fit "
+            f"determination. Recommended: broaden the manual search or reach out "
+            f"directly to the company's India CSR office before deprioritising."
+        )
+        if existing_partner:
+            insight = _existing_partner_prefix(
+                company, "Evidence coverage was too thin to score confidently in this "
+                "run, but this must never be read as 'Not a Target'."
+            ) + insight
+        logger.warning(
+            "score UNSCORED company=%r reason=evidence_coverage_insufficient "
+            "avg_confidence=%.1f authenticity=%d",
+            company, avg_conf, authenticity,
+        )
+        decision_makers = attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources)
+        return _unscored_result(
+            state, insight, sources, source_links, logo_url, registry, existing_partner,
+            analysis=analysis,
+            score_breakdown=build_score_breakdown(analysis),
+            decision_makers=decision_makers,
+        )
 
     final_score = analysis["fit_score"]
     tier = get_scoring_tier(final_score, cfg)

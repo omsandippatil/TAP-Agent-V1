@@ -23,6 +23,7 @@ LOW_CONF_FILL = PatternFill("solid", fgColor="FEF7DC")
 ESTIMATE_FILL = PatternFill("solid", fgColor="FEF3E7")
 PROBABLE_FILL = PatternFill("solid", fgColor="FEF7DC")
 BANNER_FILL = PatternFill("solid", fgColor="0F3D3E")
+COVERAGE_FILL = PatternFill("solid", fgColor="FEF7DC")
 LINK_FONT_COLOR = "0A66C2"
 
 WHITE_BOLD = Font(name=ARIAL, bold=True, color="FFFFFF", size=11)
@@ -35,6 +36,7 @@ BOLD = Font(name=ARIAL, bold=True, size=10)
 BODY = Font(name=ARIAL, size=10)
 SMALL = Font(name=ARIAL, size=9, color="666666")
 LINK_FONT = Font(name=ARIAL, size=10, color=LINK_FONT_COLOR, underline="single", bold=True)
+COVERAGE_BOLD = Font(name=ARIAL, bold=True, color="8A6200", size=10)
 
 WRAP = Alignment(wrap_text=True, vertical="top")
 WRAP_CENTER = Alignment(wrap_text=True, vertical="center", horizontal="center")
@@ -61,6 +63,16 @@ SOURCE_LABELS = {
 
 def _strip_highlight_markers(text: str) -> str:
     return _HIGHLIGHT_PATTERN.sub(r"\1", text or "")
+
+
+def _is_coverage_insufficient(result: dict, tier: dict) -> bool:
+    if result.get("fit_score") is None:
+        return True
+    if result.get("evidence_coverage_insufficient"):
+        return True
+    if (tier or {}).get("key") == "UNSCORED":
+        return True
+    return False
 
 
 def _sheet(wb, title, widths):
@@ -99,6 +111,21 @@ def _banner(ws, title_text, subtitle_text, col_span):
         img.anchor = f"{last_col}1"
         ws.add_image(img)
     return 4
+
+
+def _coverage_row(ws, row, col_span):
+    ws.row_dimensions[row].height = 20
+    last_col = get_column_letter(col_span)
+    ws.merge_cells(f"A{row}:{last_col}{row}")
+    for col in range(1, col_span + 1):
+        ws.cell(row=row, column=col).fill = COVERAGE_FILL
+    cell = ws.cell(
+        row=row, column=1,
+        value="\u26a0 EVIDENCE COVERAGE TOO LOW TO SCORE CONFIDENTLY — fit score withheld for this company, see Verdict sheet.",
+    )
+    cell.font = COVERAGE_BOLD
+    cell.alignment = Alignment(vertical="center", horizontal="left", indent=1)
+    return row + 1
 
 
 def _header(ws, row, texts):
@@ -195,12 +222,13 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
     sources = result.get("sources", []) or []
     decision_makers = result.get("decision_makers", []) or []
     important_links = result.get("important_links", []) or []
-    fit_score = result.get("fit_score", 0)
+    fit_score = result.get("fit_score")
     tier = result.get("scoring_tier", {}) or {}
     state = result.get("state", "")
     now = datetime.datetime.now().strftime("%d %B %Y")
     has_analysis = bool(analysis)
     source_url_lookup = _source_url_lookup(sources)
+    coverage_insufficient = _is_coverage_insufficient(result, tier)
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -209,6 +237,8 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
     r = _banner(ws, f"{company} — DEEP-DIVE BASE",
                 f"Generated {now}  ·  engine draft — every figure must be verified by a person before this ships",
                 2)
+    if coverage_insufficient:
+        r = _coverage_row(ws, r, 2)
 
     delivery_model = analysis.get("delivery_model", "UNCLEAR") if has_analysis else "UNCLEAR"
     way_in = {
@@ -216,6 +246,8 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
         "HYBRID": "Enter as a delivery-excellence partner strengthening their education portfolio.",
         "IMPLEMENTER": "Enter as a specialist curriculum/tech partner, not a grant recipient.",
     }.get(delivery_model, "To confirm — delivery model unclear from sources.")
+
+    fit_score_display = fit_score if fit_score is not None else "N/A (evidence coverage insufficient)"
 
     if has_analysis:
         criteria = analysis.get("criteria", []) or []
@@ -226,13 +258,14 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
             if red_flags
             else "Weakest criteria: " + "; ".join(f"{w['name']} ({w['score']}/5)" for w in weakest)
         )
-        call_line = f"{tier.get('label', '')} — fit score {fit_score}/100 — semantic alignment {analysis.get('overall_semantic_alignment', 0)}/100"
+        call_line = f"{tier.get('label', '')} — fit score {fit_score_display} — semantic alignment {analysis.get('overall_semantic_alignment', 0)}/100"
         csr_head_note = analysis.get("csr_head_note", "")
-        authenticity_note = f"Evidence authenticity {analysis.get('overall_authenticity_score', 0)}/100 · avg criteria confidence {breakdown.get('average_confidence_pct', 0)}%"
+        avg_conf = analysis.get("average_criteria_confidence_pct") or breakdown.get("average_confidence_pct", 0)
+        authenticity_note = f"Evidence authenticity {analysis.get('overall_authenticity_score', 0)}/100 · avg criteria confidence {avg_conf}%"
         fit_rationale = analysis.get("fit_rationale", "")
     else:
         catch = LLM_UNAVAILABLE_EVIDENCE
-        call_line = f"Analysis unavailable — fit score {fit_score}/100 (state: {state})"
+        call_line = f"Analysis unavailable — fit score {fit_score_display} (state: {state})"
         csr_head_note = LLM_UNAVAILABLE_EVIDENCE
         authenticity_note = LLM_UNAVAILABLE_EVIDENCE
         fit_rationale = LLM_UNAVAILABLE_EVIDENCE
@@ -259,6 +292,8 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
 
     ws = _sheet(wb, "2. Fit Against Criteria", [38, 9, 12, 62, 52])
     r = _banner(ws, "Fit Against Criteria", "Every criterion scored 0–5 with confidence and cited evidence", 5)
+    if coverage_insufficient:
+        r = _coverage_row(ws, r, 5)
     r = _header(ws, r, ["Criterion (0–5)", "Score", "Confidence", "Evidence", "Reasoning"])
     if has_analysis:
         for cri in analysis.get("criteria", []):
@@ -275,7 +310,7 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
                 r = _row(ws, r, values, alignments=alignments, highlight_col_indices={3})
             if cri.get("confidence", 100) < 50:
                 ws.cell(row=row_start, column=3).fill = LOW_CONF_FILL
-        avg_conf = breakdown.get("average_confidence_pct", "")
+        avg_conf = analysis.get("average_criteria_confidence_pct") or breakdown.get("average_confidence_pct", "")
         r = _row(
             ws, r,
             ["OVERALL SEMANTIC ALIGNMENT", analysis.get("overall_semantic_alignment", 0),

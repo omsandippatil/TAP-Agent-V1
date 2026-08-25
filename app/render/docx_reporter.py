@@ -53,6 +53,7 @@ SOURCE_LABELS = {
 
 UNSCORED_GREY = RGBColor(0x9C, 0xA3, 0xA3)
 UNSCORED_GREY_HEX = "9CA3A3"
+COVERAGE_BANNER_HEX = "8A6200"
 
 
 def fit_hex(score):
@@ -95,6 +96,16 @@ def fit_label(score):
     if score >= 45:
         return "WATCHLIST"
     return "LOW FIT"
+
+
+def is_unscored(result: dict, tier: dict) -> bool:
+    if result.get("fit_score") is None:
+        return True
+    if result.get("evidence_coverage_insufficient"):
+        return True
+    if (tier or {}).get("key") == "UNSCORED":
+        return True
+    return False
 
 
 TC_PR_CHILD_ORDER = ("cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd", "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign", "hideMark", "cellIns", "cellDel", "cellMerge", "tcPrChange")
@@ -437,8 +448,32 @@ def merge_decision_makers(result: dict) -> list:
     return merged
 
 
+def add_coverage_banner(doc, result: dict):
+    banner_table = doc.add_table(rows=1, cols=1)
+    banner_table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    no_table_borders(banner_table)
+    cell = banner_table.rows[0].cells[0]
+    shade_cell(cell, YELLOW_SOFT_HEX)
+    set_cell_margins(cell, top=140, bottom=140, left=180, right=180)
+    paragraph = cell.paragraphs[0]
+    paragraph.paragraph_format.space_after = Pt(0)
+    title_run = paragraph.add_run("\u26a0 EVIDENCE COVERAGE TOO LOW TO SCORE CONFIDENTLY")
+    title_run.font.name = FONT_NAME
+    title_run.bold = True
+    title_run.font.size = Pt(10)
+    title_run.font.color.rgb = RGBColor(0x8A, 0x62, 0x00)
+    detail_paragraph = cell.add_paragraph()
+    detail_paragraph.paragraph_format.space_after = Pt(0)
+    detail_run = detail_paragraph.add_run(
+        "A fit score has been withheld for this company. See Executive Summary for detail on what was and wasn't found.")
+    detail_run.font.name = FONT_NAME
+    detail_run.font.size = Pt(9)
+    detail_run.font.color.rgb = RGBColor(0x8A, 0x62, 0x00)
+    return banner_table
+
+
 async def generate_docx_report(company: str, result: dict, mode: str = "deep") -> bytes:
-    fit_score = result.get("fit_score", 0)
+    fit_score = result.get("fit_score")
     state = result.get("state", "")
     insight = result.get("strategic_insight", "")
     analysis = result.get("analysis") or {}
@@ -449,6 +484,7 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     important_links = result.get("important_links", []) or []
     tier = result.get("scoring_tier", {}) or {}
     has_analysis = bool(analysis)
+    coverage_insufficient = is_unscored(result, tier)
     generated_on = datetime.datetime.now().strftime("%d %B %Y")
 
     doc = Document()
@@ -510,6 +546,9 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     subtitle_run.font.size = Pt(8.5)
     subtitle_run.font.color.rgb = RGBColor(0xB8, 0xE3, 0xE0)
 
+    if coverage_insufficient:
+        add_coverage_banner(doc, result)
+
     add_section_heading(doc, "Executive summary")
     summary_table = doc.add_table(rows=1, cols=2)
     summary_table.alignment = WD_TABLE_ALIGNMENT.LEFT
@@ -568,12 +607,13 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
 
     add_section_heading(doc, "Semantic alignment & authenticity")
     if has_analysis:
+        avg_confidence = analysis.get("average_criteria_confidence_pct") or breakdown.get("average_confidence_pct", 0)
         metrics_paragraph = doc.add_paragraph()
         metrics_paragraph.paragraph_format.space_after = Pt(6)
         metrics_run = metrics_paragraph.add_run(
             f"Semantic alignment: {analysis.get('overall_semantic_alignment', 0)}/100    ·    "
             f"Evidence authenticity: {analysis.get('overall_authenticity_score', 0)}/100    ·    "
-            f"Avg criteria confidence: {breakdown.get('average_confidence_pct', 0)}%"
+            f"Avg criteria confidence: {avg_confidence}%"
         )
         metrics_run.font.name = FONT_NAME
         metrics_run.bold = True

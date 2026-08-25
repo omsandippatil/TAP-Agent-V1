@@ -302,6 +302,18 @@ SOURCE_INTEGRITY_RULE = (
     "programme."
 )
 
+ENTITY_DISAMBIGUATION_RULE = (
+    "ENTITY DISAMBIGUATION: some companies operate through more than one distinct legal "
+    "vehicle for CSR — e.g. a direct India branch/subsidiary AND a separately-named "
+    "foundation (such as 'UBS AG Mumbai Branch' vs 'UBS Optimus Foundation'). These are "
+    "related but not interchangeable funding channels. If the evidence names more than one "
+    "such entity, do not silently merge them into one undifferentiated profile: for every "
+    "programme, partner, and spend figure, note in its source_excerpt or description which "
+    "specific named entity the evidence actually attributes it to, whenever the evidence makes "
+    "that clear. If the evidence is ambiguous about which entity is responsible, say so rather "
+    "than assuming they are the same organisation."
+)
+
 DECISION_MAKER_RULE = (
     "DECISION-MAKERS — RELEVANCE FILTER (feedback priority, check this carefully): only include "
     "a person if their TITLE or the EVIDENCE CONTEXT around their name specifically ties them to "
@@ -387,6 +399,8 @@ SOURCES:
 {GEOGRAPHY_RULE}
 
 {SOURCE_INTEGRITY_RULE}
+
+{ENTITY_DISAMBIGUATION_RULE}
 
 {EVIDENCE_STYLE_RULE}
 
@@ -926,6 +940,26 @@ def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode:
     return final_score
 
 
+LOW_COVERAGE_AUTHENTICITY_THRESHOLD = 30
+LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD = 35
+
+
+def average_criteria_confidence(criteria: list[dict]) -> float:
+    if not criteria:
+        return 0.0
+    return sum(c.get("confidence", 0) for c in criteria) / len(criteria)
+
+
+def evidence_coverage_is_too_low(criteria: list[dict], authenticity_score: int) -> bool:
+    if not criteria:
+        return True
+    avg_confidence = average_criteria_confidence(criteria)
+    return (
+        authenticity_score < LOW_COVERAGE_AUTHENTICITY_THRESHOLD
+        or avg_confidence < LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD
+    )
+
+
 def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
     parsed = dict(parsed) if isinstance(parsed, dict) else {}
 
@@ -1335,6 +1369,13 @@ async def analyze_and_score_company(
     validated = _repair_analysis(merged)
     result = validated.model_dump()
 
+    result["evidence_coverage_insufficient"] = evidence_coverage_is_too_low(
+        result["criteria"], result["overall_authenticity_score"]
+    )
+    result["average_criteria_confidence_pct"] = round(
+        average_criteria_confidence(result["criteria"]), 1
+    )
+
     model_reported_score = result["fit_score"]
     result["fit_score"] = compute_final_fit_score(
         criteria=result["criteria"],
@@ -1350,8 +1391,9 @@ async def analyze_and_score_company(
 
     logger.info(
         "analyze_and_score_company DONE company=%r mode=%s model_reported_fit_score=%d final_fit_score=%d "
-        "authenticity=%d partners=%d programmes=%d decision_makers=%d",
+        "authenticity=%d avg_criteria_confidence=%.1f coverage_insufficient=%s partners=%d programmes=%d decision_makers=%d",
         company, mode, model_reported_score, result["fit_score"], result["overall_authenticity_score"],
+        result["average_criteria_confidence_pct"], result["evidence_coverage_insufficient"],
         len(result["partners"]), len(result["programmes"]), len(result["decision_makers"]),
     )
     logger.info(

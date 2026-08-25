@@ -244,7 +244,8 @@ PARTNER_QUERIES = [
     '"{c}" CSR NGO partner India',
 ]
 
-MAX_PARTNER_SOURCES = 4
+MAX_PARTNER_SOURCES = 6
+MAX_PROGRAMME_SOURCES = 4
 
 PLAN_QUERIES = [
     '"{c}" CSR "partnered with" OR "partnership with" education India announced',
@@ -268,6 +269,8 @@ EDUCATION_PROGRAMME_QUERIES = [
     '"{c}" CSR "digital literacy" OR STEM OR coding OR skilling India students',
     '"{c}" "21st century skills" OR "21st-century skills" India CSR',
     '"{c}" CSR education programme India',
+    '"{c}" "development impact bond" OR "outcomes fund" education India',
+    '"{c}" education programme "in partnership with" OR "delivered by" OR "implemented by" India',
 ]
 
 SECTOR_QUERIES = [
@@ -415,6 +418,27 @@ def mentions_company(company: str, text: str) -> bool:
     if not tokens:
         return company.lower() in lowered
     return any(token in lowered for token in tokens)
+
+
+_ENTITY_PROXIMITY_WINDOW_CHARS = 60
+
+
+def mentions_company_specifically(company: str, text: str) -> bool:
+    if not text:
+        return False
+    tokens = company_name_tokens(company)
+    if len(tokens) < 2:
+        return mentions_company(company, text)
+
+    lowered = text.lower()
+    positions = sorted(
+        match.start()
+        for token in tokens
+        for match in re.finditer(re.escape(token), lowered)
+    )
+    if len(positions) < 2:
+        return mentions_company(company, text)
+    return any(b - a < _ENTITY_PROXIMITY_WINDOW_CHARS for a, b in zip(positions, positions[1:]))
 
 
 def candidate_domains(company: str) -> list[str]:
@@ -1423,7 +1447,7 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
             body = result.get("body", "")
             if not url or url in seen_urls:
                 continue
-            if not mentions_company(company, f"{title} {body}"):
+            if not mentions_company_specifically(company, f"{title} {body}"):
                 continue
 
             if "linkedin.com" in url:
@@ -1482,12 +1506,13 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
     if job_deadline is not None:
         deadline = min(deadline, job_deadline)
-    best_candidate = None
+
+    candidates: list[tuple[float, str, str]] = []
+    seen_urls: set[str] = set()
     urls_tried = 0
+
     for template in EDUCATION_PROGRAMME_QUERIES:
         if not await _within_deadline(deadline):
-            break
-        if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
             break
         query = template.format(c=company)
         results = await search_web(
@@ -1500,10 +1525,11 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
             url = result.get("href", "")
             title = result.get("title", "")
             body = result.get("body", "")
-            if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
+            if not url or url in seen_urls or any(domain in url for domain in AGGREGATOR_DOMAINS):
                 continue
             if not mentions_company(company, f"{title} {body}"):
                 continue
+            seen_urls.add(url)
             urls_tried += 1
             is_pdf = url.lower().endswith(".pdf")
             text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
@@ -1512,22 +1538,36 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
             if "education" not in text.lower() and not any(kw in text.lower() for kw in EDUCATION_KEYWORDS):
                 continue
             score = score_candidate_text(company, text, url) + 5.0
-            if best_candidate is None or score > best_candidate[0]:
-                best_candidate = (score, make_source("education_programme_search", 9, url, text, "FOUND", "search"))
-            if best_candidate and best_candidate[0] >= MIN_ACCEPT_SCORE:
-                break
+            candidates.append((score, url, text))
+
+        if len(candidates) >= MAX_PROGRAMME_SOURCES * 2:
+            break
 
     logger.info(
-        "education_programme_search DONE company=%r urls_tried=%d found=%s",
-        company, urls_tried, bool(best_candidate),
+        "education_programme_search DONE company=%r urls_tried=%d candidates_found=%d",
+        company, urls_tried, len(candidates),
     )
 
-    if best_candidate:
-        if registry is not None:
-            registry.register_core_source(best_candidate[1])
-        return best_candidate[1]
+    if not candidates:
+        return make_source("education_programme_search", 9, status="NOT_FOUND")
 
-    return make_source("education_programme_search", 9, status="NOT_FOUND")
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    top = candidates[:MAX_PROGRAMME_SOURCES]
+    combined_text = "\n\n---\n\n".join(f"[{url}]\n{text[:2500]}" for _, url, text in top)
+    primary_url = top[0][1]
+    source = make_source(
+        "education_programme_search", 9, primary_url, clean_text(combined_text, 8000), "FOUND", "search"
+    )
+
+    if registry is not None:
+        registry.register_core_source(source)
+        for _, url, text in top[1:]:
+            registry.register_child_hit(
+                source_name="education_programme_search", url=url,
+                label="Programme search result", excerpt=text[:200],
+            )
+
+    return source
 
 
 async def _run_linkedin_query_batch(company: str, queries: list[str], search_cfg: dict, budget: SearchBudget,
@@ -1578,6 +1618,8 @@ async def fetch_linkedin_people(company: str, search_cfg: dict, budget: SearchBu
             return False
         parsed = parse_linkedin_hit(raw_title, snippet, url, company)
         if not parsed["name"] or not parsed["has_csr_signal"]:
+            return False
+        if not mentions_company_specifically(company, f"{raw_title} {snippet}"):
             return False
         seen_urls.add(url)
         if registry is not None:
