@@ -298,7 +298,9 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         sources, llm.evidence_token_budget(company, mission, sources_manifest)
     )
 
-    analysis = await llm.analyze_and_score_company(company, mission, cleaned_sources, sources_manifest)
+    analysis = await llm.analyze_and_score_company(
+        company, mission, cleaned_sources, sources_manifest, mode=mode, cfg=cfg,
+    )
 
     if not analysis:
         cooldown_remaining = llm.anthropic_cooldown_remaining_seconds()
@@ -360,6 +362,11 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
 
     valid_numbers = {entry["number"] for entry in registry.entries()}
     insight = strip_unknown_citation_tokens(analysis.get("strategic_insight", ""), valid_numbers)
+
+    underspend_signal = analysis.get("csr_underspend_signal") or {}
+    if underspend_signal.get("present") and underspend_signal.get("explanation"):
+        insight = f"{insight} {underspend_signal['explanation']}"
+
     if existing_partner:
         insight = _existing_partner_prefix(
             company, "This score reflects that established relationship."
