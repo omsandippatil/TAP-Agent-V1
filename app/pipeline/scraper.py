@@ -227,6 +227,20 @@ ANNUAL_REPORT_QUERIES = [
     '"{c}" annual report CSR India filetype:pdf',
 ]
 
+MULTI_YEAR_FINANCIAL_QUERIES = [
+    '"{c}" "net profit" OR "profit after tax" {fy1} {fy2} {fy3} crore annual report',
+    '"{c}" CSR expenditure {fy1} {fy2} {fy3} crore comparison',
+    '"{c}" "3 year average net profit" OR "average net profit" CSR India',
+]
+
+FY_YEAR_TOKEN_PATTERN = re.compile(r"FY\s?20?\d{2}[-–]\d{2,4}|20\d{2}[-–]\d{2,4}", re.IGNORECASE)
+
+
+def count_distinct_year_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return len({m.group(0).upper().replace(" ", "") for m in FY_YEAR_TOKEN_PATTERN.finditer(text)})
+
 ANNUAL_REPORT_ENTITY_QUERIES = [
     '"{legal_name}" "annual report" {fy} CSR crore filetype:pdf',
 ]
@@ -1419,6 +1433,77 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
     return make_source("annual_report", 4, status="NOT_FOUND")
 
 
+async def fetch_multi_year_financials(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
+                                       registry: SourceRegistry | None = None, job_deadline: float | None = None,
+                                       annual_report_source: dict | None = None) -> dict:
+    await _check_job_deadline(job_deadline)
+    deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+    if job_deadline is not None:
+        deadline = min(deadline, job_deadline)
+
+    annual_report_years = count_distinct_year_tokens((annual_report_source or {}).get("text", ""))
+    if annual_report_years >= 2:
+        logger.info(
+            "multi_year_financials skipped company=%r reason=annual_report_already_multi_year years=%d",
+            company, annual_report_years,
+        )
+        return make_source("multi_year_financials", 10, status="NOT_TRIED")
+
+    fy1, fy2, fy3 = CURRENT_FY_LABEL, PRIOR_FY_LABELS[0], PRIOR_FY_LABELS[1]
+    best_candidate = None
+
+    for template in MULTI_YEAR_FINANCIAL_QUERIES:
+        if not await _within_deadline(deadline):
+            break
+        query = template.format(c=company, fy1=fy1, fy2=fy2, fy3=fy3)
+        results = await search_web(
+            query, budget, max_results=8,
+            prefer_google=search_cfg.get("annual_reports", True), quota_guard=quota_guard,
+            category="multi_year_financials",
+        )
+        for result in results:
+            if not await _within_deadline(deadline):
+                break
+            url = result.get("href", "")
+            title = result.get("title", "")
+            body = result.get("body", "")
+            if not url or not mentions_company(company, f"{title} {body}"):
+                continue
+            if url.lower().endswith(".pdf"):
+                text = await fetch_pdf_text(url)
+                if text and not pdf_is_csr_relevant(text):
+                    continue
+            else:
+                text = await fetch_page_text(url) or body
+            if not (text and len(text) > 200 and mentions_company(company, text)):
+                continue
+            if count_financial_figures(text) < 2:
+                continue
+            year_tokens = count_distinct_year_tokens(text)
+            score = score_candidate_text(company, text, url)
+            candidate = (year_tokens, score, make_source("multi_year_financials", 10, url, text, "FOUND", "search"))
+            if best_candidate is None:
+                best_candidate = candidate
+            elif year_tokens >= 2 and best_candidate[0] < 2:
+                best_candidate = candidate
+            elif (year_tokens >= 2) == (best_candidate[0] >= 2) and score > best_candidate[1]:
+                best_candidate = candidate
+        if best_candidate and best_candidate[0] >= 2:
+            break
+
+    if best_candidate:
+        chosen = best_candidate[2]
+        logger.info(
+            "multi_year_financials DONE company=%r year_tokens=%d score=%.1f",
+            company, best_candidate[0], best_candidate[1],
+        )
+        if registry is not None:
+            registry.register_core_source(chosen)
+        return chosen
+
+    return make_source("multi_year_financials", 10, status="NOT_FOUND")
+
+
 _PARTNER_RELEVANCE_KEYWORD_PATTERN = re.compile(
     r"\b(partner|partnered|partnership|ngo|foundation|mou|memorandum|collaborat|"
     r"implement|grant|csr)\b", re.IGNORECASE,
@@ -1834,6 +1919,7 @@ async def fetch_screen_sources(company: str, search_cfg: dict, quota_guard=None,
 
     source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry)
     source_4 = await fetch_annual_report(company, search_cfg, budget, quota_guard, registry=registry)
+    source_10 = await fetch_multi_year_financials(company, search_cfg, budget, quota_guard, registry=registry, annual_report_source=source_4)
     source_2 = await fetch_mca_portal(company, search_cfg, budget, quota_guard, registry=registry)
     source_5 = await fetch_partner_source(company, search_cfg, budget, quota_guard, registry=registry)
     source_6 = await fetch_linkedin_people(company, search_cfg, budget, quota_guard, registry=registry)
@@ -1843,10 +1929,10 @@ async def fetch_screen_sources(company: str, search_cfg: dict, quota_guard=None,
     source_7 = make_source("plans_search", 7, status="NOT_TRIED")
     source_8 = make_source("sector_eligibility_search", 8, status="NOT_TRIED")
 
-    sources = [source_1, source_2, source_3, source_4, source_5, source_6, source_7, source_8, source_9]
+    sources = [source_1, source_2, source_3, source_4, source_5, source_6, source_7, source_8, source_9, source_10]
     found_count = sum(1 for s in sources if s.get("status") == "FOUND")
     logger.info(
-        "fetch_screen_sources DONE company=%r found=%d/9 google_used=%d ddgs_used=%d",
+        "fetch_screen_sources DONE company=%r found=%d/10 google_used=%d ddgs_used=%d",
         company, found_count, budget.google_queries_used, budget.ddgs_queries_used,
     )
     return sources
@@ -1866,18 +1952,19 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
             await progress_cb(message)
 
     try:
-        await advance_step("Sources 1-4/9 — CSR page, MCA, National CSR Portal, annual report...")
+        await advance_step("Sources 1-4/10 — CSR page, MCA, National CSR Portal, annual report...")
         source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_2 = await fetch_mca_portal(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_3 = await fetch_national_csr_portal(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_4 = await fetch_annual_report(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        source_10 = await fetch_multi_year_financials(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline, annual_report_source=source_4)
         logger.info(
-            "deep sources 1-4 company=%r csr_page=%s mca=%s national=%s annual=%s google_used=%d ddgs_used=%d",
+            "deep sources 1-4,10 company=%r csr_page=%s mca=%s national=%s annual=%s multi_year=%s google_used=%d ddgs_used=%d",
             company, source_1.get("status"), source_2.get("status"), source_3.get("status"), source_4.get("status"),
-            budget.google_queries_used, budget.ddgs_queries_used,
+            source_10.get("status"), budget.google_queries_used, budget.ddgs_queries_used,
         )
 
-        await advance_step("Sources 5-9/9 — partners, decision-makers, plans, sector, education programmes...")
+        await advance_step("Sources 5-9/10 — partners, decision-makers, plans, sector, education programmes...")
         source_5 = await fetch_partner_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_6 = await fetch_linkedin_people(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_7 = await fetch_plans_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
@@ -1895,8 +1982,9 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
         source_7 = existing.get("source_7") or not_tried("plans_search", 7)
         source_8 = existing.get("source_8") or not_tried("sector_eligibility_search", 8)
         source_9 = existing.get("source_9") or not_tried("education_programme_search", 9)
+        source_10 = existing.get("source_10") or not_tried("multi_year_financials", 10)
 
-    sources = [source_1, source_2, source_3, source_4, source_5, source_6, source_7, source_8, source_9]
+    sources = [source_1, source_2, source_3, source_4, source_5, source_6, source_7, source_8, source_9, source_10]
 
     total_figures = sum(count_financial_figures(s.get("text", "")) for s in sources)
     if total_figures == 0 and budget.google_has_budget("csr_budget") and time.monotonic() < job_deadline:
@@ -1936,7 +2024,7 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
 
     found_count = sum(1 for s in sources if s.get("status") == "FOUND")
     logger.info(
-        "fetch_deep_sources DONE company=%r found=%d/9 total_financial_figures=%d source_bank_entries=%d "
+        "fetch_deep_sources DONE company=%r found=%d/10 total_financial_figures=%d source_bank_entries=%d "
         "google_used=%d ddgs_used=%d",
         company, found_count, sum(count_financial_figures(s.get("text", "")) for s in sources),
         len(registry.entries()), budget.google_queries_used, budget.ddgs_queries_used,

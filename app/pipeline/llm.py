@@ -447,7 +447,7 @@ Extract, matching the JSON shape's key order exactly:
 19. red_flags[] — genuine contradictions or marketing-not-substance signals, severity low/medium/high. Missing/undocumented details are NOT red flags.
 20. contact_pathway — the single most concrete real channel; "Not identified" if nothing exists.
 
-7b. eligibility.net_profit_history — apply the PROFIT HISTORY rule; this feeds a downstream statutory-obligation calculation, so profit-figure recall matters as much as spend-figure recall.
+7b. eligibility.net_profit_history — apply the PROFIT HISTORY rule; this feeds a downstream statutory-obligation calculation, so profit-figure recall matters as much as spend-figure recall. Source 10 (multi_year_financials), when present, is specifically curated to contain side-by-side year figures — check it first for profit_history and spend.history.
 
 Reply with ONE JSON object, nothing else, no markdown fences.
 
@@ -477,9 +477,21 @@ JSON shape:
 }}"""
 
 
-def _scoring_prompt(company: str, mission: str, mode: str, extraction: dict, sources_manifest: str) -> str:
+def _scoring_prompt(company: str, mission: str, mode: str, extraction: dict, sources_manifest: str,
+                     csr_obligation: dict | None = None) -> str:
     calibration = _mode_calibration(mode)
     extraction_json = json.dumps(extraction, ensure_ascii=False, indent=2)
+
+    obligation_block = ""
+    if csr_obligation and csr_obligation.get("computable"):
+        obligation_block = f"""
+CSR OBLIGATION SIGNAL (pre-computed, do not recalculate — just weave into narrative if relevant):
+{json.dumps(csr_obligation, ensure_ascii=False)}
+A company with latest_year_underspending=true has compelled, unplaced CSR funds — mention this
+explicitly and favorably in strategic_insight if present, as it is a stronger warmth signal than
+profitability alone. Do not fabricate this signal if computable=false.
+"""
+
     return f"""You are a careful, fair-minded CSR partnerships analyst judging whether {company} is a good funding/partnership fit for an Indian education NGO. A separate extraction pass already pulled every fact below from the fetched evidence — do not re-extract or add new facts, only score against what's here and write the narrative fields.
 
 {calibration['stance']}
@@ -493,7 +505,7 @@ EXTRACTED FACTS FOR {company} (already verified against evidence — numbered so
 
 SOURCES:
 {sources_manifest}
-
+{obligation_block}
 {SCORING_PHILOSOPHY}
 
 {SCORING_CONSISTENCY_RULE}
@@ -506,7 +518,7 @@ Produce, in this order:
 2. fit_score (int 0-100) — compute this yourself as the weighted average of the criteria scores you just wrote (score/5 × weight for each, summed across all 17). Do this arithmetically from your own criteria, not as a separate holistic guess, so it matches what the system independently computes from the same criteria.
 3. fit_rationale (2-4 sentences): justify the scoring from the extracted facts, stating plainly what's confirmed vs inferred vs undocumented. If a named partner/programme suggests a plausible but unconfirmed entry path, you may add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme — never invent one not in the extracted facts. If decision_makers and/or partners/programmes are non-empty, end with one short sentence "Key contacts: A (Title), B (Title); Key partners: X, Y" using only names from the extracted facts. Omit that closing sentence if both lists are empty.
 4. overall_semantic_alignment (0-100) + alignment_rationale (1-2 sentences) — how well the company's actual activity matches the NGO mission semantically, independent of documentation completeness.
-5. strategic_insight — a 150-280 word standalone narrative (this is the lead summary shown to the user first, and should read as usable outreach material, not just an internal note): measured and evidence-grounded, leading with genuine strengths before caveats, stating plainly whether/why this is a good fit, naming strongest/weakest dimensions without dwelling on the weakest, flagging group-foundation routing if present, noting eligibility if uncertain, and giving one concrete next step. When spend is discussed, lead with the education-specific figure/trend over the total CSR figure if both are available. When a specific programme or partner is TAP-relevant, name its delivery channel explicitly (in-school/curriculum vs adult/standalone vs digital, etc.) and state concretely how TAP's own model (AI-enabled WhatsApp delivery, government-school, curriculum-embedded electives) does or doesn't overlap with it — write this so a sentence could be lifted directly into an outreach email, rather than a generic theme match like "both work in education." If TAP-similar partners exist, mention that positively. {"Since this is a screen-mode pass, if the signal is promising but sourcing is thin, say plainly that a deep-research pass would surface more (spend figures, named partners, a decision-maker) rather than treating the gap as a weakness." if mode == "screen" else ""} End with the same "Key contacts: ...; Key partners: ..." sentence format as fit_rationale (only using names from the extracted facts), omitted if both lists are empty.
+5. strategic_insight — a 150-280 word standalone narrative (this is the lead summary shown to the user first, and should read as usable outreach material, not just an internal note): measured and evidence-grounded, leading with genuine strengths before caveats, stating plainly whether/why this is a good fit, naming strongest/weakest dimensions without dwelling on the weakest, flagging group-foundation routing if present, noting eligibility if uncertain, weaving in the CSR obligation signal above if present, and giving one concrete next step. When spend is discussed, lead with the education-specific figure/trend over the total CSR figure if both are available. When a specific programme or partner is TAP-relevant, name its delivery channel explicitly (in-school/curriculum vs adult/standalone vs digital, etc.) and state concretely how TAP's own model (AI-enabled WhatsApp delivery, government-school, curriculum-embedded electives) does or doesn't overlap with it — write this so a sentence could be lifted directly into an outreach email, rather than a generic theme match like "both work in education." If TAP-similar partners exist, mention that positively. {"Since this is a screen-mode pass, if the signal is promising but sourcing is thin, say plainly that a deep-research pass would surface more (spend figures, named partners, a decision-maker) rather than treating the gap as a weakness." if mode == "screen" else ""} End with the same "Key contacts: ...; Key partners: ..." sentence format as fit_rationale (only using names from the extracted facts), omitted if both lists are empty.
 
 All criteria ids appear exactly once, in the order listed, each with its name copied exactly as given above. Keep every string concise so the full reply fits comfortably in your output budget.
 
@@ -1070,10 +1082,14 @@ def _apply_authenticity_ceiling(fit_score: float, authenticity_score: int, mode:
 
 
 def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode: str,
-                             model_reported_score: int | None = None) -> int:
+                             model_reported_score: int | None = None, company: str = "") -> int:
     weighted = _compute_weighted_fit_score(criteria)
     calibrated = _apply_authenticity_ceiling(weighted, authenticity_score, mode)
     final_score = int(round(max(0.0, min(100.0, calibrated))))
+    logger.info(
+        "mode_comparison_debug company=%r mode=%s weighted_pre_ceiling=%.1f ceiling_applied=%s final=%d",
+        company, mode, weighted, calibrated != weighted, final_score,
+    )
     if model_reported_score is not None:
         drift = abs(model_reported_score - weighted)
         if drift > 15:
@@ -1481,13 +1497,14 @@ async def score_extracted_facts(
     extraction: dict,
     sources_manifest: str,
     cfg: dict | None = None,
+    csr_obligation: dict | None = None,
 ) -> dict | None:
     scoring_facts = {
         k: v for k, v in extraction.items()
         if k not in ("open_questions", "key_facts_summary", "overall_authenticity_score",
                       "evidence_recency", "source_quality_assessment", "csr_head_note")
     }
-    prompt = _scoring_prompt(company, mission, mode, scoring_facts, sources_manifest)
+    prompt = _scoring_prompt(company, mission, mode, scoring_facts, sources_manifest, csr_obligation=csr_obligation)
     prompt_tokens = estimate_tokens(prompt)
     output_ceiling = _anthropic_context_window() - SCORING_OUTPUT_TOKEN_RESERVE
 
@@ -1496,7 +1513,7 @@ async def score_extracted_facts(
         for list_field in ("programmes", "partners", "decision_makers", "geographies", "red_flags"):
             if trimmed_facts.get(list_field):
                 trimmed_facts[list_field] = trimmed_facts[list_field][:5]
-        prompt = _scoring_prompt(company, mission, mode, trimmed_facts, sources_manifest)
+        prompt = _scoring_prompt(company, mission, mode, trimmed_facts, sources_manifest, csr_obligation=csr_obligation)
         prompt_tokens = estimate_tokens(prompt)
 
     if prompt_tokens > output_ceiling:
@@ -1540,7 +1557,13 @@ async def analyze_and_score_company(
     if not extraction:
         return None
 
-    scoring = await score_extracted_facts(company, mission, mode, extraction, sources_manifest, cfg=cfg)
+    csr_obligation_signal = compute_csr_obligation_signal(
+        extraction.get("eligibility", {}), extraction.get("spend", {})
+    )
+
+    scoring = await score_extracted_facts(
+        company, mission, mode, extraction, sources_manifest, cfg=cfg, csr_obligation=csr_obligation_signal,
+    )
     if not scoring:
         logger.error(
             "analyze_and_score_company scoring pass failed after successful extraction, "
@@ -1562,9 +1585,7 @@ async def analyze_and_score_company(
     validated = _repair_analysis(merged)
     result = validated.model_dump()
 
-    result["csr_obligation_signal"] = compute_csr_obligation_signal(
-        result.get("eligibility", {}), result.get("spend", {})
-    )
+    result["csr_obligation_signal"] = csr_obligation_signal
 
     coverage_insufficient, coverage_reason = evidence_coverage_is_too_low(
         result["criteria"], result["overall_authenticity_score"]
@@ -1578,12 +1599,20 @@ async def analyze_and_score_company(
         weighted_average_criteria_confidence(result["criteria"]), 1
     )
 
+    if coverage_insufficient:
+        result["fit_score_display_mode"] = "insufficient_evidence"
+        result["fit_score_label"] = "Insufficient evidence to score confidently"
+    else:
+        result["fit_score_display_mode"] = "scored"
+        result["fit_score_label"] = ""
+
     model_reported_score = result["fit_score"]
     result["fit_score"] = compute_final_fit_score(
         criteria=result["criteria"],
         authenticity_score=result["overall_authenticity_score"],
         mode=mode,
         model_reported_score=model_reported_score,
+        company=company,
     )
 
     if not result.get("strategic_insight", "").strip():

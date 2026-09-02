@@ -329,8 +329,9 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         weighted_conf = analysis.get("weighted_criteria_confidence_pct", avg_conf)
         authenticity = analysis.get("overall_authenticity_score", 0)
         reason_clause = coverage_reason or "coverage was too thin to score fit confidently."
+        label = analysis.get("fit_score_label") or "Insufficient evidence to score confidently"
         insight = (
-            f"Evidence coverage for {company} was too thin to score fit confidently: "
+            f"{label} for {company}: "
             f"{reason_clause} (weighted criteria confidence: {weighted_conf:.0f}%, source "
             f"authenticity: {authenticity}%). This means the research pass did not retrieve "
             f"enough public evidence to judge fit either way — it is **not** a Low Fit "
