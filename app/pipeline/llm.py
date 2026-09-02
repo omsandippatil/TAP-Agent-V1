@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 import typing
 
 import httpx
@@ -28,6 +29,10 @@ MIN_PROMPT_TRIM_CHARS = 150
 MAX_PROMPT_SHRINK_ATTEMPTS = 6
 PROMPT_SHRINK_SAFETY_MARGIN = 120
 DEFAULT_ANTHROPIC_CONTEXT_WINDOW = 200000
+
+ANTHROPIC_DEFAULT_COOLDOWN_SECONDS = 60.0
+
+_anthropic_cooldown_until = 0.0
 
 EXTRACTION_PRIORITY_KEYS = [
     "overall_authenticity_score",
@@ -720,9 +725,18 @@ async def call_anthropic_chat(
         return None
 
     if response.status_code == 429:
+        retry_after_header = response.headers.get("retry-after", "")
+        try:
+            retry_after_seconds = float(retry_after_header)
+        except (TypeError, ValueError):
+            retry_after_seconds = ANTHROPIC_DEFAULT_COOLDOWN_SECONDS
+        global _anthropic_cooldown_until
+        _anthropic_cooldown_until = max(
+            _anthropic_cooldown_until, time.monotonic() + max(0.0, retry_after_seconds)
+        )
         logger.warning(
-            "anthropic 429 caller=%s retry_after=%s body=%s",
-            caller, response.headers.get("retry-after", "unknown"), response.text[:200],
+            "anthropic 429 caller=%s retry_after=%s cooldown_until_monotonic=%.1f body=%s",
+            caller, retry_after_header or "unknown", _anthropic_cooldown_until, response.text[:200],
         )
         return None
 
@@ -1153,7 +1167,7 @@ def _sanitize_source(value: str, valid_sources: set[str]) -> str:
 
 
 def anthropic_cooldown_remaining_seconds() -> float:
-    return 0.0
+    return max(0.0, _anthropic_cooldown_until - time.monotonic())
 
 
 def evidence_token_budget(company: str, mission: str, sources_manifest: str) -> int:

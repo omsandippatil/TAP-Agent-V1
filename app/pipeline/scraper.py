@@ -47,27 +47,31 @@ BLOCKED_403_DOMAINS = (
 _DYNAMIC_BLOCKED_DOMAINS: dict[str, int] = {}
 _DYNAMIC_BLOCK_THRESHOLD = 3
 
-_GOOGLE_CSE_BROKEN = False
+GOOGLE_CSE_BROKEN_COOLDOWN_SECONDS = 900
+
+_GOOGLE_CSE_BROKEN_UNTIL = 0.0
 _GOOGLE_CSE_BROKEN_LOCK = asyncio.Lock()
 
 
 def _mark_google_cse_broken(reason: str) -> None:
-    global _GOOGLE_CSE_BROKEN
-    if not _GOOGLE_CSE_BROKEN:
-        _GOOGLE_CSE_BROKEN = True
+    global _GOOGLE_CSE_BROKEN_UNTIL
+    already_broken = time.monotonic() < _GOOGLE_CSE_BROKEN_UNTIL
+    _GOOGLE_CSE_BROKEN_UNTIL = time.monotonic() + GOOGLE_CSE_BROKEN_COOLDOWN_SECONDS
+    if not already_broken:
         logger.error(
-            "google CSE marked broken for rest of process, all further google calls will be skipped reason=%s",
-            reason,
+            "google CSE marked broken for %ds cooldown, all further google calls will be skipped "
+            "until then reason=%s",
+            GOOGLE_CSE_BROKEN_COOLDOWN_SECONDS, reason,
         )
 
 
 def google_cse_is_broken() -> bool:
-    return _GOOGLE_CSE_BROKEN
+    return time.monotonic() < _GOOGLE_CSE_BROKEN_UNTIL
 
 
 def reset_google_cse_broken_flag_for_tests() -> None:
-    global _GOOGLE_CSE_BROKEN
-    _GOOGLE_CSE_BROKEN = False
+    global _GOOGLE_CSE_BROKEN_UNTIL
+    _GOOGLE_CSE_BROKEN_UNTIL = 0.0
 
 
 OFFICIAL_GOV_DOMAINS = (

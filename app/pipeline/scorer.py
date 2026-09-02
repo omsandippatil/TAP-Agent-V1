@@ -259,14 +259,14 @@ def _existing_partner_prefix(company: str, note: str) -> str:
 
 
 async def score(company: str, sources: list, cfg: dict, quota_guard=None,
-                 registry: SourceRegistry | None = None) -> dict:
+                 registry: SourceRegistry | None = None, mode: str = "deep") -> dict:
     registry = registry or SourceRegistry(company)
     for source in sources:
         if source.get("status") == "FOUND" and not source.get("source_number"):
             registry.register_core_source(source)
 
     state = determine_state(sources)
-    logger.info("score START company=%r state=%s source_bank_size=%d", company, state, len(registry.entries()))
+    logger.info("score START company=%r mode=%r state=%s source_bank_size=%d", company, mode, state, len(registry.entries()))
 
     existing_partner = is_existing_tap_partner(company, cfg)
     source_links = build_source_links(sources)
@@ -289,7 +289,7 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
                 company, "No public CSR evidence surfaced in this run, but this must never be "
                 "read as 'Not a Target' — follow up internally rather than deprioritising."
             ) + insight
-        logger.info("score UNSCORED company=%r reason=no_sources_found no_anthropic_call", company)
+        logger.info("score UNSCORED company=%r mode=%r reason=no_sources_found no_anthropic_call", company, mode)
         return _unscored_result(state, insight, sources, source_links, logo_url, registry, existing_partner)
 
     cleaned_sources = clean_and_budget_sources(
@@ -316,7 +316,7 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
                 company, "Scoring could not run this time, but this must never be read as "
                 "'Not a Target'."
             ) + insight
-        logger.warning("score UNSCORED company=%r reason=analysis_call_failed", company)
+        logger.warning("score UNSCORED company=%r mode=%r reason=analysis_call_failed", company, mode)
         return _unscored_result(state, insight, sources, source_links, logo_url, registry, existing_partner)
 
     if analysis.get("evidence_coverage_insufficient"):
@@ -336,9 +336,9 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
                 "run, but this must never be read as 'Not a Target'."
             ) + insight
         logger.warning(
-            "score UNSCORED company=%r reason=evidence_coverage_insufficient "
+            "score UNSCORED company=%r mode=%r reason=evidence_coverage_insufficient "
             "avg_confidence=%.1f authenticity=%d",
-            company, avg_conf, authenticity,
+            company, mode, avg_conf, authenticity,
         )
         decision_makers = attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources)
         return _unscored_result(
@@ -369,8 +369,8 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         important_links = []
 
     logger.info(
-        "score DONE company=%r fit_score=%d tier=%s source_bank_size=%d",
-        company, final_score, tier.get("label"), len(registry.entries()),
+        "score DONE company=%r mode=%r fit_score=%d tier=%s source_bank_size=%d",
+        company, mode, final_score, tier.get("label"), len(registry.entries()),
     )
 
     return {
@@ -388,5 +388,5 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         "logo_url": logo_url,
         "source_bank": registry.as_source_bank(),
         "is_existing_tap_partner": existing_partner,
-        "cache_key": (company.strip().lower(), evidence_hash(sources), mission_hash(mission)),
+        "cache_key": (mode, company.strip().lower(), evidence_hash(sources), mission_hash(mission)),
     }

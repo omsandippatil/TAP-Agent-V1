@@ -137,7 +137,7 @@ decision_tiers_v7:
   - {min: 65, tier: 3, label: "Conditional", color: "#20B2AA", key: "CONDITIONAL",
      action: "Strengthen evidence. Identify warmest introduction path.",
      description: "Solid signals. Needs tailored case before outreach."}
-  - {min: 50, tier: 4, label: "Watchlist", color: "#F5C518", key: "WATCHLIST",
+  - {min: 45, tier: 4, label: "Watchlist", color: "#F5C518", key: "WATCHLIST",
      action: "Monitor CSR policy updates quarterly. Nurture relationship.",
      description: "Partial alignment. Not partnership-ready yet."}
   - {min: 0,  tier: 0, label: "Not a Target", color: "#9CA3A3", key: "REJECT",
