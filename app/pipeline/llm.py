@@ -1346,6 +1346,7 @@ async def score_extracted_facts(
     mode: str,
     extraction: dict,
     sources_manifest: str,
+    cfg: dict | None = None,
 ) -> dict | None:
     scoring_facts = {
         k: v for k, v in extraction.items()
@@ -1399,12 +1400,13 @@ async def analyze_and_score_company(
     cleaned_sources: list[dict],
     sources_manifest: str,
     mode: str = "deep",
+    cfg: dict | None = None,
 ) -> dict | None:
     extraction = await extract_company_facts(company, mission, cleaned_sources, sources_manifest)
     if not extraction:
         return None
 
-    scoring = await score_extracted_facts(company, mission, mode, extraction, sources_manifest)
+    scoring = await score_extracted_facts(company, mission, mode, extraction, sources_manifest, cfg=cfg)
     if not scoring:
         logger.error(
             "analyze_and_score_company scoring pass failed after successful extraction, "
