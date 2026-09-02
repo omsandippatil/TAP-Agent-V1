@@ -246,6 +246,18 @@ EDUCATION_SPEND_RULE = (
     "trend, so treat finding the trend as equally important as finding the headline number."
 )
 
+PROFIT_HISTORY_RULE = (
+    "NET PROFIT HISTORY (for statutory obligation calculation, separate from spend): "
+    "actively scan the evidence for net profit / profit after tax figures across multiple "
+    "fiscal years, the same way you scan for CSR spend trend. Populate "
+    "eligibility.net_profit_history[] with every distinct (fiscal_year, net_profit_inr_crore) "
+    "pair you find, each with a verbatim source_excerpt. Set "
+    "eligibility.net_profit_trend_direction to RISING/FLAT/DECLINING when two or more years "
+    "exist, UNKNOWN otherwise. This is used downstream to compute the company's Section 135 "
+    "CSR obligation (2% of average net profit) and compare it against actual CSR spend — do "
+    "not perform that calculation yourself, only extract the profit figures faithfully."
+)
+
 PARTNER_RULE = (
     "PARTNERS: include a named third-party organisation as a partner only if the evidence shows "
     "an actual relationship (funds, co-designs, implements with, partners with, delivers via, "
@@ -395,6 +407,8 @@ SOURCES:
 
 {EDUCATION_SPEND_RULE}
 
+{PROFIT_HISTORY_RULE}
+
 {PARTNER_RULE}
 
 {PROGRAMME_RULE}
@@ -418,7 +432,7 @@ Extract, matching the JSON shape's key order exactly:
 4. csr_head_note — one sentence, only from actual named-person context, never speculation from a bare title.
 5. delivery_model (FUNDER/IMPLEMENTER/HYBRID/UNCLEAR) + delivery_model_evidence (1 sentence).
 6. sector — from company-description language; UNKNOWN only if truly no clue.
-7. eligibility — Section 135 applicability (LIKELY/UNLIKELY/UNKNOWN) from net worth/turnover/profit figures (kept separate from spend), plus the plain numeric business-scale fields.
+7. eligibility — Section 135 applicability (LIKELY/UNLIKELY/UNKNOWN) from net worth/turnover/profit figures (kept separate from spend), plus the plain numeric business-scale fields, plus the profit history required by the PROFIT HISTORY rule.
 8. spend — apply the SPEND VS REVENUE and EDUCATION SPEND rules strictly, including the mandatory multi-year trend search.
 9. rfp_signal — an explicit call for NGO partners; default false/empty unless stated.
 10. board_affinity — named board/promoter personal education-philanthropy history; default false/empty unless stated.
@@ -433,6 +447,8 @@ Extract, matching the JSON shape's key order exactly:
 19. red_flags[] — genuine contradictions or marketing-not-substance signals, severity low/medium/high. Missing/undocumented details are NOT red flags.
 20. contact_pathway — the single most concrete real channel; "Not identified" if nothing exists.
 
+7b. eligibility.net_profit_history — apply the PROFIT HISTORY rule; this feeds a downstream statutory-obligation calculation, so profit-figure recall matters as much as spend-figure recall.
+
 Reply with ONE JSON object, nothing else, no markdown fences.
 
 JSON shape:
@@ -444,7 +460,7 @@ JSON shape:
   "delivery_model": "<FUNDER|IMPLEMENTER|HYBRID|UNCLEAR>",
   "delivery_model_evidence": "<sentence>",
   "sector": {{"sector": "<sector>", "sub_sector": "<or empty>", "reasoning": "<short>"}},
-  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number, 0 if unknown>, "net_profit_inr_crore": <number, 0 if unknown>}},
+  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number, 0 if unknown>, "net_profit_inr_crore": <number, 0 if unknown>, "net_profit_fiscal_year": "<if stated>", "net_profit_history": [{{"fiscal_year": "<year>", "net_profit_inr_crore": <number, 0 if unknown>, "source_excerpt": "<short, verbatim ok>"}}], "net_profit_trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>"}},
   "spend": {{"inr_crore": <number, 0 if unknown, education-specific only>, "display": "<exact CSR-labeled education figure or empty>", "fiscal_year": "<if stated>", "is_education_specific": <bool>, "education_pct_of_total_csr": <number, 0 if unknown>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short, verbatim ok>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number, 0 if unknown>, "display": "<as stated>", "source_excerpt": "<short, verbatim ok>"}}], "total_csr_inr_crore": <number, 0 if unknown>, "total_csr_display": "<as stated or empty>", "total_csr_fiscal_year": "<if stated>"}},
   "rfp_signal": {{"present": <bool>, "channel": "<short>", "evidence": "<short>"}},
   "board_affinity": {{"present": <bool>, "person_name": "<name or empty>", "connection": "<short>", "source_excerpt": "<short, verbatim ok>"}},
@@ -635,12 +651,22 @@ class GroupFoundationSchema(BaseModel):
     source: str = ""
 
 
+class NetProfitYearSchema(BaseModel):
+    fiscal_year: str = ""
+    net_profit_inr_crore: float = 0.0
+    source_excerpt: str = Field(default="", max_length=260)
+    source: str = ""
+
+
 class EligibilitySchema(BaseModel):
     plausibly_mandated: str = "UNKNOWN"
     reasoning: str = Field(default="", max_length=280)
     net_worth_turnover_signal: str = Field(default="", max_length=200)
     net_worth_turnover_inr_crore: float = 0.0
     net_profit_inr_crore: float = 0.0
+    net_profit_fiscal_year: str = ""
+    net_profit_history: list[NetProfitYearSchema] = Field(default_factory=list)
+    net_profit_trend_direction: str = "UNKNOWN"
     source: str = ""
 
 
@@ -648,6 +674,24 @@ class SectorSchema(BaseModel):
     sector: str = "UNKNOWN"
     sub_sector: str = ""
     reasoning: str = Field(default="", max_length=200)
+
+
+class CsrObligationYearSchema(BaseModel):
+    fiscal_year: str = ""
+    net_profit_inr_crore: float = 0.0
+    statutory_obligation_inr_crore: float = 0.0
+    actual_total_csr_inr_crore: float = 0.0
+    shortfall_inr_crore: float = 0.0
+    is_underspending: bool = False
+
+
+class CsrObligationSignalSchema(BaseModel):
+    computable: bool = False
+    reason_not_computable: str = Field(default="", max_length=200)
+    years: list[CsrObligationYearSchema] = Field(default_factory=list)
+    latest_year_underspending: bool = False
+    profit_trend_direction: str = "UNKNOWN"
+    explanation: str = Field(default="", max_length=320)
 
 
 class FullAnalysisSchema(BaseModel):
@@ -679,6 +723,94 @@ class FullAnalysisSchema(BaseModel):
     open_questions: list[str] = Field(default_factory=list)
     strategic_insight: str = Field(default="", max_length=2200)
     scoring_incomplete: bool = False
+    csr_obligation_signal: CsrObligationSignalSchema = CsrObligationSignalSchema()
+
+
+SECTION_135_CSR_RATE = 0.02
+MIN_PROFIT_YEARS_FOR_TREND = 2
+
+
+def compute_csr_obligation_signal(eligibility: dict, spend: dict) -> dict:
+    profit_years = eligibility.get("net_profit_history") or []
+    valid_profit_years = [
+        y for y in profit_years
+        if isinstance(y, dict) and y.get("fiscal_year") and y.get("net_profit_inr_crore", 0) > 0
+    ]
+
+    if not valid_profit_years:
+        return {
+            "computable": False,
+            "reason_not_computable": "No disclosed net profit figure was found in evidence.",
+            "years": [],
+            "latest_year_underspending": False,
+            "profit_trend_direction": "UNKNOWN",
+            "explanation": "",
+        }
+
+    spend_by_year = {}
+    for entry in (spend.get("history") or []):
+        fy = entry.get("fiscal_year", "")
+        if fy:
+            spend_by_year[fy] = entry.get("inr_crore", 0.0)
+    if spend.get("total_csr_fiscal_year") and spend.get("total_csr_inr_crore"):
+        spend_by_year.setdefault(spend["total_csr_fiscal_year"], spend["total_csr_inr_crore"])
+    if spend.get("fiscal_year") and spend.get("inr_crore") and spend.get("is_education_specific") is False:
+        spend_by_year.setdefault(spend["fiscal_year"], spend["inr_crore"])
+
+    computed_years = []
+    for entry in sorted(valid_profit_years, key=lambda y: y.get("fiscal_year", "")):
+        fy = entry["fiscal_year"]
+        profit = entry["net_profit_inr_crore"]
+        obligation = round(profit * SECTION_135_CSR_RATE, 2)
+        actual = spend_by_year.get(fy, 0.0)
+        shortfall = round(max(0.0, obligation - actual), 2)
+        computed_years.append({
+            "fiscal_year": fy,
+            "net_profit_inr_crore": profit,
+            "statutory_obligation_inr_crore": obligation,
+            "actual_total_csr_inr_crore": actual,
+            "shortfall_inr_crore": shortfall,
+            "is_underspending": actual > 0 and shortfall > 0,
+        })
+
+    latest = computed_years[-1] if computed_years else None
+    latest_underspending = bool(latest and latest["is_underspending"])
+
+    trend = eligibility.get("net_profit_trend_direction", "UNKNOWN")
+    if trend == "UNKNOWN" and len(valid_profit_years) >= MIN_PROFIT_YEARS_FOR_TREND:
+        profits_in_order = [y["net_profit_inr_crore"] for y in sorted(valid_profit_years, key=lambda y: y["fiscal_year"])]
+        if profits_in_order[-1] > profits_in_order[0] * 1.05:
+            trend = "RISING"
+        elif profits_in_order[-1] < profits_in_order[0] * 0.95:
+            trend = "DECLINING"
+        else:
+            trend = "FLAT"
+
+    explanation = ""
+    if latest_underspending:
+        explanation = (
+            f"In {latest['fiscal_year']}, statutory CSR obligation was approximately "
+            f"₹{latest['statutory_obligation_inr_crore']:.1f} crore (2% of ₹{latest['net_profit_inr_crore']:.1f} crore "
+            f"net profit) against actual CSR spend of ₹{latest['actual_total_csr_inr_crore']:.1f} crore — "
+            f"a shortfall of approximately ₹{latest['shortfall_inr_crore']:.1f} crore. Companies underspending "
+            f"against their statutory obligation carry compelled, unplaced CSR funds, which can be a stronger "
+            f"funding signal than profitability alone."
+        )
+    elif latest and not latest["actual_total_csr_inr_crore"]:
+        explanation = (
+            f"Statutory obligation for {latest['fiscal_year']} is estimable at approximately "
+            f"₹{latest['statutory_obligation_inr_crore']:.1f} crore, but no matching actual CSR spend figure "
+            f"for that year was found in evidence, so underspend cannot be confirmed."
+        )
+
+    return {
+        "computable": True,
+        "reason_not_computable": "",
+        "years": computed_years,
+        "latest_year_underspending": latest_underspending,
+        "profit_trend_direction": trend,
+        "explanation": explanation,
+    }
 
 
 async def call_anthropic_chat(
@@ -1328,6 +1460,8 @@ async def extract_company_facts(
     extraction["group_foundation"]["source"] = _sanitize_source(extraction["group_foundation"].get("source", ""), valid_sources)
     extraction.setdefault("eligibility", {})
     extraction["eligibility"]["source"] = _sanitize_source(extraction["eligibility"].get("source", ""), valid_sources)
+    for entry in extraction["eligibility"].get("net_profit_history", []) or []:
+        entry["source"] = _sanitize_source(entry.get("source", ""), valid_sources)
 
     logger.info(
         "extract_company_facts DONE company=%r authenticity=%d partners=%d programmes=%d decision_makers=%d red_flags=%d "
@@ -1427,6 +1561,10 @@ async def analyze_and_score_company(
 
     validated = _repair_analysis(merged)
     result = validated.model_dump()
+
+    result["csr_obligation_signal"] = compute_csr_obligation_signal(
+        result.get("eligibility", {}), result.get("spend", {})
+    )
 
     coverage_insufficient, coverage_reason = evidence_coverage_is_too_low(
         result["criteria"], result["overall_authenticity_score"]

@@ -363,9 +363,9 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
     valid_numbers = {entry["number"] for entry in registry.entries()}
     insight = strip_unknown_citation_tokens(analysis.get("strategic_insight", ""), valid_numbers)
 
-    underspend_signal = analysis.get("csr_underspend_signal") or {}
-    if underspend_signal.get("present") and underspend_signal.get("explanation"):
-        insight = f"{insight} {underspend_signal['explanation']}"
+    obligation_signal = analysis.get("csr_obligation_signal") or {}
+    if obligation_signal.get("computable") and obligation_signal.get("latest_year_underspending") and obligation_signal.get("explanation"):
+        insight = f"{insight} {obligation_signal['explanation']}"
 
     if existing_partner:
         insight = _existing_partner_prefix(
