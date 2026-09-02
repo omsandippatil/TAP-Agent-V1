@@ -120,8 +120,10 @@ def build_score_breakdown(analysis: dict) -> dict:
     average_confidence = (
         sum(c.get("confidence", 0) for c in criteria) / len(criteria) if criteria else 0
     )
+    weighted_confidence = llm.weighted_average_criteria_confidence(criteria)
     return {
         "average_confidence_pct": round(average_confidence, 1),
+        "weighted_confidence_pct": round(weighted_confidence, 1),
         "criteria_weighted": [
             {
                 "id": c.get("id", ""),
@@ -320,15 +322,18 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         return _unscored_result(state, insight, sources, source_links, logo_url, registry, existing_partner)
 
     if analysis.get("evidence_coverage_insufficient"):
+        coverage_reason = analysis.get("evidence_coverage_reason", "").strip()
         avg_conf = analysis.get("average_criteria_confidence_pct", 0)
+        weighted_conf = analysis.get("weighted_criteria_confidence_pct", avg_conf)
         authenticity = analysis.get("overall_authenticity_score", 0)
+        reason_clause = coverage_reason or "coverage was too thin to score fit confidently."
         insight = (
-            f"Evidence coverage for {company} was too thin to score fit confidently "
-            f"(average criteria confidence: {avg_conf:.0f}%, source authenticity: "
-            f"{authenticity}%). This means the research pass did not retrieve enough "
-            f"public evidence to judge fit either way — it is **not** a Low Fit "
-            f"determination. Recommended: broaden the manual search or reach out "
-            f"directly to the company's India CSR office before deprioritising."
+            f"Evidence coverage for {company} was too thin to score fit confidently: "
+            f"{reason_clause} (weighted criteria confidence: {weighted_conf:.0f}%, source "
+            f"authenticity: {authenticity}%). This means the research pass did not retrieve "
+            f"enough public evidence to judge fit either way — it is **not** a Low Fit "
+            f"determination. Recommended: broaden the manual search or reach out directly to "
+            f"the company's India CSR office before deprioritising."
         )
         if existing_partner:
             insight = _existing_partner_prefix(
@@ -337,8 +342,8 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             ) + insight
         logger.warning(
             "score UNSCORED company=%r mode=%r reason=evidence_coverage_insufficient "
-            "avg_confidence=%.1f authenticity=%d",
-            company, mode, avg_conf, authenticity,
+            "coverage_reason=%r avg_confidence=%.1f weighted_confidence=%.1f authenticity=%d",
+            company, mode, coverage_reason, avg_conf, weighted_conf, authenticity,
         )
         decision_makers = attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources)
         return _unscored_result(

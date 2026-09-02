@@ -955,7 +955,9 @@ def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode:
 
 
 LOW_COVERAGE_AUTHENTICITY_THRESHOLD = 30
-LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD = 35
+LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD = 45
+LOW_COVERAGE_HIGH_WEIGHT_FLOOR = 8
+LOW_COVERAGE_HIGH_WEIGHT_CONFIDENCE_THRESHOLD = 25
 
 
 def average_criteria_confidence(criteria: list[dict]) -> float:
@@ -964,14 +966,55 @@ def average_criteria_confidence(criteria: list[dict]) -> float:
     return sum(c.get("confidence", 0) for c in criteria) / len(criteria)
 
 
-def evidence_coverage_is_too_low(criteria: list[dict], authenticity_score: int) -> bool:
+def weighted_average_criteria_confidence(criteria: list[dict]) -> float:
     if not criteria:
-        return True
-    avg_confidence = average_criteria_confidence(criteria)
-    return (
-        authenticity_score < LOW_COVERAGE_AUTHENTICITY_THRESHOLD
-        or avg_confidence < LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD
-    )
+        return 0.0
+    total_weight = 0.0
+    weighted_sum = 0.0
+    for entry in criteria:
+        weight = CRITERIA_WEIGHTS.get(entry.get("id", ""))
+        if weight is None:
+            continue
+        confidence = max(0, min(100, int(entry.get("confidence", 0) or 0)))
+        weighted_sum += confidence * weight
+        total_weight += weight
+    if total_weight == 0:
+        return 0.0
+    return weighted_sum / total_weight
+
+
+def _low_confidence_high_weight_criterion(criteria: list[dict]) -> dict | None:
+    worst = None
+    for entry in criteria:
+        weight = CRITERIA_WEIGHTS.get(entry.get("id", ""))
+        if weight is None or weight < LOW_COVERAGE_HIGH_WEIGHT_FLOOR:
+            continue
+        confidence = max(0, min(100, int(entry.get("confidence", 0) or 0)))
+        if confidence >= LOW_COVERAGE_HIGH_WEIGHT_CONFIDENCE_THRESHOLD:
+            continue
+        if worst is None or confidence < worst.get("confidence", 0):
+            worst = entry
+    return worst
+
+
+def evidence_coverage_is_too_low(criteria: list[dict], authenticity_score: int) -> tuple[bool, str]:
+    if not criteria:
+        return True, "No criteria were returned to score against."
+
+    if authenticity_score < LOW_COVERAGE_AUTHENTICITY_THRESHOLD:
+        return True, f"Source authenticity was only {authenticity_score} percent."
+
+    weighted_confidence = weighted_average_criteria_confidence(criteria)
+    if weighted_confidence < LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD:
+        return True, f"Weighted criteria confidence was only {weighted_confidence:.0f} percent."
+
+    weak_criterion = _low_confidence_high_weight_criterion(criteria)
+    if weak_criterion is not None:
+        name = weak_criterion.get("name") or weak_criterion.get("id", "a high-weight criterion")
+        confidence = weak_criterion.get("confidence", 0)
+        return True, f"{name} had only {confidence} percent confidence."
+
+    return False, ""
 
 
 def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
@@ -1383,11 +1426,16 @@ async def analyze_and_score_company(
     validated = _repair_analysis(merged)
     result = validated.model_dump()
 
-    result["evidence_coverage_insufficient"] = evidence_coverage_is_too_low(
+    coverage_insufficient, coverage_reason = evidence_coverage_is_too_low(
         result["criteria"], result["overall_authenticity_score"]
     )
+    result["evidence_coverage_insufficient"] = coverage_insufficient
+    result["evidence_coverage_reason"] = coverage_reason
     result["average_criteria_confidence_pct"] = round(
         average_criteria_confidence(result["criteria"]), 1
+    )
+    result["weighted_criteria_confidence_pct"] = round(
+        weighted_average_criteria_confidence(result["criteria"]), 1
     )
 
     model_reported_score = result["fit_score"]
@@ -1405,9 +1453,11 @@ async def analyze_and_score_company(
 
     logger.info(
         "analyze_and_score_company DONE company=%r mode=%s model_reported_fit_score=%d final_fit_score=%d "
-        "authenticity=%d avg_criteria_confidence=%.1f coverage_insufficient=%s partners=%d programmes=%d decision_makers=%d",
+        "authenticity=%d avg_criteria_confidence=%.1f weighted_criteria_confidence=%.1f coverage_insufficient=%s "
+        "coverage_reason=%r partners=%d programmes=%d decision_makers=%d",
         company, mode, model_reported_score, result["fit_score"], result["overall_authenticity_score"],
-        result["average_criteria_confidence_pct"], result["evidence_coverage_insufficient"],
+        result["average_criteria_confidence_pct"], result["weighted_criteria_confidence_pct"],
+        result["evidence_coverage_insufficient"], result["evidence_coverage_reason"],
         len(result["partners"]), len(result["programmes"]), len(result["decision_makers"]),
     )
     logger.info(
