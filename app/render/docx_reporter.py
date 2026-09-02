@@ -927,6 +927,20 @@ async def generate_docx_report(company: str, result: dict, mode: str = "deep") -
     )
     if eligibility.get("reasoning"):
         add_evidence_paragraph(doc, eligibility["reasoning"], source_lookup.get(eligibility.get("source", ""), ""))
+    if eligibility.get("net_profit_trend_direction") and eligibility.get("net_profit_trend_direction") != "UNKNOWN":
+        profit_trend_paragraph = doc.add_paragraph()
+        profit_trend_paragraph.paragraph_format.space_after = Pt(4)
+        profit_trend_run = profit_trend_paragraph.add_run(f"Net profit trend: {eligibility['net_profit_trend_direction']}")
+        profit_trend_run.font.name = FONT_NAME
+        profit_trend_run.bold = True
+        profit_trend_run.font.size = Pt(9.5)
+        profit_trend_run.font.color.rgb = TEAL_MID
+    if eligibility.get("net_profit_history"):
+        profit_rows = [
+            (entry.get("fiscal_year", ""), entry.get("net_profit_inr_crore", ""), entry.get("source_excerpt", ""))
+            for entry in eligibility["net_profit_history"]
+        ]
+        build_data_table(doc, ["Fiscal year", "Net profit (₹ crore)", "Excerpt"], [3.2, 3.2, 9.9], profit_rows)
     if group_foundation.get("routed_through_group"):
         group_paragraph = doc.add_paragraph()
         group_paragraph.paragraph_format.space_after = Pt(4)

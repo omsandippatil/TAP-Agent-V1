@@ -218,6 +218,21 @@
           {% if eligibility and eligibility.reasoning %}
             <p class="panel-footnote">{{ evidence_line(eligibility.reasoning, eligibility.source) }}{% if eligibility.net_worth_turnover_signal %} — {{ eligibility.net_worth_turnover_signal }}{% endif %}</p>
           {% endif %}
+          {% if eligibility and eligibility.net_profit_trend_direction and eligibility.net_profit_trend_direction != 'UNKNOWN' %}
+            <p class="mt-12"><b>Net profit trend: {{ eligibility.net_profit_trend_direction }}</b></p>
+          {% endif %}
+          {% if eligibility and eligibility.net_profit_history %}
+            <div class="table-scroll">
+              <table>
+                <thead><tr><th>Fiscal year</th><th>Net profit (₹ crore)</th><th>Source</th></tr></thead>
+                <tbody>
+                  {% for y in eligibility.net_profit_history %}
+                    <tr><td>{{ y.fiscal_year }}</td><td>{{ evidence_line(y.net_profit_inr_crore, y.source) }}</td><td>{{ cite(y.source) }}</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% endif %}
         </div>
       </section>
 
