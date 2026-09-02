@@ -513,7 +513,7 @@ SOURCES:
 {HIGHLIGHT_RULE}
 
 Produce, in this order:
-1. criteria[] — all 17 ids below, in order, each with id, name (copy exactly as given), score 0-5, confidence 0-100, short evidence, short reasoning, drawn only from the extracted facts above. Follow the CONSISTENCY rule above for every score:
+1. criteria[] — all 17 ids below, in order, each with id, name (copy exactly as given), score 0-5, confidence 0-100, short evidence, short reasoning, drawn only from the extracted facts above. Follow the CONSISTENCY rule above for every score. IMPORTANT: `confidence` must reflect how directly the extracted facts support THIS criterion specifically — not your confidence in the company overall, and not the confidence you assigned to a different criterion. A criterion resting on an inferred/sector-default judgment (per the SCORING PHILOSOPHY) should carry a materially lower confidence than one resting on an explicit, named fact:
 {_rubric_block()}
 2. fit_score (int 0-100) — compute this yourself as the weighted average of the criteria scores you just wrote (score/5 × weight for each, summed across all 17). Do this arithmetically from your own criteria, not as a separate holistic guess, so it matches what the system independently computes from the same criteria.
 3. fit_rationale (2-4 sentences): justify the scoring from the extracted facts, stating plainly what's confirmed vs inferred vs undocumented. If a named partner/programme suggests a plausible but unconfirmed entry path, you may add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme — never invent one not in the extracted facts. If decision_makers and/or partners/programmes are non-empty, end with one short sentence "Key contacts: A (Title), B (Title); Key partners: X, Y" using only names from the extracted facts. Omit that closing sentence if both lists are empty.
@@ -1102,19 +1102,53 @@ def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode:
     return final_score
 
 
+# ---------------------------------------------------------------------------
+# EVIDENCE COVERAGE / CONFIDENCE GATE
+#
+# Rewritten to close the gap the reviewer flagged: on the UBS runs, several
+# individual criteria sat at 15-40% confidence while the OLD weighted-average
+# gate (which lets high-weight criteria dominate) stayed just above its
+# threshold, so no low-confidence flag ever fired even though a large share
+# of the scorecard was effectively unsupported.
+#
+# This version checks coverage from four independent angles and fails the
+# gate if ANY of them trips. It intentionally does not rely solely on a
+# single weighted-average number, since a single blended statistic can
+# always be gamed by a handful of well-supported, high-weight criteria
+# masking many weak ones — exactly the failure mode observed.
+# ---------------------------------------------------------------------------
+
+# Kept for backward compatibility with any external code/tests importing
+# these names directly; still used as the "authenticity" and "weighted
+# average" legs of the new multi-check gate below.
 LOW_COVERAGE_AUTHENTICITY_THRESHOLD = 30
 LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD = 45
 LOW_COVERAGE_HIGH_WEIGHT_FLOOR = 8
 LOW_COVERAGE_HIGH_WEIGHT_CONFIDENCE_THRESHOLD = 25
 
+# New legs of the gate. Kept as separate named constants (rather than reusing
+# the ones above) so each threshold can be tuned independently without
+# changing the meaning of the legacy constants other code may reference.
+LOW_COVERAGE_PLAIN_AVERAGE_THRESHOLD = 45
+LOW_COVERAGE_MIN_CONFIDENT_CRITERIA_COUNT = 6
+LOW_COVERAGE_CONFIDENT_CRITERION_THRESHOLD = 40
+LOW_COVERAGE_MIN_CONFIDENT_WEIGHT_SHARE = 0.45
+LOW_COVERAGE_LOW_CONFIDENCE_CRITERION_THRESHOLD = 25
+LOW_COVERAGE_MAX_LOW_CONFIDENCE_SHARE = 0.5
+
 
 def average_criteria_confidence(criteria: list[dict]) -> float:
+    """Unweighted mean confidence across all criteria. Kept for backward
+    compatibility (used directly by scorer.py's build_score_breakdown)."""
     if not criteria:
         return 0.0
     return sum(c.get("confidence", 0) for c in criteria) / len(criteria)
 
 
 def weighted_average_criteria_confidence(criteria: list[dict]) -> float:
+    """Weight-weighted mean confidence. Kept for backward compatibility, but
+    the coverage gate below no longer relies on this figure alone — see
+    evidence_coverage_is_too_low()."""
     if not criteria:
         return 0.0
     total_weight = 0.0
@@ -1132,6 +1166,10 @@ def weighted_average_criteria_confidence(criteria: list[dict]) -> float:
 
 
 def _low_confidence_high_weight_criterion(criteria: list[dict]) -> dict | None:
+    """Returns the lowest-confidence criterion among those with weight >=
+    LOW_COVERAGE_HIGH_WEIGHT_FLOOR, if its confidence is below
+    LOW_COVERAGE_HIGH_WEIGHT_CONFIDENCE_THRESHOLD. Kept for backward
+    compatibility and still used as one leg of the gate."""
     worst = None
     for entry in criteria:
         weight = CRITERIA_WEIGHTS.get(entry.get("id", ""))
@@ -1145,7 +1183,67 @@ def _low_confidence_high_weight_criterion(criteria: list[dict]) -> dict | None:
     return worst
 
 
+def _confident_weight_share(criteria: list[dict], threshold: int) -> tuple[float, int]:
+    """Returns (fraction_of_total_weight_at_or_above_threshold, count_of_such_criteria).
+    This measures how much of the scorecard — by decision-relevant weight,
+    not just headcount — is actually well-supported, which is what a single
+    average can hide."""
+    total_weight = 0.0
+    confident_weight = 0.0
+    confident_count = 0
+    for entry in criteria:
+        weight = CRITERIA_WEIGHTS.get(entry.get("id", ""))
+        if weight is None:
+            continue
+        total_weight += weight
+        confidence = max(0, min(100, int(entry.get("confidence", 0) or 0)))
+        if confidence >= threshold:
+            confident_weight += weight
+            confident_count += 1
+    if total_weight == 0:
+        return 0.0, 0
+    return confident_weight / total_weight, confident_count
+
+
+def _low_confidence_share(criteria: list[dict], threshold: int) -> float:
+    """Fraction of ALL criteria (unweighted headcount) sitting at or below a
+    low-confidence floor. Catches the "many weak criteria, dragged up by a
+    few strong high-weight ones" pattern directly, regardless of how the
+    weighted average nets out."""
+    if not criteria:
+        return 1.0
+    low_count = sum(
+        1 for c in criteria
+        if max(0, min(100, int(c.get("confidence", 0) or 0))) <= threshold
+    )
+    return low_count / len(criteria)
+
+
 def evidence_coverage_is_too_low(criteria: list[dict], authenticity_score: int) -> tuple[bool, str]:
+    """Multi-signal coverage gate. Fails (returns True) if ANY of the
+    following independent checks trips:
+
+      1. Source authenticity is too low (unchanged from before).
+      2. Weighted-average criteria confidence is too low (unchanged from
+         before — kept as a floor, not the only signal).
+      3. NEW: plain (unweighted) average confidence is too low — catches
+         cases where a handful of high-weight criteria pull the weighted
+         average above threshold while most of the scorecard is thin.
+      4. Unchanged: a single high-weight criterion is very low confidence.
+      5. NEW: too few criteria clear a basic "confidently supported" bar,
+         by BOTH weight-share and raw count — catches a scorecard that is
+         mostly inferred/sector-default guesses even if no single number
+         looks alarming in isolation.
+      6. NEW: too large a share of ALL criteria (by headcount) sit at or
+         below a low-confidence floor — this is the direct fix for the
+         UBS pattern (multiple criteria at 15-40%) that the old
+         weighted-average-only check could miss.
+
+    Any single trip is enough — this is deliberately conservative, since the
+    cost of a false "insufficient evidence" label is small (the analyst just
+    does more digging) while the cost of a confident-looking low score on
+    thin evidence is a lost prospect, per the original feedback.
+    """
     if not criteria:
         return True, "No criteria were returned to score against."
 
@@ -1156,11 +1254,36 @@ def evidence_coverage_is_too_low(criteria: list[dict], authenticity_score: int) 
     if weighted_confidence < LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD:
         return True, f"Weighted criteria confidence was only {weighted_confidence:.0f} percent."
 
+    plain_confidence = average_criteria_confidence(criteria)
+    if plain_confidence < LOW_COVERAGE_PLAIN_AVERAGE_THRESHOLD:
+        return True, f"Average criteria confidence was only {plain_confidence:.0f} percent."
+
     weak_criterion = _low_confidence_high_weight_criterion(criteria)
     if weak_criterion is not None:
         name = weak_criterion.get("name") or weak_criterion.get("id", "a high-weight criterion")
         confidence = weak_criterion.get("confidence", 0)
         return True, f"{name} had only {confidence} percent confidence."
+
+    confident_weight_share, confident_count = _confident_weight_share(
+        criteria, LOW_COVERAGE_CONFIDENT_CRITERION_THRESHOLD
+    )
+    if (
+        confident_weight_share < LOW_COVERAGE_MIN_CONFIDENT_WEIGHT_SHARE
+        or confident_count < LOW_COVERAGE_MIN_CONFIDENT_CRITERIA_COUNT
+    ):
+        return True, (
+            f"Only {confident_count} of {len(criteria)} criteria (covering "
+            f"{confident_weight_share * 100:.0f} percent of scoring weight) reached at least "
+            f"{LOW_COVERAGE_CONFIDENT_CRITERION_THRESHOLD} percent confidence."
+        )
+
+    low_share = _low_confidence_share(criteria, LOW_COVERAGE_LOW_CONFIDENCE_CRITERION_THRESHOLD)
+    if low_share > LOW_COVERAGE_MAX_LOW_CONFIDENCE_SHARE:
+        low_count = round(low_share * len(criteria))
+        return True, (
+            f"{low_count} of {len(criteria)} criteria had {LOW_COVERAGE_LOW_CONFIDENCE_CRITERION_THRESHOLD} "
+            f"percent confidence or below."
+        )
 
     return False, ""
 
