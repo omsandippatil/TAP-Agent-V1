@@ -39,6 +39,33 @@ CSR_ROLE_KEYWORD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Functional CSR titles: narrow, specific day-to-day roles. People tend to
+# update these promptly when they change jobs because the title itself is
+# the identity ("I am the CSR Manager"), unlike a broad C-suite title that
+# can persist on a profile/press mention long after an actual departure.
+CSR_FUNCTIONAL_TITLE_PATTERN = re.compile(
+    r"(head[\s,]*(?:of\s+)?csr|csr\s+head|csr\s+director|csr\s+manager|csr\s+lead|"
+    r"csr\s+specialist|csr\s+executive|"
+    r"sustainability\s+head|head\s+of\s+sustainability|sustainability\s+manager|"
+    r"sustainability\s+lead|"
+    r"esg\s+head|head\s+of\s+esg|esg\s+manager|esg\s+lead|"
+    r"social\s+impact\s+(?:head|lead|manager)|head\s+of\s+social\s+impact|"
+    r"philanthropy\s+(?:head|lead|manager)|head\s+of\s+philanthropy|"
+    r"community\s+(?:engagement|relations|development)\s+(?:head|lead|manager)|"
+    r"foundation\s+(?:director|head|manager))",
+    re.IGNORECASE,
+)
+
+# Broad senior/executive titles. On their own (without a functional CSR
+# title also present) these are the titles most likely to be stale, since
+# board/C-suite listings in press and profile snippets lag real personnel
+# changes the longest.
+SENIOR_EXECUTIVE_TITLE_PATTERN = re.compile(
+    r"\b(chief\s+\w+(?:\s+\w+)?\s+officer|c[a-z]o|president|chairperson|chairman|"
+    r"chairwoman|managing\s+director|founder|co[\s\-]?founder)\b",
+    re.IGNORECASE,
+)
+
 SENIORITY_KEYWORD_PATTERN_ORDER = [
     ("C_SUITE", re.compile(r"\b(chief\s+\w+\s+officer|c[a-z]o)\b", re.IGNORECASE)),
     ("VP", re.compile(r"\b(vice\s+president|vp)\b", re.IGNORECASE)),
@@ -60,7 +87,8 @@ DEPARTMENT_KEYWORD_PATTERN = re.compile(
 
 FORMER_ROLE_KEYWORD_PATTERN = re.compile(
     r"\b(former|ex[\s\-]|previously|until\s+\d{4}|retired|alumnus|alumni|"
-    r"past\s+(?:employee|role)|no\s+longer)\b",
+    r"past\s+(?:employee|role)|no\s+longer|stepped\s+down|left\s+(?:the\s+)?(?:role|company|firm|position)|"
+    r"succeeded\s+by|handed\s+over\s+to)\b",
     re.IGNORECASE,
 )
 
@@ -178,6 +206,15 @@ def extract_job_title(raw_title: str, snippet: str, parts: list[str] | None = No
         return candidate
     match = CSR_ROLE_KEYWORD_PATTERN.search(f"{raw_title} {snippet}")
     return match.group(0).strip() if match else ""
+
+
+def extract_full_title_text(raw_title: str, snippet: str, parts: list[str] | None = None) -> str:
+    """Everything that reads as a title/role claim, not just the first
+    segment extract_job_title picks. Used for staleness judgment so that a
+    second role mentioned later in the same line (e.g. "... and CEO X
+    Foundation") is not invisible to the seniority/functional check."""
+    parts = parts if parts is not None else split_linkedin_title(raw_title)
+    return " ".join(parts[1:]) if len(parts) > 1 else (raw_title or "")
 
 
 def extract_seniority_level(job_title: str, raw_title: str, snippet: str) -> str:
@@ -348,10 +385,33 @@ def is_currently_at_company(raw_title: str, snippet: str, affiliation: str, comp
     return True
 
 
+def has_functional_csr_title(full_title_text: str) -> bool:
+    """True if a narrow, specific CSR/sustainability/philanthropy job title
+    is present — not just a broad executive title that happens to sit near
+    a foundation/CSR mention."""
+    return bool(CSR_FUNCTIONAL_TITLE_PATTERN.search(full_title_text or ""))
+
+
+def has_unverified_senior_title(full_title_text: str) -> bool:
+    """True if a broad C-suite/president/founder-style title is present
+    without an accompanying functional CSR title. Broad executive titles
+    are the ones most prone to being stale in a scraped snippet, since a
+    press bio or old profile line can keep listing someone as CEO/Chief.../
+    President long after they've actually moved on — the title itself
+    carries no evidence of current-ness the way a narrow functional title
+    does. This is a structural signal, not a name/company lookup."""
+    if not full_title_text:
+        return False
+    if not SENIOR_EXECUTIVE_TITLE_PATTERN.search(full_title_text):
+        return False
+    return not has_functional_csr_title(full_title_text)
+
+
 def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> dict:
     parts = split_linkedin_title(raw_title)
     name = extract_person_name(raw_title, parts) or extract_name_from_url(url)
     job_title = extract_job_title(raw_title, snippet, parts)
+    full_title_text = extract_full_title_text(raw_title, snippet, parts)
     affiliation = extract_company_affiliation(raw_title, snippet, parts, company=company)
     all_companies = extract_all_company_mentions(raw_title, snippet, affiliation)
     india_signal = location_mentions_india(raw_title, snippet, url)
@@ -369,7 +429,17 @@ def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> 
     title_blocked = bool(NON_CSR_TITLE_KEYWORD_PATTERN.search(job_title)) and not title_csr_match
     role_verified = has_csr_signal and not title_blocked
 
-    if current_role and company_match and india_signal:
+    functional_title = has_functional_csr_title(full_title_text)
+    unverified_senior_title = has_unverified_senior_title(full_title_text)
+
+    if unverified_senior_title:
+        # A broad executive title with no narrow functional CSR title to
+        # anchor it is treated as unverified regardless of how the other
+        # signals line up — this is the case most likely to be stale, and
+        # also the least useful contact for grassroots outreach even when
+        # accurate, so it's never allowed to reach HIGH.
+        confidence = "MEDIUM" if (company_match and india_signal) else "LOW"
+    elif current_role and company_match and india_signal and functional_title:
         confidence = "HIGH"
     elif company_match and (current_role or has_csr_signal):
         confidence = "MEDIUM"
@@ -403,6 +473,8 @@ def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> 
         "has_csr_signal": has_csr_signal,
         "role_verified": role_verified,
         "is_current_company_match": company_match,
+        "has_functional_csr_title": functional_title,
+        "has_unverified_senior_title": unverified_senior_title,
         "profile_completeness": profile_completeness,
         "confidence": confidence,
     }
