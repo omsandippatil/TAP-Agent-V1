@@ -43,6 +43,16 @@ CSR_ROLE_KEYWORD_PATTERN = re.compile(
 # update these promptly when they change jobs because the title itself is
 # the identity ("I am the CSR Manager"), unlike a broad C-suite title that
 # can persist on a profile/press mention long after an actual departure.
+#
+# NOTE: deliberately excludes "foundation ceo" / "foundation president" —
+# those are senior-executive titles that happen to sit at a foundation, not
+# narrow functional CSR roles, and belong under SENIOR_EXECUTIVE_TITLE_PATTERN
+# instead so they get the more conservative (never-HIGH) confidence handling.
+# A prior version matched "foundation ceo" here, which let a stale "CEO of
+# the Foundation" title reach HIGH confidence on the strength of a title
+# pattern alone — this is what caused a person who left a foundation CEO
+# role years earlier to still outrank a correct, current, India-based
+# contact in the final sort.
 CSR_FUNCTIONAL_TITLE_PATTERN = re.compile(
     r"(head[\s,]*(?:of\s+)?csr|csr\s+head|csr\s+director|csr\s+manager|csr\s+lead|"
     r"csr\s+specialist|csr\s+executive|"
@@ -59,10 +69,15 @@ CSR_FUNCTIONAL_TITLE_PATTERN = re.compile(
 # Broad senior/executive titles. On their own (without a functional CSR
 # title also present) these are the titles most likely to be stale, since
 # board/C-suite listings in press and profile snippets lag real personnel
-# changes the longest.
+# changes the longest. Explicitly includes "foundation ceo"/"foundation
+# president" — a CEO-of-foundation title is exactly the shape of title most
+# likely to be quoted long after the person has actually moved on, so it
+# is treated the same as any other broad executive title rather than as a
+# narrow, self-updating functional one.
 SENIOR_EXECUTIVE_TITLE_PATTERN = re.compile(
     r"\b(chief\s+\w+(?:\s+\w+)?\s+officer|c[a-z]o|president|chairperson|chairman|"
-    r"chairwoman|managing\s+director|founder|co[\s\-]?founder)\b",
+    r"chairwoman|managing\s+director|founder|co[\s\-]?founder|"
+    r"foundation\s+(?:ceo|president))\b",
     re.IGNORECASE,
 )
 
@@ -388,18 +403,25 @@ def is_currently_at_company(raw_title: str, snippet: str, affiliation: str, comp
 def has_functional_csr_title(full_title_text: str) -> bool:
     """True if a narrow, specific CSR/sustainability/philanthropy job title
     is present — not just a broad executive title that happens to sit near
-    a foundation/CSR mention."""
+    a foundation/CSR mention. "Foundation CEO"/"Foundation president" are
+    deliberately excluded here (see SENIOR_EXECUTIVE_TITLE_PATTERN) since
+    those are the broad-title shape most prone to going stale in a scraped
+    snippet, and treating them as "functional" let a stale senior title
+    reach HIGH confidence undeservedly."""
     return bool(CSR_FUNCTIONAL_TITLE_PATTERN.search(full_title_text or ""))
 
 
 def has_unverified_senior_title(full_title_text: str) -> bool:
-    """True if a broad C-suite/president/founder-style title is present
-    without an accompanying functional CSR title. Broad executive titles
-    are the ones most prone to being stale in a scraped snippet, since a
-    press bio or old profile line can keep listing someone as CEO/Chief.../
-    President long after they've actually moved on — the title itself
-    carries no evidence of current-ness the way a narrow functional title
-    does. This is a structural signal, not a name/company lookup."""
+    """True if a broad C-suite/president/founder/foundation-CEO-style title
+    is present without an accompanying, distinct functional CSR title. Broad
+    executive titles are the ones most prone to being stale in a scraped
+    snippet, since a press bio or old profile line can keep listing someone
+    as CEO/Chief.../President/Foundation CEO long after they've actually
+    moved on — the title itself carries no evidence of current-ness the way
+    a narrow functional title does. This is a structural signal, not a
+    name/company lookup, and it does not attempt to detect staleness that
+    isn't stated anywhere in the source text — it only avoids rewarding an
+    undated senior title with unearned confidence."""
     if not full_title_text:
         return False
     if not SENIOR_EXECUTIVE_TITLE_PATTERN.search(full_title_text):
@@ -433,11 +455,12 @@ def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> 
     unverified_senior_title = has_unverified_senior_title(full_title_text)
 
     if unverified_senior_title:
-        # A broad executive title with no narrow functional CSR title to
-        # anchor it is treated as unverified regardless of how the other
-        # signals line up — this is the case most likely to be stale, and
-        # also the least useful contact for grassroots outreach even when
-        # accurate, so it's never allowed to reach HIGH.
+        # A broad executive title (including "Foundation CEO") with no
+        # narrow functional CSR title to anchor it is treated as unverified
+        # regardless of how the other signals line up — this is the case
+        # most likely to be stale, and also the least useful contact for
+        # grassroots outreach even when accurate, so it's never allowed to
+        # reach HIGH.
         confidence = "MEDIUM" if (company_match and india_signal) else "LOW"
     elif current_role and company_match and india_signal and functional_title:
         confidence = "HIGH"
