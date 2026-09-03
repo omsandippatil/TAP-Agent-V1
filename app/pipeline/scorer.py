@@ -40,6 +40,17 @@ SCORE_BANDS = [
 
 BAND_UNSCORED = {"key": "UNSCORED", "label": "Not enough evidence to score", "color": "#9CA3A3"}
 
+RESEARCH_CONFIDENCE_BADGES = {
+    "High": {"key": "HIGH", "label": "High research confidence", "color": "#146B65"},
+    "Medium": {"key": "MEDIUM", "label": "Medium research confidence", "color": "#F5C518"},
+    "Low": {"key": "LOW", "label": "Low research confidence — treat as directional", "color": "#D97706"},
+    "Insufficient": {"key": "INSUFFICIENT", "label": "Insufficient evidence to score confidently", "color": "#9CA3A3"},
+}
+
+PARTIAL_COVERAGE_BANNER = (
+    "Scored on partial evidence — treat as directional. Verify key facts before outreach."
+)
+
 IMPORTANT_LINK_QUERIES = (
     '"{company}" official CSR OR sustainability page India',
     '"{company}" India "CSR-2" OR "Form CSR-2" OR MCA filing',
@@ -50,16 +61,19 @@ MAX_IMPORTANT_LINKS = 8
 IMPORTANT_LINK_SEARCH_RESULTS = 5
 
 SOURCE_LABELS = {
+    "entity_resolution": "Related entity mapping",
     "india_csr_page": "Company CSR page",
     "mca_portal": "MCA portal",
     "mca_via_search": "MCA (via search)",
     "national_csr_portal": "National CSR Portal",
     "annual_report": "Annual / sustainability report",
     "global_annual_report": "Annual / sustainability report",
+    "multi_year_financials": "Multi-year financials",
     "partner_search": "Partner search",
     "people_search": "LinkedIn people search",
     "plans_search": "Partnerships & plans search",
     "sector_eligibility_search": "Sector & eligibility search",
+    "education_programme_search": "Education programme search",
 }
 
 _COMPANY_SUFFIX_PATTERN = re.compile(
@@ -87,6 +101,10 @@ def score_band(score, cfg: dict) -> dict:
         if score >= band.get("min", 0):
             return band
     return bands[-1]
+
+
+def research_confidence_badge(label: str) -> dict:
+    return dict(RESEARCH_CONFIDENCE_BADGES.get(label or "", RESEARCH_CONFIDENCE_BADGES["Insufficient"]))
 
 
 def _normalize_company_name(name: str) -> str:
@@ -139,6 +157,25 @@ def build_score_breakdown(analysis: dict) -> dict:
     }
 
 
+def build_entity_structure_view(analysis: dict) -> dict:
+    """Renders the parent -> India entity -> foundation mapping (feedback #8)
+    as a plain dict the templates/reporters can walk directly, with an
+    `is_populated` flag so renderers can skip the section entirely when the
+    evidence never named more than one legal vehicle."""
+    structure = (analysis or {}).get("entity_structure") or {}
+    parent = (structure.get("parent_company") or "").strip()
+    india_entity = (structure.get("india_entity") or "").strip()
+    foundation = (structure.get("foundation_entity") or "").strip()
+    notes = (structure.get("notes") or "").strip()
+    return {
+        "parent_company": parent,
+        "india_entity": india_entity,
+        "foundation_entity": foundation,
+        "notes": notes,
+        "is_populated": bool(parent or india_entity or foundation),
+    }
+
+
 def build_source_links(sources: list) -> list[dict]:
     out = []
     for source in sources:
@@ -185,6 +222,14 @@ def attach_linkedin_urls(decision_makers: list[dict], sources: list) -> list[dic
         if matched_url:
             person["linkedin_url"] = matched_url
     return decision_makers
+
+
+def sort_decision_makers_india_first(decision_makers: list[dict]) -> list[dict]:
+    """India-titled/India-scoped contacts surface ahead of global ones
+    (feedback #6), without dropping global contacts that may still be the
+    only named contact available. Stable sort preserves the model's own
+    relative ordering within each tier."""
+    return sorted(decision_makers, key=lambda person: not person.get("is_india_specific", False))
 
 
 async def gather_important_links(company: str, quota_guard=None, registry: SourceRegistry | None = None) -> list[dict]:
@@ -237,7 +282,8 @@ async def resolve_logo(company: str, sources: list, cfg: dict, quota_guard=None)
 def _unscored_result(state: str, insight: str, sources: list, source_links: list, logo_url: str,
                       registry: SourceRegistry, existing_partner: bool = False,
                       analysis: dict | None = None, score_breakdown: dict | None = None,
-                      decision_makers: list | None = None) -> dict:
+                      decision_makers: list | None = None,
+                      research_confidence_label: str = "Insufficient") -> dict:
     return {
         "state": state,
         "fit_score": None,
@@ -253,11 +299,23 @@ def _unscored_result(state: str, insight: str, sources: list, source_links: list
         "logo_url": logo_url,
         "is_existing_tap_partner": existing_partner,
         "source_bank": registry.as_source_bank(),
+        "research_confidence_label": research_confidence_label,
+        "research_confidence_badge": research_confidence_badge(research_confidence_label),
+        "entity_structure": build_entity_structure_view(analysis) if analysis else {
+            "parent_company": "", "india_entity": "", "foundation_entity": "", "notes": "", "is_populated": False,
+        },
     }
 
 
-def _existing_partner_prefix(company: str, note: str) -> str:
-    return f"**Existing TAP partner** — {company} is on TAP's active donor/partner list. {note} "
+def _never_read_silence_as_negative_prefix(company: str, existing_partner: bool, note: str) -> str:
+    """Feedback #2: the 'never read silence as negative' framing previously
+    only applied to existing TAP partners via _existing_partner_prefix. This
+    generalizes the same reassurance to every low-coverage / unscored result,
+    existing partner or not, so thin sourcing never silently reads as a
+    negative signal about the company itself."""
+    if existing_partner:
+        return f"**Existing TAP partner** — {company} is on TAP's active donor/partner list. {note} "
+    return f"**Note:** {note} "
 
 
 async def score(company: str, sources: list, cfg: dict, quota_guard=None,
@@ -286,11 +344,14 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             "doesn't reach. Recommended: direct outreach to their India CSR office to confirm "
             "fit before deprioritising."
         )
-        if existing_partner:
-            insight = _existing_partner_prefix(
-                company, "No public CSR evidence surfaced in this run, but this must never be "
-                "read as 'Not a Target' — follow up internally rather than deprioritising."
-            ) + insight
+        insight = _never_read_silence_as_negative_prefix(
+            company, existing_partner,
+            "No public CSR evidence surfaced in this run, but this must never be "
+            "read as 'Not a Target' — follow up internally rather than deprioritising."
+            if existing_partner else
+            "No public evidence surfaced in this run. Absence of documentation is not "
+            "evidence of absence of fit — follow up directly rather than deprioritising.",
+        ) + insight
         logger.info("score UNSCORED company=%r mode=%r reason=no_sources_found no_anthropic_call", company, mode)
         return _unscored_result(state, insight, sources, source_links, logo_url, registry, existing_partner)
 
@@ -305,23 +366,26 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
     if not analysis:
         cooldown_remaining = llm.anthropic_cooldown_remaining_seconds()
         if cooldown_remaining > 0:
-            insight = (
+            base_note = (
                 f"{llm.LLM_UNAVAILABLE_EVIDENCE} — Anthropic rate limit is active, try again in "
                 f"about {int(cooldown_remaining // 60)}m {int(cooldown_remaining % 60)}s. This is "
                 "a temporary infrastructure gap, not a reflection of the company's fit."
             )
         else:
-            insight = (
+            base_note = (
                 f"{llm.LLM_UNAVAILABLE_EVIDENCE} This is a temporary gap in evidence processing, "
                 "not a reflection of the company's fit — re-run scoring once evidence is available."
             )
-        if existing_partner:
-            insight = _existing_partner_prefix(
-                company, "Scoring could not run this time, but this must never be read as "
-                "'Not a Target'."
-            ) + insight
+        insight = _never_read_silence_as_negative_prefix(
+            company, existing_partner,
+            "Scoring could not run this time, but this must never be read as 'Not a Target'."
+            if existing_partner else
+            "Scoring could not run this time — this is an infrastructure gap, not a fit signal.",
+        ) + base_note
         logger.warning("score UNSCORED company=%r mode=%r reason=analysis_call_failed", company, mode)
         return _unscored_result(state, insight, sources, source_links, logo_url, registry, existing_partner)
+
+    research_confidence_label = analysis.get("research_confidence_label", "Insufficient")
 
     if analysis.get("evidence_coverage_insufficient"):
         coverage_reason = analysis.get("evidence_coverage_reason", "").strip()
@@ -338,22 +402,29 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             f"determination. Recommended: broaden the manual search or reach out directly to "
             f"the company's India CSR office before deprioritising."
         )
-        if existing_partner:
-            insight = _existing_partner_prefix(
-                company, "Evidence coverage was too thin to score confidently in this "
-                "run, but this must never be read as 'Not a Target'."
-            ) + insight
+        insight = _never_read_silence_as_negative_prefix(
+            company, existing_partner,
+            "Evidence coverage was too thin to score confidently in this run, but this must "
+            "never be read as 'Not a Target'."
+            if existing_partner else
+            "Evidence coverage was too thin to score confidently in this run — this reflects "
+            "thin public documentation, not a judgment on fit.",
+        ) + insight
         logger.warning(
             "score UNSCORED company=%r mode=%r reason=evidence_coverage_insufficient "
-            "coverage_reason=%r avg_confidence=%.1f weighted_confidence=%.1f authenticity=%d",
-            company, mode, coverage_reason, avg_conf, weighted_conf, authenticity,
+            "coverage_reason=%r avg_confidence=%.1f weighted_confidence=%.1f authenticity=%d "
+            "research_confidence=%s",
+            company, mode, coverage_reason, avg_conf, weighted_conf, authenticity, research_confidence_label,
         )
-        decision_makers = attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources)
+        decision_makers = sort_decision_makers_india_first(
+            attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources)
+        )
         return _unscored_result(
             state, insight, sources, source_links, logo_url, registry, existing_partner,
             analysis=analysis,
             score_breakdown=build_score_breakdown(analysis),
             decision_makers=decision_makers,
+            research_confidence_label=research_confidence_label,
         )
 
     final_score = analysis["fit_score"]
@@ -368,12 +439,24 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
     if obligation_signal.get("computable") and obligation_signal.get("latest_year_underspending") and obligation_signal.get("explanation"):
         insight = f"{insight} {obligation_signal['explanation']}"
 
+    # Feedback #3 (partial-coverage tier): a result can clear the hard
+    # evidence_coverage_is_too_low gate above and still land in the "Low"
+    # research-confidence band. Rather than silently showing a scored result
+    # with no visible caveat, prepend the same directional-treatment banner
+    # that thin-but-scored results deserve — this is now default behavior
+    # for every company at Low research confidence, not just existing
+    # partners (feedback #2).
+    if research_confidence_label == "Low":
+        insight = f"**{PARTIAL_COVERAGE_BANNER}** {insight}"
+
     if existing_partner:
-        insight = _existing_partner_prefix(
-            company, "This score reflects that established relationship."
+        insight = _never_read_silence_as_negative_prefix(
+            company, existing_partner, "This score reflects that established relationship."
         ) + insight
 
-    decision_makers = attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources)
+    decision_makers = sort_decision_makers_india_first(
+        attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources)
+    )
 
     try:
         important_links = await gather_important_links(company, quota_guard=quota_guard, registry=registry)
@@ -382,8 +465,8 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         important_links = []
 
     logger.info(
-        "score DONE company=%r mode=%r fit_score=%d tier=%s source_bank_size=%d",
-        company, mode, final_score, tier.get("label"), len(registry.entries()),
+        "score DONE company=%r mode=%r fit_score=%d tier=%s research_confidence=%s source_bank_size=%d",
+        company, mode, final_score, tier.get("label"), research_confidence_label, len(registry.entries()),
     )
 
     return {
@@ -401,5 +484,8 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         "logo_url": logo_url,
         "source_bank": registry.as_source_bank(),
         "is_existing_tap_partner": existing_partner,
+        "research_confidence_label": research_confidence_label,
+        "research_confidence_badge": research_confidence_badge(research_confidence_label),
+        "entity_structure": build_entity_structure_view(analysis),
         "cache_key": (mode, company.strip().lower(), evidence_hash(sources), mission_hash(mission)),
     }

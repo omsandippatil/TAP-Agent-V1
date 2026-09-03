@@ -177,6 +177,23 @@ INDIA_LEGAL_ENTITY_PATTERN = re.compile(
     r"(?:Foundation|Trust|Chapter))\b"
 )
 
+# Feedback item #8: companies frequently run CSR through more than one distinct
+# legal vehicle — the parent/global brand, a separately incorporated India
+# entity/branch, and a separately-named foundation or trust (UBS AG Mumbai
+# Branch vs UBS Optimus Foundation is the case that motivated this). This
+# pattern specifically hunts for a "<Brand> Foundation" / "<Brand> Trust" /
+# "<Brand> AG/Branch" style name so discover_related_entities() below can find
+# these even when they don't share the exact company string passed in.
+RELATED_ENTITY_NAME_PATTERN = re.compile(
+    r"\b([A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,4}\s+"
+    r"(?:Foundation|Trust|CSR\s+Foundation|Charitable\s+Trust))\b"
+)
+RELATED_INDIA_BRANCH_PATTERN = re.compile(
+    r"\b([A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,4}\s+"
+    r"(?:AG|SE|N\.?V\.?|PLC)?\s*(?:India|Mumbai|Delhi|Bengaluru|Bangalore)\s+"
+    r"(?:Branch|Private\s+Limited|Pvt\.?\s+Ltd\.?|Limited|Ltd\.?))\b"
+)
+
 CURRENCY_NEAR_INDIA_WINDOW_CHARS = 200
 
 CURRENT_FY_LABEL = "FY2025-26"
@@ -221,6 +238,19 @@ LEGAL_ENTITY_RESOLUTION_QUERIES = [
     '"{c}" India Pvt Ltd registered company name MCA',
 ]
 
+# Feedback item #8: dedicated query set to discover related legal vehicles —
+# a separately-named foundation/trust, or a separately incorporated India
+# branch/subsidiary — that may run CSR under a different name than the parent
+# company string the analyst typed in. Run once per company (cached on the
+# SearchBudget, same pattern as resolve_india_legal_entity_name) and the
+# resulting entity names are then also used as extra query substitutions in
+# the partner/programme/CSR-page fetchers, not just recorded for the report.
+RELATED_ENTITY_DISCOVERY_QUERIES = [
+    '"{c}" foundation CSR India',
+    '"{c}" "group foundation" OR "CSR arm" OR "CSR trust" India',
+    '"{c}" India branch OR subsidiary CSR "corporate social responsibility"',
+]
+
 ANNUAL_REPORT_QUERIES = [
     '"{c}" "annual report" {fy} India CSR crore filetype:pdf',
     '"{c}" "business responsibility and sustainability report" India filetype:pdf',
@@ -253,6 +283,13 @@ CSR_SPEND_ENTITY_QUERIES = [
     '"{legal_name}" "CSR expenditure" crore {fy}',
 ]
 
+# Feedback item #5: the original query set relied on a handful of generic
+# "partner" phrasings and missed named-format initiatives entirely (the UBS
+# Educate Girls / Quality Education India Development Impact Bonds were not
+# surfaced because nothing here searched for that vocabulary specifically).
+# Added: an explicit DIB/outcomes-fund query, an annual-report/impact-report
+# grant-recipients query, and a multi-year angle so partner history isn't
+# limited to whatever the single most recent press release mentions.
 PARTNER_QUERIES = [
     '"{c}" CSR "implementation partner" OR "implementing partner" India NGO named',
     '"{c}" foundation "grant recipients" OR "funded organisations" India CSR named',
@@ -260,10 +297,26 @@ PARTNER_QUERIES = [
     'site:linkedin.com/company "{c}" "partnered with" OR "proud to partner" OR "MoU" NGO CSR India',
     '"{c}" "memorandum of understanding" OR "MoU" NGO education CSR India',
     '"{c}" CSR NGO partner India',
+    '"{c}" "development impact bond" OR "DIB" OR "outcomes fund" education India',
+    '"{c}" impact report OR annual report "grant recipients" OR "partner organisations" education',
+    '"{c}" CSR partner {fy1} OR {fy2} OR {fy3} named NGO',
 ]
 
-MAX_PARTNER_SOURCES = 6
-MAX_PROGRAMME_SOURCES = 4
+# Feedback item #5: once an initial pass finds candidate NGO/partner names, run
+# a second round of targeted queries per name to confirm and expand — this is
+# what catches a partner *network* (e.g. Gyan Shala, Kaivalya Education
+# Foundation, Educational Initiatives, Pratham Infotech Foundation, Society
+# for All Round Development all appearing around the same UBS DIBs) instead of
+# reporting only the single most prominent name from the first pass.
+PARTNER_FOLLOWUP_QUERIES = [
+    '"{partner}" "{c}" partnership OR funded OR implementing',
+]
+
+MAX_PARTNER_SOURCES_DEEP = 12
+MAX_PARTNER_SOURCES_SCREEN = 6
+MAX_PROGRAMME_SOURCES_DEEP = 8
+MAX_PROGRAMME_SOURCES_SCREEN = 4
+MAX_PARTNER_FOLLOWUP_NAMES = 5
 
 PLAN_QUERIES = [
     '"{c}" CSR "partnered with" OR "partnership with" education India announced',
@@ -283,6 +336,14 @@ LINKEDIN_PEOPLE_GLOBAL_FALLBACK_QUERIES = [
     'site:linkedin.com/in "{c}" "head of sustainability" OR "chief sustainability officer"',
 ]
 
+# Feedback item #4: the original single flat query bucket recognised broad
+# themes ("education", "STEM") but rarely surfaced the fuller
+# programme -> intervention -> beneficiary -> geography -> partner chain a
+# fundraiser actually needs. The named-initiative and outcomes-fund queries
+# below are the "stage 1" broad pass; fetch_education_programme_source now
+# also runs a "stage 2" follow-up (see PROGRAMME_DEEP_DIVE_QUERY_TEMPLATE)
+# per named programme it finds, specifically hunting for the missing chain
+# elements (geography, beneficiaries, partner, scale/outcomes).
 EDUCATION_PROGRAMME_QUERIES = [
     '"{c}" CSR "digital literacy" OR STEM OR coding OR skilling India students',
     '"{c}" "21st century skills" OR "21st-century skills" India CSR',
@@ -290,6 +351,31 @@ EDUCATION_PROGRAMME_QUERIES = [
     '"{c}" "development impact bond" OR "outcomes fund" education India',
     '"{c}" education programme "in partnership with" OR "delivered by" OR "implemented by" India',
 ]
+
+# Feedback item #4 (stage 2 — programme chain deep-dive). Fired once per
+# distinct named programme discovered in stage 1, to fill in exactly the
+# chain elements a fundraiser needs (geography, beneficiaries, partner,
+# government-school involvement, scale/outcomes) that a generic theme query
+# routinely misses.
+PROGRAMME_DEEP_DIVE_QUERY_TEMPLATE = (
+    '"{programme}" "{c}" geography OR beneficiaries OR students OR partner OR scale OR outcomes'
+)
+MAX_PROGRAMME_DEEP_DIVE_NAMES = 4
+
+# Heuristic extraction of candidate named-programme / named-partner phrases
+# from already-fetched snippet text, used to seed the stage-2 follow-up
+# queries above without waiting for the LLM extraction pass (which runs much
+# later, after all sources are already fetched). This is intentionally loose
+# — false positives here just mean one extra wasted search query, whereas
+# missing a real name here means the deep-dive follow-up never fires at all.
+NAMED_INITIATIVE_PATTERN = re.compile(
+    r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){1,5}\s+"
+    r"(?:Development Impact Bond|Outcomes Fund|Programme|Program|Initiative|Project|Mission|Scholarship))\b"
+)
+NAMED_NGO_PATTERN = re.compile(
+    r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,4}\s+"
+    r"(?:Foundation|Trust|Education Foundation|Infotech Foundation))\b"
+)
 
 SECTOR_QUERIES = [
     '"{c}" India sector industry business overview annual report',
@@ -337,7 +423,12 @@ SOURCE_DEADLINE_SECONDS = 18
 FOLLOWUP_DEADLINE_SECONDS = 10
 CONCURRENT_FETCH_LIMIT = 2
 
-DEEP_JOB_HARD_DEADLINE_SECONDS = 110
+# Feedback items #1 and #5 call for materially deeper retrieval (entity
+# resolution, wider partner search, programme deep-dives). That extra work
+# needs a longer hard deadline and a larger query budget in deep mode, or the
+# new passes would simply get starved by sources 1-4 as before. Screen mode
+# keeps its original, faster ceiling since it is explicitly a triage pass.
+DEEP_JOB_HARD_DEADLINE_SECONDS = 150
 MAX_PDF_DOWNLOAD_BYTES = 15 * 1024 * 1024
 PDF_STREAM_CHUNK_BYTES = 262144
 MAX_PDF_PAGES_HARD_CAP = 40
@@ -457,6 +548,96 @@ def mentions_company_specifically(company: str, text: str) -> bool:
     if len(positions) < 2:
         return mentions_company(company, text)
     return any(b - a < _ENTITY_PROXIMITY_WINDOW_CHARS for a, b in zip(positions, positions[1:]))
+
+
+# ---------------------------------------------------------------------------
+# ENTITY RESOLUTION (feedback item #8)
+#
+# Companies frequently run CSR through more than one distinct legal vehicle —
+# a global/parent brand, a separately incorporated India entity or branch,
+# and/or a separately-named foundation or trust. Prior to this, every fetcher
+# searched only for the literal company string typed in, so evidence sitting
+# under a differently-named foundation (UBS Optimus Foundation vs "UBS") was
+# invisible to the whole pipeline. discover_related_entities() below finds
+# these once per company and callers can fold the results into their own
+# query substitutions.
+# ---------------------------------------------------------------------------
+
+
+def _looks_like_same_entity(company: str, candidate: str) -> bool:
+    """True if candidate is just the company name with corporate suffixes —
+    i.e. not actually a distinct related entity worth tracking separately."""
+    company_norm = re.sub(r"[^a-z0-9]", "", company.lower())
+    candidate_norm = re.sub(r"[^a-z0-9]", "", candidate.lower())
+    return company_norm == candidate_norm
+
+
+def _extract_related_entity_candidates(company: str, text: str) -> list[dict]:
+    if not text:
+        return []
+    tokens = company_name_tokens(company)
+    candidates: list[dict] = []
+    seen = set()
+
+    for pattern, entity_type in (
+        (RELATED_ENTITY_NAME_PATTERN, "FOUNDATION"),
+        (RELATED_INDIA_BRANCH_PATTERN, "INDIA_SUBSIDIARY"),
+    ):
+        for match in pattern.finditer(text):
+            name = re.sub(r"\s+", " ", match.group(1)).strip()
+            if _looks_like_same_entity(company, name):
+                continue
+            name_lower = name.lower()
+            if tokens and not any(token in name_lower for token in tokens):
+                continue
+            key = name_lower
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({"entity_name": name, "entity_type": entity_type})
+    return candidates
+
+
+async def discover_related_entities(company: str, search_cfg: dict, budget: SearchBudget,
+                                     quota_guard=None, deadline: float | None = None) -> list[dict]:
+    """Search for a separately-named foundation/trust or a separately
+    incorporated India branch/subsidiary connected to `company`. Cached on
+    the SearchBudget instance for the lifetime of one company run, the same
+    pattern as resolve_india_legal_entity_name, since this is a one-time
+    lookup other fetchers reuse rather than repeat per-source."""
+    if getattr(budget, "related_entities_resolved", False):
+        return budget.related_entities_cache or []
+
+    discovered: dict[str, dict] = {}
+    for query_template in RELATED_ENTITY_DISCOVERY_QUERIES:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        if not budget.google_has_budget("entity_resolution") and not budget.ddgs_has_budget():
+            break
+        query = query_template.format(c=company)
+        results = await search_web(
+            query, budget, max_results=6, prefer_google=search_cfg.get("mca", True),
+            quota_guard=quota_guard, category="entity_resolution",
+        )
+        for result in results:
+            haystack = f"{result.get('title', '')} {result.get('body', '')}"
+            for candidate in _extract_related_entity_candidates(company, haystack):
+                key = candidate["entity_name"].lower()
+                if key not in discovered:
+                    discovered[key] = candidate
+
+    resolved = list(discovered.values())
+    budget.related_entities_resolved = True
+    budget.related_entities_cache = resolved
+    logger.info(
+        "discover_related_entities DONE company=%r found=%d names=%s",
+        company, len(resolved), [e["entity_name"] for e in resolved],
+    )
+    return resolved
+
+
+def related_entity_names(related_entities: list[dict]) -> list[str]:
+    return [e.get("entity_name", "") for e in (related_entities or []) if e.get("entity_name")]
 
 
 def candidate_domains(company: str) -> list[str]:
@@ -1506,77 +1687,150 @@ async def fetch_multi_year_financials(company: str, search_cfg: dict, budget: Se
 
 _PARTNER_RELEVANCE_KEYWORD_PATTERN = re.compile(
     r"\b(partner|partnered|partnership|ngo|foundation|mou|memorandum|collaborat|"
-    r"implement|grant|csr)\b", re.IGNORECASE,
+    r"implement|grant|csr|development impact bond|dib|outcomes fund)\b", re.IGNORECASE,
 )
 
 
+def _extract_named_partner_candidates(company: str, text: str) -> list[str]:
+    """Loose heuristic used to seed the stage-2 partner follow-up (feedback
+    #5). Pulls candidate NGO/foundation names out of already-fetched text so
+    a second round of targeted queries can confirm/expand the partner
+    network instead of stopping at whichever name appeared in the single
+    most prominent result."""
+    if not text:
+        return []
+    seen = set()
+    ordered = []
+    for match in NAMED_NGO_PATTERN.finditer(text):
+        name = re.sub(r"\s+", " ", match.group(1)).strip()
+        if _looks_like_same_entity(company, name):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(name)
+    return ordered
+
+
 async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
+                                registry: SourceRegistry | None = None, job_deadline: float | None = None,
+                                related_entities: list[dict] | None = None, mode: str = "deep") -> dict:
     await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
     if job_deadline is not None:
         deadline = min(deadline, job_deadline)
+    max_partner_sources = MAX_PARTNER_SOURCES_DEEP if mode == "deep" else MAX_PARTNER_SOURCES_SCREEN
     candidates: list[tuple[float, str, str]] = []
     seen_urls: set[str] = set()
     urls_tried = 0
 
-    for template in PARTNER_QUERIES:
-        if not await _within_deadline(deadline):
-            break
-        query = template.format(c=company)
-        results = await search_web(
-            query, budget, max_results=6, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard,
-            category="partner_search",
-        )
-        for result in results:
+    # Run the standard query set against both the company name and any
+    # related entities discovered upstream (feedback #8) — a foundation's
+    # partners are frequently only discoverable by searching the foundation's
+    # own name, not the parent brand.
+    search_targets = [company] + related_entity_names(related_entities)[:2]
+
+    for target in search_targets:
+        for template in PARTNER_QUERIES:
             if not await _within_deadline(deadline):
                 break
-            url = result.get("href", "")
-            title = result.get("title", "")
-            body = result.get("body", "")
-            if not url or url in seen_urls:
-                continue
-            if not mentions_company_specifically(company, f"{title} {body}"):
-                continue
+            if len(candidates) >= max_partner_sources * 2:
+                break
+            query = template.format(c=target, fy1=CURRENT_FY_LABEL, fy2=PRIOR_FY_LABELS[0], fy3=PRIOR_FY_LABELS[1])
+            results = await search_web(
+                query, budget, max_results=6, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard,
+                category="partner_search",
+            )
+            for result in results:
+                if not await _within_deadline(deadline):
+                    break
+                url = result.get("href", "")
+                title = result.get("title", "")
+                body = result.get("body", "")
+                if not url or url in seen_urls:
+                    continue
+                if not mentions_company_specifically(company, f"{title} {body}") and not mentions_company_specifically(target, f"{title} {body}"):
+                    continue
 
-            if "linkedin.com" in url:
-                snippet_text = f"{title}. {body}".strip()
-                if len(snippet_text) < 40 or not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(snippet_text):
+                if "linkedin.com" in url:
+                    snippet_text = f"{title}. {body}".strip()
+                    if len(snippet_text) < 40 or not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(snippet_text):
+                        continue
+                    seen_urls.add(url)
+                    urls_tried += 1
+                    score = score_candidate_text(company, snippet_text, url)
+                    candidates.append((score, url, snippet_text))
+                    continue
+
+                if any(domain in url for domain in AGGREGATOR_DOMAINS):
                     continue
                 seen_urls.add(url)
                 urls_tried += 1
-                score = score_candidate_text(company, snippet_text, url)
-                candidates.append((score, url, snippet_text))
-                continue
+                is_pdf = url.lower().endswith(".pdf")
+                text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
+                if is_pdf and text and not pdf_is_csr_relevant(text):
+                    continue
+                if not text or len(text) < 150 or not mentions_company(company, text):
+                    continue
+                if not is_csr_relevant(text) and not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(text):
+                    continue
+                score = score_candidate_text(company, text, url)
+                candidates.append((score, url, text))
 
-            if any(domain in url for domain in AGGREGATOR_DOMAINS):
-                continue
-            seen_urls.add(url)
-            urls_tried += 1
-            is_pdf = url.lower().endswith(".pdf")
-            text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
-            if is_pdf and text and not pdf_is_csr_relevant(text):
-                continue
-            if not text or len(text) < 150 or not mentions_company(company, text):
-                continue
-            if not is_csr_relevant(text) and not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(text):
-                continue
-            score = score_candidate_text(company, text, url)
-            candidates.append((score, url, text))
-
-        if len(candidates) >= MAX_PARTNER_SOURCES * 2:
+            if len(candidates) >= max_partner_sources * 2:
+                break
+        if len(candidates) >= max_partner_sources * 2:
             break
 
-    logger.info("partner_search DONE company=%r urls_tried=%d candidates_found=%d", company, urls_tried, len(candidates))
+    # Stage 2 (feedback #5): pull candidate partner org names out of what we
+    # already fetched, then run a small number of targeted follow-up queries
+    # per name to confirm/expand the partner network rather than reporting
+    # only whichever single name surfaced first.
+    if mode == "deep" and await _within_deadline(deadline):
+        candidate_names: list[str] = []
+        for _, _, text in candidates:
+            for name in _extract_named_partner_candidates(company, text):
+                if name not in candidate_names:
+                    candidate_names.append(name)
+        for partner_name in candidate_names[:MAX_PARTNER_FOLLOWUP_NAMES]:
+            if not await _within_deadline(deadline):
+                break
+            for template in PARTNER_FOLLOWUP_QUERIES:
+                query = template.format(partner=partner_name, c=company)
+                results = await search_web(
+                    query, budget, max_results=4, prefer_google=search_cfg.get("partners", True),
+                    quota_guard=quota_guard, category="partner_search",
+                )
+                for result in results:
+                    url = result.get("href", "")
+                    title = result.get("title", "")
+                    body = result.get("body", "")
+                    if not url or url in seen_urls or any(domain in url for domain in AGGREGATOR_DOMAINS):
+                        continue
+                    if not mentions_company_specifically(company, f"{title} {body}"):
+                        continue
+                    seen_urls.add(url)
+                    urls_tried += 1
+                    text = await fetch_page_text(url) or body
+                    if not text or len(text) < 120 or not mentions_company(company, text):
+                        continue
+                    score = score_candidate_text(company, text, url) + 3.0
+                    candidates.append((score, url, text))
+
+    logger.info(
+        "partner_search DONE company=%r urls_tried=%d candidates_found=%d mode=%s search_targets=%s",
+        company, urls_tried, len(candidates), mode, search_targets,
+    )
 
     if not candidates:
         return make_source("partner_search", 5, status="NOT_FOUND")
 
     candidates.sort(key=lambda c: c[0], reverse=True)
-    top = candidates[:MAX_PARTNER_SOURCES]
+    top = candidates[:max_partner_sources]
     combined_text = "\n\n---\n\n".join(f"[{url}]\n{text[:2500]}" for _, url, text in top)
     primary_url = top[0][1]
-    source = make_source("partner_search", 5, primary_url, clean_text(combined_text, 8000), "FOUND", "search")
+    source = make_source("partner_search", 5, primary_url, clean_text(combined_text, 10000), "FOUND", "search")
 
     if registry is not None:
         registry.register_core_source(source)
@@ -1590,62 +1844,106 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
 
 
 async def fetch_education_programme_source(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
-                                            registry: SourceRegistry | None = None, job_deadline: float | None = None) -> dict:
+                                            registry: SourceRegistry | None = None, job_deadline: float | None = None,
+                                            related_entities: list[dict] | None = None, mode: str = "deep") -> dict:
     await _check_job_deadline(job_deadline)
     deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
     if job_deadline is not None:
         deadline = min(deadline, job_deadline)
 
+    max_programme_sources = MAX_PROGRAMME_SOURCES_DEEP if mode == "deep" else MAX_PROGRAMME_SOURCES_SCREEN
     candidates: list[tuple[float, str, str]] = []
     seen_urls: set[str] = set()
     urls_tried = 0
 
-    for template in EDUCATION_PROGRAMME_QUERIES:
-        if not await _within_deadline(deadline):
-            break
-        query = template.format(c=company)
-        results = await search_web(
-            query, budget, max_results=6, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard,
-            category="education_programme_search",
-        )
-        for result in results:
+    search_targets = [company] + related_entity_names(related_entities)[:2]
+
+    for target in search_targets:
+        for template in EDUCATION_PROGRAMME_QUERIES:
             if not await _within_deadline(deadline):
                 break
-            url = result.get("href", "")
-            title = result.get("title", "")
-            body = result.get("body", "")
-            if not url or url in seen_urls or any(domain in url for domain in AGGREGATOR_DOMAINS):
-                continue
-            if not mentions_company(company, f"{title} {body}"):
-                continue
-            seen_urls.add(url)
-            urls_tried += 1
-            is_pdf = url.lower().endswith(".pdf")
-            text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
-            if not text or len(text) < 150 or not mentions_company(company, text):
-                continue
-            if "education" not in text.lower() and not any(kw in text.lower() for kw in EDUCATION_KEYWORDS):
-                continue
-            score = score_candidate_text(company, text, url) + 5.0
-            candidates.append((score, url, text))
+            if len(candidates) >= max_programme_sources * 2:
+                break
+            query = template.format(c=target)
+            results = await search_web(
+                query, budget, max_results=6, prefer_google=search_cfg.get("partners", True), quota_guard=quota_guard,
+                category="education_programme_search",
+            )
+            for result in results:
+                if not await _within_deadline(deadline):
+                    break
+                url = result.get("href", "")
+                title = result.get("title", "")
+                body = result.get("body", "")
+                if not url or url in seen_urls or any(domain in url for domain in AGGREGATOR_DOMAINS):
+                    continue
+                if not mentions_company(company, f"{title} {body}") and not mentions_company(target, f"{title} {body}"):
+                    continue
+                seen_urls.add(url)
+                urls_tried += 1
+                is_pdf = url.lower().endswith(".pdf")
+                text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
+                if not text or len(text) < 150 or not mentions_company(company, text):
+                    continue
+                if "education" not in text.lower() and not any(kw in text.lower() for kw in EDUCATION_KEYWORDS):
+                    continue
+                score = score_candidate_text(company, text, url) + 5.0
+                candidates.append((score, url, text))
 
-        if len(candidates) >= MAX_PROGRAMME_SOURCES * 2:
+            if len(candidates) >= max_programme_sources * 2:
+                break
+        if len(candidates) >= max_programme_sources * 2:
             break
 
+    # Stage 2 (feedback #4): for named programmes/initiatives found in stage 1
+    # text, run a targeted deep-dive query to fill in the chain elements a
+    # fundraiser actually needs (geography, beneficiaries, partner, scale)
+    # rather than leaving the report with just the theme-level mention.
+    if mode == "deep" and await _within_deadline(deadline):
+        programme_names: list[str] = []
+        for _, _, text in candidates:
+            for match in NAMED_INITIATIVE_PATTERN.finditer(text):
+                name = re.sub(r"\s+", " ", match.group(1)).strip()
+                if name not in programme_names:
+                    programme_names.append(name)
+        for programme_name in programme_names[:MAX_PROGRAMME_DEEP_DIVE_NAMES]:
+            if not await _within_deadline(deadline):
+                break
+            query = PROGRAMME_DEEP_DIVE_QUERY_TEMPLATE.format(programme=programme_name, c=company)
+            results = await search_web(
+                query, budget, max_results=5, prefer_google=search_cfg.get("partners", True),
+                quota_guard=quota_guard, category="education_programme_search",
+            )
+            for result in results:
+                url = result.get("href", "")
+                title = result.get("title", "")
+                body = result.get("body", "")
+                if not url or url in seen_urls or any(domain in url for domain in AGGREGATOR_DOMAINS):
+                    continue
+                if not mentions_company(company, f"{title} {body}"):
+                    continue
+                seen_urls.add(url)
+                urls_tried += 1
+                text = await fetch_page_text(url) or body
+                if not text or len(text) < 120 or not mentions_company(company, text):
+                    continue
+                score = score_candidate_text(company, text, url) + 4.0
+                candidates.append((score, url, text))
+
     logger.info(
-        "education_programme_search DONE company=%r urls_tried=%d candidates_found=%d",
-        company, urls_tried, len(candidates),
+        "education_programme_search DONE company=%r urls_tried=%d candidates_found=%d mode=%s",
+        company, urls_tried, len(candidates), mode,
     )
 
     if not candidates:
         return make_source("education_programme_search", 9, status="NOT_FOUND")
 
     candidates.sort(key=lambda c: c[0], reverse=True)
-    top = candidates[:MAX_PROGRAMME_SOURCES]
+    top = candidates[:max_programme_sources]
     combined_text = "\n\n---\n\n".join(f"[{url}]\n{text[:2500]}" for _, url, text in top)
     primary_url = top[0][1]
     source = make_source(
-        "education_programme_search", 9, primary_url, clean_text(combined_text, 8000), "FOUND", "search"
+        "education_programme_search", 9, primary_url, clean_text(combined_text, 10000), "FOUND", "search"
     )
 
     if registry is not None:
@@ -1737,7 +2035,15 @@ async def fetch_linkedin_people(company: str, search_cfg: dict, budget: SearchBu
     if not hits:
         return make_source("people_search", 6, status="NOT_FOUND")
 
-    hits.sort(key=lambda h: (h.get("confidence") != "HIGH", h.get("confidence") != "MEDIUM"))
+    # India-specific contacts are prioritised ahead of global ones (feedback
+    # #6) — the confidence ordering already exists, this adds a location-aware
+    # tiebreak within each confidence tier so an India-titled contact of equal
+    # confidence surfaces above a global one.
+    hits.sort(key=lambda h: (
+        h.get("confidence") != "HIGH",
+        h.get("confidence") != "MEDIUM",
+        not h.get("india_location_signal"),
+    ))
     high_confidence_hits = [h for h in hits if h.get("confidence") == "HIGH"]
     medium_confidence_hits = [h for h in hits if h.get("confidence") == "MEDIUM"]
     final_hits = (high_confidence_hits + medium_confidence_hits)[:10] or hits[:6]
@@ -1921,9 +2227,9 @@ async def fetch_screen_sources(company: str, search_cfg: dict, quota_guard=None,
     source_4 = await fetch_annual_report(company, search_cfg, budget, quota_guard, registry=registry)
     source_10 = await fetch_multi_year_financials(company, search_cfg, budget, quota_guard, registry=registry, annual_report_source=source_4)
     source_2 = await fetch_mca_portal(company, search_cfg, budget, quota_guard, registry=registry)
-    source_5 = await fetch_partner_source(company, search_cfg, budget, quota_guard, registry=registry)
+    source_5 = await fetch_partner_source(company, search_cfg, budget, quota_guard, registry=registry, mode="screen")
     source_6 = await fetch_linkedin_people(company, search_cfg, budget, quota_guard, registry=registry)
-    source_9 = await fetch_education_programme_source(company, search_cfg, budget, quota_guard, registry=registry)
+    source_9 = await fetch_education_programme_source(company, search_cfg, budget, quota_guard, registry=registry, mode="screen")
 
     source_3 = make_source("national_csr_portal", 3, status="NOT_TRIED")
     source_7 = make_source("plans_search", 7, status="NOT_TRIED")
@@ -1951,7 +2257,27 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
         if progress_cb:
             await progress_cb(message)
 
+    related_entities: list[dict] = []
+
     try:
+        # Feedback item #8: resolve related legal entities (foundation, India
+        # branch/subsidiary) BEFORE the retrieval-heavy fetchers run, so their
+        # query templates can also search under those names. This is cheap
+        # relative to the rest of the pipeline and directly targets cases
+        # like UBS Optimus Foundation being invisible to a "UBS" search.
+        await advance_step("Mapping related entities — parent, India branch, foundation...")
+        related_entities = await discover_related_entities(
+            company, search_cfg, budget, quota_guard, deadline=job_deadline,
+        )
+        if registry is not None and related_entities:
+            for entity in related_entities:
+                registry.register_child_hit(
+                    source_name="entity_resolution",
+                    url="",
+                    label=f"Related entity — {entity.get('entity_name', '')} ({entity.get('entity_type', '')})",
+                    excerpt="",
+                )
+
         await advance_step("Sources 1-4/10 — CSR page, MCA, National CSR Portal, annual report...")
         source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_2 = await fetch_mca_portal(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
@@ -1965,11 +2291,17 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
         )
 
         await advance_step("Sources 5-9/10 — partners, decision-makers, plans, sector, education programmes...")
-        source_5 = await fetch_partner_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        source_5 = await fetch_partner_source(
+            company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline,
+            related_entities=related_entities, mode="deep",
+        )
         source_6 = await fetch_linkedin_people(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_7 = await fetch_plans_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_8 = await fetch_sector_eligibility_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
-        source_9 = await fetch_education_programme_source(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        source_9 = await fetch_education_programme_source(
+            company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline,
+            related_entities=related_entities, mode="deep",
+        )
     except DeepJobDeadlineExceeded:
         logger.warning("fetch_deep_sources hit hard job deadline company=%r seconds=%d", company, DEEP_JOB_HARD_DEADLINE_SECONDS)
         existing = locals()
@@ -2025,9 +2357,9 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
     found_count = sum(1 for s in sources if s.get("status") == "FOUND")
     logger.info(
         "fetch_deep_sources DONE company=%r found=%d/10 total_financial_figures=%d source_bank_entries=%d "
-        "google_used=%d ddgs_used=%d",
+        "google_used=%d ddgs_used=%d related_entities=%d",
         company, found_count, sum(count_financial_figures(s.get("text", "")) for s in sources),
-        len(registry.entries()), budget.google_queries_used, budget.ddgs_queries_used,
+        len(registry.entries()), budget.google_queries_used, budget.ddgs_queries_used, len(related_entities),
     )
     gc.collect()
     return sources

@@ -43,6 +43,7 @@ EXTRACTION_PRIORITY_KEYS = [
     "sector",
     "eligibility",
     "spend",
+    "entity_structure",
 ]
 
 
@@ -198,7 +199,11 @@ SCORING_PHILOSOPHY = (
     "the higher one — undocumented should never read as a negative signal. This applies "
     "per-criterion; it does not mean invent facts, and it does not mean treat every company as "
     "a great fit — evidence that actively points away from fit should bring scores down "
-    "honestly, just as evidence that supports fit should bring them up."
+    "honestly, just as evidence that supports fit should bring them up. Critically: a low "
+    "fit score and low research confidence are NOT the same conclusion. If evidence is thin, "
+    "say so plainly and let the evidence-coverage gate (applied outside this prompt) handle "
+    "whether the score should be shown at all — do not pre-emptively collapse toward a low "
+    "score just because the sources you were given are sparse."
 )
 
 SCORING_CONSISTENCY_RULE = (
@@ -258,6 +263,31 @@ PROFIT_HISTORY_RULE = (
     "not perform that calculation yourself, only extract the profit figures faithfully."
 )
 
+# Feedback item #8: companies frequently operate CSR through more than one legal
+# vehicle (a direct India entity AND a separately-named foundation/trust). Earlier
+# versions of this prompt only asked the model to "note in prose" which entity did
+# what, which the model routinely skipped under output-budget pressure. This is now
+# a first-class structured field (entity_structure) populated in its own step, and
+# every programme/partner must also carry funded_by_entity so a report can render an
+# actual parent -> India entity -> foundation -> programme -> partner chain instead
+# of a single flattened company profile.
+ENTITY_STRUCTURE_RULE = (
+    "ENTITY STRUCTURE (feedback priority — do this as a distinct step before programmes/"
+    "partners): scan the evidence for every distinct named legal vehicle connected to "
+    "{company} that could plausibly run or fund CSR — the parent/global company, a "
+    "separately incorporated India entity or branch, and any separately-named foundation, "
+    "trust, or CSR arm (e.g. 'X Foundation', 'X India Private Limited', 'X AG Mumbai "
+    "Branch'). Populate entity_structure with whichever of these are actually named in the "
+    "evidence — leave a field empty rather than guessing if the evidence never names that "
+    "layer. Do not assume the parent and a named foundation are the same funding channel "
+    "just because they share a brand name — they are related but distinct, and evidence "
+    "about one is not automatically evidence about the other unless the text says so. Every "
+    "programme and partner extracted later must set funded_by_entity to whichever of these "
+    "named entities the evidence actually attributes it to (or leave it empty if the "
+    "evidence does not make that clear) — never silently default it to the parent company "
+    "name."
+)
+
 PARTNER_RULE = (
     "PARTNERS: include a named third-party organisation as a partner only if the evidence shows "
     "an actual relationship (funds, co-designs, implements with, partners with, delivers via, "
@@ -272,14 +302,24 @@ PARTNER_RULE = (
     "delivery_model_fit, so weigh it there yourself. If your own fit_rationale or "
     "delivery_model_evidence text names a third-party org the company works with, that same org "
     "must also appear in the partners array — never describe a partnership in prose while "
-    "leaving it out of the structured list. "
+    "leaving it out of the structured list. Set funded_by_entity per the ENTITY STRUCTURE rule. "
     "PARTNER HISTORY DEPTH (feedback priority): a partner list is far more valuable to a "
     "fundraiser when it spans multiple years, because it reveals whether the relationship is "
     "one-off or sustained, and what scale of grant the company typically gives. Actively check "
     "the evidence for partner mentions across different fiscal years / annual reports, not just "
     "the most recent one, and include each distinct (partner, year) combination you find as a "
     "separate entry rather than collapsing multi-year partners into a single undated entry — "
-    "this lets the reader see the funding pattern over time."
+    "this lets the reader see the funding pattern over time. NAMED-FORMAT INITIATIVES "
+    "(feedback priority, check this specifically): a Development Impact Bond, outcomes fund, "
+    "flagship-named programme, or any other formally-named initiative is exactly the kind of "
+    "detail that is easy to under-extract because it can appear as a passing mention rather "
+    "than a dedicated CSR-page paragraph. If the evidence references one anywhere, even in a "
+    "single sentence or a footnote-like mention, always extract it as its own programme entry "
+    "with confidence='probable' at minimum — never fold it into a generic theme sentence in "
+    "key_facts_summary instead of a structured programme entry. A DIB or outcomes fund also "
+    "typically involves several delivery partners, not one — actively look for every "
+    "organisation named alongside it and add each as a separate partner entry rather than "
+    "citing only the most prominent name."
 )
 
 PROGRAMME_RULE = (
@@ -292,7 +332,7 @@ PROGRAMME_RULE = (
     "if there's one additional concrete supporting detail (scale, duration, since-when) beyond "
     "name/what's-funded/beneficiary; confidence='probable' otherwise. If your own fit_rationale "
     "or delivery_model_evidence names a specific initiative, it must also appear in the "
-    "programmes array. "
+    "programmes array. Set funded_by_entity per the ENTITY STRUCTURE rule. "
     "GO BEYOND THE THEME LABEL: a theme word ('financial literacy', 'skill development', "
     "'life skills') is not on its own useful for a fundraising decision, because the same theme "
     "can mean completely different things in practice — e.g. banking-awareness workshops for "
@@ -305,7 +345,17 @@ PROGRAMME_RULE = (
     "one-off or ongoing. If the evidence truly does not support any of (a)-(c) beyond the theme "
     "name, say so explicitly in `description` (e.g. 'delivery channel not stated in evidence') "
     "rather than silently omitting the distinction — the goal is that no programme entry reads "
-    "as just a repeated theme word."
+    "as just a repeated theme word. "
+    "PROGRAMME CHAIN COMPLETENESS (feedback priority): the fundraising-useful shape of a "
+    "programme entry is programme -> intervention -> beneficiaries -> geography -> "
+    "implementation partner -> government-school involvement -> scale/outcomes -> funding. For "
+    "every programme, set chain_missing_elements to the subset of "
+    "[beneficiaries, geography, partner, government_school_involvement, scale_or_outcomes, "
+    "funding_amount] that the evidence genuinely does not state anywhere for this programme — "
+    "do not guess a value just to leave the list empty. This is not a penalty on the company; "
+    "it tells the reader exactly what still needs manual follow-up, so be precise and honest "
+    "about what is actually missing versus what you found elsewhere in the evidence and should "
+    "have already filled in above."
 )
 
 SOURCE_INTEGRITY_RULE = (
@@ -327,10 +377,16 @@ ENTITY_DISAMBIGUATION_RULE = (
     "such entity, do not silently merge them into one undifferentiated profile: for every "
     "programme, partner, and spend figure, note in its source_excerpt or description which "
     "specific named entity the evidence actually attributes it to, whenever the evidence makes "
-    "that clear. If the evidence is ambiguous about which entity is responsible, say so rather "
-    "than assuming they are the same organisation."
+    "that clear, and set funded_by_entity accordingly (see ENTITY STRUCTURE rule). If the "
+    "evidence is ambiguous about which entity is responsible, say so rather than assuming they "
+    "are the same organisation."
 )
 
+# Feedback item #6: decision-maker retrieval is already reasonably good, but every
+# entry should visibly pass three checks (current org, current designation,
+# CSR/foundation/sustainability/philanthropy relevance) and India-based contacts
+# should be distinguishable from global ones so a reader doesn't have to re-derive
+# that themselves.
 DECISION_MAKER_RULE = (
     "DECISION-MAKERS — RELEVANCE FILTER (feedback priority, check this carefully): only include "
     "a person if their TITLE or the EVIDENCE CONTEXT around their name specifically ties them to "
@@ -343,7 +399,27 @@ DECISION_MAKER_RULE = (
     "person they can credibly reach out to about CSR/education, and a wrong name wastes an "
     "outreach attempt and damages credibility. The CEO/MD/Chairperson may be included only if "
     "the evidence shows them personally quoted or credited on CSR/foundation matters, not by "
-    "default just for holding the top role."
+    "default just for holding the top role. THREE-CHECK VERIFICATION: before including anyone, "
+    "confirm from the evidence (1) they are still at the company (no former-role language "
+    "nearby), (2) their designation as stated is CSR/foundation/sustainability/philanthropy-"
+    "relevant, not inferred from context alone, and (3) the role genuinely covers this company's "
+    "CSR function, not an unrelated department. INDIA PRIORITY: when the evidence surfaces both "
+    "an India-based/India-titled CSR contact and a global-level contact for the same company, "
+    "include both if evidence supports each, but set is_india_specific=true only for the person "
+    "whose title or scope is explicitly India-focused (e.g. 'CSR Head, India', 'India "
+    "Foundation Director') — this lets the report prioritise the India contact without "
+    "discarding a global one that may still be the only named contact available."
+)
+
+GEOGRAPHY_RULE = (
+    "GEOGRAPHIES: capture every state/city explicitly named in the evidence as a separate "
+    "entry — prefer this granular level over country-level ('India') or vague scope phrases "
+    "('across India', 'pan-India', 'multiple states') whenever ANY more specific place is named "
+    "anywhere in the evidence, since state/city is what tells a fundraiser whether this overlaps "
+    "with TAP's existing footprint. If the evidence genuinely only supports a vague scope with no "
+    "state/city named anywhere, include that vague entry rather than omitting geography "
+    "entirely, but do not let a vague entry substitute for specific ones that are available "
+    "elsewhere in the evidence — include both if both exist."
 )
 
 EVIDENCE_STYLE_RULE = (
@@ -367,26 +443,15 @@ HIGHLIGHT_RULE = (
     "if the field is empty."
 )
 
-GEOGRAPHY_RULE = (
-    "GEOGRAPHIES: capture every state/city explicitly named in the evidence as a separate "
-    "entry — prefer this granular level over country-level ('India') or vague scope phrases "
-    "('across India', 'pan-India', 'multiple states') whenever ANY more specific place is named "
-    "anywhere in the evidence, since state/city is what tells a fundraiser whether this overlaps "
-    "with TAP's existing footprint. If the evidence genuinely only supports a vague scope with no "
-    "state/city named anywhere, include that vague entry rather than omitting geography "
-    "entirely, but do not let a vague entry substitute for specific ones that are available "
-    "elsewhere in the evidence — include both if both exist."
-)
-
 FIELD_ORDER_RULE = (
     "FIELD ORDER: emit the JSON object's top-level keys in exactly the order shown in the JSON "
     "shape below, with no exceptions. This matters because your reply can be cut off by an "
     "output-length limit, and fields written first are the ones guaranteed to survive a cutoff — "
     "so short, high-value summary fields (authenticity score, source quality, evidence recency, "
-    "delivery model, sector, eligibility, spend) are placed before the larger array fields "
-    "(programmes, partners, decision_makers, geographies, red_flags), which are placed last "
-    "since they are the most likely to be truncated safely without losing the fields other parts "
-    "of the pipeline depend on."
+    "delivery model, sector, eligibility, spend, entity structure) are placed before the larger "
+    "array fields (programmes, partners, decision_makers, geographies, red_flags), which are "
+    "placed last since they are the most likely to be truncated safely without losing the fields "
+    "other parts of the pipeline depend on."
 )
 
 
@@ -402,6 +467,8 @@ EVIDENCE (from sources actually fetched for {company} — numbered sources below
 
 SOURCES:
 {sources_manifest}
+
+{ENTITY_STRUCTURE_RULE.format(company=company)}
 
 {SPEND_VS_REVENUE_RULE}
 
@@ -434,18 +501,19 @@ Extract, matching the JSON shape's key order exactly:
 6. sector — from company-description language; UNKNOWN only if truly no clue.
 7. eligibility — Section 135 applicability (LIKELY/UNLIKELY/UNKNOWN) from net worth/turnover/profit figures (kept separate from spend), plus the plain numeric business-scale fields, plus the profit history required by the PROFIT HISTORY rule.
 8. spend — apply the SPEND VS REVENUE and EDUCATION SPEND rules strictly, including the mandatory multi-year trend search.
-9. rfp_signal — an explicit call for NGO partners; default false/empty unless stated.
-10. board_affinity — named board/promoter personal education-philanthropy history; default false/empty unless stated.
-11. volunteering — named employee volunteering/payroll-giving touching education; default false/empty unless stated.
-12. group_foundation — CSR run via a separate parent/group foundation, only if explicitly named.
-13. key_facts_summary — 3-6 short bullet-style facts (as a single string, one per line prefixed with "- ") that most directly bear on education-CSR fit — this feeds directly into the scoring pass, so include anything that would move a fit judgment either up or down.
-14. open_questions[] — up to 5 short, concrete, searchable items to verify.
-15. programmes[] — apply the PROGRAMME rule, including the delivery-channel/beneficiary specificity requirement.
-16. partners[] — apply the PARTNER rule, including similar_to_tap_profile and multi-year history.
-17. decision_makers[] — apply the DECISION-MAKER relevance filter strictly; title, public_facing_score 0-100, tenure_status, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence.
-18. geographies[] — apply the GEOGRAPHY rule; prefer state/city over country/vague-region entries.
-19. red_flags[] — genuine contradictions or marketing-not-substance signals, severity low/medium/high. Missing/undocumented details are NOT red flags.
-20. contact_pathway — the single most concrete real channel; "Not identified" if nothing exists.
+9. entity_structure — apply the ENTITY STRUCTURE rule; leave any layer empty rather than guessing.
+10. rfp_signal — an explicit call for NGO partners; default false/empty unless stated.
+11. board_affinity — named board/promoter personal education-philanthropy history; default false/empty unless stated.
+12. volunteering — named employee volunteering/payroll-giving touching education; default false/empty unless stated.
+13. group_foundation — CSR run via a separate parent/group foundation, only if explicitly named.
+14. key_facts_summary — 3-6 short bullet-style facts (as a single string, one per line prefixed with "- ") that most directly bear on education-CSR fit — this feeds directly into the scoring pass, so include anything that would move a fit judgment either up or down. Do not use this field as a dumping ground for a named programme or initiative that belongs in the programmes array instead.
+15. open_questions[] — up to 5 short, concrete, searchable items to verify.
+16. programmes[] — apply the PROGRAMME rule, including the delivery-channel/beneficiary specificity requirement and the chain-completeness fields.
+17. partners[] — apply the PARTNER rule, including similar_to_tap_profile, multi-year history, and named-format initiatives (DIBs, outcomes funds).
+18. decision_makers[] — apply the DECISION-MAKER relevance filter and three-check verification strictly; title, public_facing_score 0-100, tenure_status, is_india_specific, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence.
+19. geographies[] — apply the GEOGRAPHY rule; prefer state/city over country/vague-region entries.
+20. red_flags[] — genuine contradictions or marketing-not-substance signals, severity low/medium/high. Missing/undocumented details are NOT red flags.
+21. contact_pathway — the single most concrete real channel; "Not identified" if nothing exists.
 
 7b. eligibility.net_profit_history — apply the PROFIT HISTORY rule; this feeds a downstream statutory-obligation calculation, so profit-figure recall matters as much as spend-figure recall. Source 10 (multi_year_financials), when present, is specifically curated to contain side-by-side year figures — check it first for profit_history and spend.history.
 
@@ -462,15 +530,16 @@ JSON shape:
   "sector": {{"sector": "<sector>", "sub_sector": "<or empty>", "reasoning": "<short>"}},
   "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number, 0 if unknown>, "net_profit_inr_crore": <number, 0 if unknown>, "net_profit_fiscal_year": "<if stated>", "net_profit_history": [{{"fiscal_year": "<year>", "net_profit_inr_crore": <number, 0 if unknown>, "source_excerpt": "<short, verbatim ok>"}}], "net_profit_trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>"}},
   "spend": {{"inr_crore": <number, 0 if unknown, education-specific only>, "display": "<exact CSR-labeled education figure or empty>", "fiscal_year": "<if stated>", "is_education_specific": <bool>, "education_pct_of_total_csr": <number, 0 if unknown>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short, verbatim ok>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number, 0 if unknown>, "display": "<as stated>", "source_excerpt": "<short, verbatim ok>"}}], "total_csr_inr_crore": <number, 0 if unknown>, "total_csr_display": "<as stated or empty>", "total_csr_fiscal_year": "<if stated>"}},
+  "entity_structure": {{"parent_company": "<name or empty>", "india_entity": "<name or empty>", "foundation_entity": "<name or empty>", "notes": "<short, only if evidence clarifies how these relate>"}},
   "rfp_signal": {{"present": <bool>, "channel": "<short>", "evidence": "<short>"}},
   "board_affinity": {{"present": <bool>, "person_name": "<name or empty>", "connection": "<short>", "source_excerpt": "<short, verbatim ok>"}},
   "volunteering": {{"present": <bool>, "programme_name": "<name or empty>", "description": "<short>", "source_excerpt": "<short, verbatim ok>"}},
   "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>", "source_excerpt": "<short, verbatim ok>"}},
   "key_facts_summary": "<3-6 lines, each starting with '- '>",
   "open_questions": ["<short item>", "..."],
-  "programmes": [{{"name": "<exact name>", "what_is_funded": "<precise funded activity>", "beneficiary_group": "<named beneficiary group>", "beneficiary_type": "<SCHOOL_CHILDREN_CURRICULUM|ADULT|OTHER>", "description": "<short, must cover delivery channel + beneficiary + one-off-vs-ongoing per PROGRAMME rule>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "source_excerpt": "<short, verbatim ok>", "confidence": "<confirmed|probable>"}}],
-  "partners": [{{"name": "<exact org name>", "relationship_type": "<funder|implementer|co-design|unclear>", "programme": "<or empty>", "year": "<or empty>", "geography": "<or empty>", "similar_to_tap_profile": <bool>, "source_excerpt": "<short, verbatim ok, must show relationship language>", "confidence": "<confirmed|probable>"}}],
-  "decision_makers": [{{"name": "<n>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "source_excerpt": "<short, verbatim ok>", "linkedin_url": "<url or empty>"}}],
+  "programmes": [{{"name": "<exact name>", "what_is_funded": "<precise funded activity>", "beneficiary_group": "<named beneficiary group>", "beneficiary_type": "<SCHOOL_CHILDREN_CURRICULUM|ADULT|OTHER>", "description": "<short, must cover delivery channel + beneficiary + one-off-vs-ongoing per PROGRAMME rule>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "funded_by_entity": "<name from entity_structure or empty>", "chain_missing_elements": ["<subset of beneficiaries|geography|partner|government_school_involvement|scale_or_outcomes|funding_amount>"], "source_excerpt": "<short, verbatim ok>", "confidence": "<confirmed|probable>"}}],
+  "partners": [{{"name": "<exact org name>", "relationship_type": "<funder|implementer|co-design|unclear>", "programme": "<or empty>", "year": "<or empty>", "geography": "<or empty>", "similar_to_tap_profile": <bool>, "funded_by_entity": "<name from entity_structure or empty>", "source_excerpt": "<short, verbatim ok, must show relationship language>", "confidence": "<confirmed|probable>"}}],
+  "decision_makers": [{{"name": "<n>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "is_india_specific": <bool>, "source_excerpt": "<short, verbatim ok>", "linkedin_url": "<url or empty>"}}],
   "geographies": [{{"place": "<state/city preferred>", "source_excerpt": "<short, verbatim ok>"}}],
   "red_flags": [{{"flag": "<short label>", "severity": "<low|medium|high>", "explanation": "<short>"}}],
   "contact_pathway": {{"channel": "<sentence>", "evidence": "<short>"}}
@@ -577,6 +646,22 @@ class SpendSchema(BaseModel):
     estimated_is_computed: bool = False
 
 
+# New: structured parent / India-entity / foundation mapping (feedback #8). Kept as
+# its own small schema so it can be validated, sanitized, and rendered independently
+# of the free-text notes that used to be the only place this distinction lived.
+class EntityStructureSchema(BaseModel):
+    parent_company: str = Field(default="", max_length=160)
+    india_entity: str = Field(default="", max_length=160)
+    foundation_entity: str = Field(default="", max_length=160)
+    notes: str = Field(default="", max_length=280)
+
+
+PROGRAMME_CHAIN_ELEMENTS = frozenset([
+    "beneficiaries", "geography", "partner", "government_school_involvement",
+    "scale_or_outcomes", "funding_amount",
+])
+
+
 class ProgrammeSchema(BaseModel):
     name: str = ""
     what_is_funded: str = Field(default="", max_length=200)
@@ -585,6 +670,8 @@ class ProgrammeSchema(BaseModel):
     description: str = Field(default="", max_length=260)
     is_multi_year: bool = False
     cohort_or_scale: str = ""
+    funded_by_entity: str = Field(default="", max_length=160)
+    chain_missing_elements: list[str] = Field(default_factory=list)
     source_excerpt: str = Field(default="", max_length=260)
     source: str = ""
     confidence: str = "confirmed"
@@ -597,6 +684,7 @@ class PartnerSchema(BaseModel):
     year: str = ""
     geography: str = Field(default="", max_length=120)
     similar_to_tap_profile: bool = False
+    funded_by_entity: str = Field(default="", max_length=160)
     source_excerpt: str = Field(default="", max_length=260)
     source: str = ""
     confidence: str = "confirmed"
@@ -608,6 +696,7 @@ class DecisionMakerSchema(BaseModel):
     public_facing_score: int = Field(ge=0, le=100, default=0)
     tenure_status: str = "UNKNOWN"
     tenure_evidence: str = Field(default="", max_length=200)
+    is_india_specific: bool = False
     source_excerpt: str = Field(default="", max_length=260)
     source: str = ""
     linkedin_url: str = ""
@@ -715,6 +804,7 @@ class FullAnalysisSchema(BaseModel):
     delivery_model_evidence: str = Field(default="", max_length=220)
     delivery_model_source: str = ""
     spend: SpendSchema = SpendSchema()
+    entity_structure: EntityStructureSchema = EntityStructureSchema()
     programmes: list[ProgrammeSchema] = Field(default_factory=list)
     partners: list[PartnerSchema] = Field(default_factory=list)
     decision_makers: list[DecisionMakerSchema] = Field(default_factory=list)
@@ -1054,6 +1144,17 @@ def _sanitize_dict_for_model(data: dict, model: type[BaseModel]) -> dict:
     return sanitized
 
 
+def _sanitize_chain_missing_elements(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned = []
+    for value in values:
+        if isinstance(value, str) and value.strip() in PROGRAMME_CHAIN_ELEMENTS:
+            if value.strip() not in cleaned:
+                cleaned.append(value.strip())
+    return cleaned
+
+
 def _compute_weighted_fit_score(criteria: list[dict]) -> float:
     if not criteria:
         return 0.0
@@ -1103,38 +1204,45 @@ def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode:
 
 
 # ---------------------------------------------------------------------------
-# EVIDENCE COVERAGE / CONFIDENCE GATE
+# EVIDENCE COVERAGE / RESEARCH CONFIDENCE GATE
 #
-# Rewritten to close the gap the reviewer flagged: on the UBS runs, several
-# individual criteria sat at 15-40% confidence while the OLD weighted-average
-# gate (which lets high-weight criteria dominate) stayed just above its
-# threshold, so no low-confidence flag ever fired even though a large share
-# of the scorecard was effectively unsupported.
+# This is the direct answer to feedback item #3: "Fit Score" and "Research
+# Confidence" must be treated as two separate questions, not one blended number.
+# The checks below decide whether coverage is so thin that no fit score should
+# be shown at all (the existing insufficient-evidence path). On top of that gate,
+# research_confidence_label() below produces a *always-shown* coarse label
+# (High/Medium/Low/Insufficient) so that even when a score IS shown, the reader
+# sees, right next to it, how much to trust it — a scored-but-thin result should
+# never present with the same visual/textual confidence as a well-evidenced one.
 #
-# This version checks coverage from four independent angles and fails the
-# gate if ANY of them trips. It intentionally does not rely solely on a
-# single weighted-average number, since a single blended statistic can
-# always be gamed by a handful of well-supported, high-weight criteria
-# masking many weak ones — exactly the failure mode observed.
+# The gate itself checks coverage from four independent angles and fails if ANY
+# of them trips, since a single blended statistic (e.g. one weighted average)
+# can be gamed by a handful of well-supported, high-weight criteria masking many
+# weak ones -- this was an observed failure mode (see feedback item #3, the UBS
+# and DMart cases where overall confidence looked passable while whole sections
+# of the scorecard were guesses).
 # ---------------------------------------------------------------------------
 
-# Kept for backward compatibility with any external code/tests importing
-# these names directly; still used as the "authenticity" and "weighted
-# average" legs of the new multi-check gate below.
 LOW_COVERAGE_AUTHENTICITY_THRESHOLD = 30
 LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD = 45
 LOW_COVERAGE_HIGH_WEIGHT_FLOOR = 8
 LOW_COVERAGE_HIGH_WEIGHT_CONFIDENCE_THRESHOLD = 25
 
-# New legs of the gate. Kept as separate named constants (rather than reusing
-# the ones above) so each threshold can be tuned independently without
-# changing the meaning of the legacy constants other code may reference.
 LOW_COVERAGE_PLAIN_AVERAGE_THRESHOLD = 45
 LOW_COVERAGE_MIN_CONFIDENT_CRITERIA_COUNT = 6
 LOW_COVERAGE_CONFIDENT_CRITERION_THRESHOLD = 40
 LOW_COVERAGE_MIN_CONFIDENT_WEIGHT_SHARE = 0.45
 LOW_COVERAGE_LOW_CONFIDENCE_CRITERION_THRESHOLD = 25
 LOW_COVERAGE_MAX_LOW_CONFIDENCE_SHARE = 0.5
+
+# Thresholds for the coarse, always-shown research_confidence_label, distinct from
+# the insufficient-evidence gate above. A result can clear the gate (a score is
+# shown) while still landing in the "Low" confidence band, which is the point --
+# the label is meant to catch borderline cases the gate doesn't reject outright.
+RESEARCH_CONFIDENCE_HIGH_AUTHENTICITY = 65
+RESEARCH_CONFIDENCE_HIGH_WEIGHTED_CONF = 65
+RESEARCH_CONFIDENCE_MEDIUM_AUTHENTICITY = 40
+RESEARCH_CONFIDENCE_MEDIUM_WEIGHTED_CONF = 45
 
 
 def average_criteria_confidence(criteria: list[dict]) -> float:
@@ -1223,26 +1331,23 @@ def evidence_coverage_is_too_low(criteria: list[dict], authenticity_score: int) 
     """Multi-signal coverage gate. Fails (returns True) if ANY of the
     following independent checks trips:
 
-      1. Source authenticity is too low (unchanged from before).
-      2. Weighted-average criteria confidence is too low (unchanged from
-         before — kept as a floor, not the only signal).
-      3. NEW: plain (unweighted) average confidence is too low — catches
-         cases where a handful of high-weight criteria pull the weighted
-         average above threshold while most of the scorecard is thin.
-      4. Unchanged: a single high-weight criterion is very low confidence.
-      5. NEW: too few criteria clear a basic "confidently supported" bar,
-         by BOTH weight-share and raw count — catches a scorecard that is
-         mostly inferred/sector-default guesses even if no single number
-         looks alarming in isolation.
-      6. NEW: too large a share of ALL criteria (by headcount) sit at or
-         below a low-confidence floor — this is the direct fix for the
-         UBS pattern (multiple criteria at 15-40%) that the old
-         weighted-average-only check could miss.
+      1. Source authenticity is too low.
+      2. Weighted-average criteria confidence is too low.
+      3. Plain (unweighted) average confidence is too low — catches cases
+         where a handful of high-weight criteria pull the weighted average
+         above threshold while most of the scorecard is thin.
+      4. A single high-weight criterion is very low confidence.
+      5. Too few criteria clear a basic "confidently supported" bar, by BOTH
+         weight-share and raw count — catches a scorecard that is mostly
+         inferred/sector-default guesses even if no single number looks
+         alarming in isolation.
+      6. Too large a share of ALL criteria (by headcount) sit at or below a
+         low-confidence floor.
 
     Any single trip is enough — this is deliberately conservative, since the
     cost of a false "insufficient evidence" label is small (the analyst just
     does more digging) while the cost of a confident-looking low score on
-    thin evidence is a lost prospect, per the original feedback.
+    thin evidence is a lost prospect, per feedback items #2 and #3.
     """
     if not criteria:
         return True, "No criteria were returned to score against."
@@ -1288,6 +1393,32 @@ def evidence_coverage_is_too_low(criteria: list[dict], authenticity_score: int) 
     return False, ""
 
 
+def research_confidence_label(criteria: list[dict], authenticity_score: int,
+                               coverage_insufficient: bool) -> str:
+    """Coarse, always-shown confidence band ("Insufficient" / "Low" / "Medium" /
+    "High") kept deliberately separate from fit_score itself. This exists
+    specifically so a scored result that only barely cleared the coverage gate
+    still visibly reads as lower-trust than a well-evidenced one, per feedback
+    item #3 ("separate TAP Fit Score from Research Confidence" rather than
+    letting thin evidence silently pull the fit score down and stop there).
+    """
+    if coverage_insufficient:
+        return "Insufficient"
+
+    weighted_confidence = weighted_average_criteria_confidence(criteria)
+    if (
+        authenticity_score >= RESEARCH_CONFIDENCE_HIGH_AUTHENTICITY
+        and weighted_confidence >= RESEARCH_CONFIDENCE_HIGH_WEIGHTED_CONF
+    ):
+        return "High"
+    if (
+        authenticity_score >= RESEARCH_CONFIDENCE_MEDIUM_AUTHENTICITY
+        and weighted_confidence >= RESEARCH_CONFIDENCE_MEDIUM_WEIGHTED_CONF
+    ):
+        return "Medium"
+    return "Low"
+
+
 def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
     parsed = dict(parsed) if isinstance(parsed, dict) else {}
 
@@ -1304,6 +1435,14 @@ def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
         for entry in sanitized.get("decision_makers", []):
             if isinstance(entry, dict) and entry.get("linkedin_url"):
                 entry["linkedin_url"] = _sanitize_linkedin_url(entry["linkedin_url"])
+
+    if isinstance(parsed.get("programmes"), list):
+        raw_by_index = [p for p in parsed["programmes"] if isinstance(p, dict)]
+        for sanitized_entry, raw_entry in zip(sanitized.get("programmes", []), raw_by_index):
+            if isinstance(sanitized_entry, dict):
+                sanitized_entry["chain_missing_elements"] = _sanitize_chain_missing_elements(
+                    raw_entry.get("chain_missing_elements")
+                )
 
     sanitized["key_facts_summary"] = str(parsed.get("key_facts_summary", "") or "")[:1500]
     sanitized["open_questions"] = [
@@ -1338,6 +1477,7 @@ def build_extraction_only_result(extraction: dict, mode: str) -> dict:
     result = validated.model_dump()
     result["scoring_incomplete"] = True
     result["open_questions"] = [q.strip()[:200] for q in extraction.get("open_questions", []) if q and q.strip()][:5]
+    result["research_confidence_label"] = "Insufficient"
 
     logger.warning(
         "build_extraction_only_result company_facts_preserved mode=%r authenticity=%d "
@@ -1350,7 +1490,16 @@ def build_extraction_only_result(extraction: dict, mode: str) -> dict:
 
 def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
     parsed = dict(parsed) if isinstance(parsed, dict) else {}
+    original_programmes = parsed.get("programmes") if isinstance(parsed.get("programmes"), list) else []
     parsed = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
+
+    if isinstance(parsed.get("programmes"), list):
+        raw_by_index = [p for p in original_programmes if isinstance(p, dict)]
+        for sanitized_entry, raw_entry in zip(parsed["programmes"], raw_by_index):
+            if isinstance(sanitized_entry, dict):
+                sanitized_entry["chain_missing_elements"] = _sanitize_chain_missing_elements(
+                    raw_entry.get("chain_missing_elements")
+                )
 
     raw_criteria = parsed.get("criteria") if isinstance(parsed.get("criteria"), list) else []
     repaired_criteria, seen_ids = [], set()
@@ -1398,8 +1547,9 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
     except ValidationError as exc:
         logger.warning("analysis validation failed, repairing containers error=%s", exc)
         for container_field, default in (
-            ("spend", {}), ("contact_pathway", {}), ("rfp_signal", {}), ("board_affinity", {}),
-            ("volunteering", {}), ("group_foundation", {}), ("eligibility", {}), ("sector", {}),
+            ("spend", {}), ("entity_structure", {}), ("contact_pathway", {}), ("rfp_signal", {}),
+            ("board_affinity", {}), ("volunteering", {}), ("group_foundation", {}),
+            ("eligibility", {}), ("sector", {}),
             ("programmes", []), ("partners", []), ("decision_makers", []), ("geographies", []),
             ("red_flags", []), ("open_questions", []),
         ):
@@ -1428,7 +1578,8 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
                 if scalar_field in parsed:
                     safe_kwargs[scalar_field] = parsed[scalar_field]
             for object_field, schema in (
-                ("spend", SpendSchema), ("contact_pathway", ContactPathwaySchema),
+                ("spend", SpendSchema), ("entity_structure", EntityStructureSchema),
+                ("contact_pathway", ContactPathwaySchema),
                 ("rfp_signal", RfpSignalSchema), ("board_affinity", BoardAffinitySchema),
                 ("volunteering", VolunteeringSchema), ("group_foundation", GroupFoundationSchema),
                 ("eligibility", EligibilitySchema), ("sector", SectorSchema),
@@ -1576,6 +1727,7 @@ async def extract_company_facts(
     extraction["spend"]["trend_source"] = _sanitize_source(extraction["spend"].get("trend_source", ""), valid_sources)
     for entry in extraction["spend"].get("history", []) or []:
         entry["source"] = _sanitize_source(entry.get("source", ""), valid_sources)
+    extraction.setdefault("entity_structure", {})
     for programme in extraction.get("programmes", []) or []:
         programme["source"] = _sanitize_source(programme.get("source", ""), valid_sources)
     for partner in extraction.get("partners", []) or []:
@@ -1604,11 +1756,11 @@ async def extract_company_facts(
 
     logger.info(
         "extract_company_facts DONE company=%r authenticity=%d partners=%d programmes=%d decision_makers=%d red_flags=%d "
-        "spend_history_years=%d geographies=%d",
+        "spend_history_years=%d geographies=%d entity_structure=%r",
         company, extraction.get("overall_authenticity_score", 0), len(extraction.get("partners", [])),
         len(extraction.get("programmes", [])), len(extraction.get("decision_makers", [])),
         len(extraction.get("red_flags", [])), len((extraction.get("spend") or {}).get("history", []) or []),
-        len(extraction.get("geographies", [])),
+        len(extraction.get("geographies", [])), extraction.get("entity_structure", {}),
     )
     return extraction
 
@@ -1722,6 +1874,14 @@ async def analyze_and_score_company(
         weighted_average_criteria_confidence(result["criteria"]), 1
     )
 
+    # research_confidence_label is deliberately computed and stored even when a
+    # fit score IS shown — see the module docstring above the coverage gate.
+    # This is the field that lets every report surface "how much to trust this"
+    # as a first-class, separate signal from the fit score itself (feedback #3).
+    result["research_confidence_label"] = research_confidence_label(
+        result["criteria"], result["overall_authenticity_score"], coverage_insufficient,
+    )
+
     if coverage_insufficient:
         result["fit_score_display_mode"] = "insufficient_evidence"
         result["fit_score_label"] = "Insufficient evidence to score confidently"
@@ -1746,10 +1906,11 @@ async def analyze_and_score_company(
     logger.info(
         "analyze_and_score_company DONE company=%r mode=%s model_reported_fit_score=%d final_fit_score=%d "
         "authenticity=%d avg_criteria_confidence=%.1f weighted_criteria_confidence=%.1f coverage_insufficient=%s "
-        "coverage_reason=%r partners=%d programmes=%d decision_makers=%d",
+        "coverage_reason=%r research_confidence=%s partners=%d programmes=%d decision_makers=%d",
         company, mode, model_reported_score, result["fit_score"], result["overall_authenticity_score"],
         result["average_criteria_confidence_pct"], result["weighted_criteria_confidence_pct"],
         result["evidence_coverage_insufficient"], result["evidence_coverage_reason"],
+        result["research_confidence_label"],
         len(result["partners"]), len(result["programmes"]), len(result["decision_makers"]),
     )
     logger.info(
