@@ -39,6 +39,13 @@ CSR_ROLE_KEYWORD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# NOTE: this pattern intentionally matches on *nouns/keywords* only, not on
+# generic descriptive words like "leader". A profile bio that says
+# "social impact leader" (a self-description, not a title) must not be
+# treated the same as a title that literally says "social impact head" or
+# "social impact director" -- see CSR_SELF_DESCRIPTION_ONLY_PATTERN below,
+# which is checked separately to catch and downweight exactly that case.
+
 # Functional CSR titles: narrow, specific day-to-day roles. People tend to
 # update these promptly when they change jobs because the title itself is
 # the identity ("I am the CSR Manager"), unlike a broad C-suite title that
@@ -66,20 +73,48 @@ CSR_FUNCTIONAL_TITLE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Self-description / bio language that mentions CSR-adjacent nouns without
+# stating an actual current title (e.g. "philanthropy, employee engagement,
+# foundation management" as a skills list, or "social impact leader" as a
+# resume tagline). These read as CSR-relevant to a naive keyword search but
+# assert no verifiable current role or employer. Matched separately so a
+# profile relying ONLY on this pattern (no functional title, no senior
+# title, and critically no confirmed employer) can be down-ranked instead
+# of treated as equivalent to an actual named title.
+CSR_SELF_DESCRIPTION_ONLY_PATTERN = re.compile(
+    r"\b(social\s+impact\s+leader|philanthropy\s*,|employee\s+engagement|"
+    r"foundation\s+management|passionate\s+about|experienced\s+in)\b",
+    re.IGNORECASE,
+)
+
 # Broad senior/executive titles. On their own (without a functional CSR
-# title also present) these are the titles most likely to be stale, since
-# board/C-suite listings in press and profile snippets lag real personnel
-# changes the longest. Explicitly includes "foundation ceo"/"foundation
-# president" — a CEO-of-foundation title is exactly the shape of title most
-# likely to be quoted long after the person has actually moved on, so it
-# is treated the same as any other broad executive title rather than as a
-# narrow, self-updating functional one.
+# title also present *for the same claim*) these are the titles most likely
+# to be stale, since board/C-suite listings in press and profile snippets
+# lag real personnel changes the longest. Explicitly includes "foundation
+# ceo"/"foundation president" in EITHER word order — a CEO-of-foundation
+# title is exactly the shape of title most likely to be quoted long after
+# the person has actually moved on, so it is treated the same as any other
+# broad executive title rather than as a narrow, self-updating functional
+# one, regardless of whether the evidence phrases it as "Foundation CEO" or
+# "CEO ... Foundation" (press releases and bios use both orders).
 SENIOR_EXECUTIVE_TITLE_PATTERN = re.compile(
     r"\b(chief\s+\w+(?:\s+\w+)?\s+officer|c[a-z]o|president|chairperson|chairman|"
     r"chairwoman|managing\s+director|founder|co[\s\-]?founder|"
-    r"foundation\s+(?:ceo|president))\b",
+    r"foundation\s+(?:ceo|president)|(?:ceo|president)\b[^.;]{0,40}\bfoundation)\b",
     re.IGNORECASE,
 )
+
+# Matches a senior-executive claim AND, separately, captures the specific
+# span of text it matched so a caller can check whether a functional title
+# also appears *inside that same span* (same role claim) versus merely
+# somewhere else in the full title string (a different, unrelated role).
+# This is what fixes the "Head of Social Impact at UBS and CEO UBS Optimus
+# Foundation" case: the functional title (Head of Social Impact) and the
+# senior title (CEO ... Foundation) are two different clauses about two
+# different roles, joined by "and" -- a functional title elsewhere in the
+# string must not be allowed to vouch for a senior title it has nothing to
+# do with.
+ROLE_CLAUSE_SPLIT_PATTERN = re.compile(r"\s*(?:,|;|\band\b)\s*", re.IGNORECASE)
 
 SENIORITY_KEYWORD_PATTERN_ORDER = [
     ("C_SUITE", re.compile(r"\b(chief\s+\w+\s+officer|c[a-z]o)\b", re.IGNORECASE)),
@@ -115,7 +150,10 @@ NON_CSR_TITLE_KEYWORD_PATTERN = re.compile(
     r"(?:manager|executive|analyst)|procurement|supply\s+chain|it\s+support|"
     r"software\s+testing|human\s+resources?\s+(?:generalist|executive|associate)|"
     r"talent\s+acquisition|recruiter|plant\s+(?:manager|operations)|factory\s+"
-    r"operations)\b",
+    r"operations|country\s+head|chief\s+digital\s+(?:information\s+)?officer|"
+    r"chief\s+information\s+officer|chief\s+technology\s+officer|"
+    r"chief\s+financial\s+officer|chief\s+operating\s+officer|chief\s+risk\s+officer|"
+    r"chief\s+marketing\s+officer)\b",
     re.IGNORECASE,
 )
 
@@ -214,10 +252,17 @@ def extract_job_title(raw_title: str, snippet: str, parts: list[str] | None = No
     parts = parts if parts is not None else split_linkedin_title(raw_title)
     role_segments = [p for p in parts[1:] if p and not COMPANY_AT_PATTERN.fullmatch(p)]
     if role_segments:
-        candidate = role_segments[0].strip(" .")
-        at_split = COMPANY_AT_PATTERN.search(candidate)
-        if at_split:
-            candidate = candidate[:at_split.start()].strip(" .,")
+        # Join ALL role segments, not just the first. A raw title like
+        # "Head of Social Impact at UBS and CEO UBS Optimus Foundation" has
+        # only one separator-delimited segment here (the "and" is inside the
+        # segment, not a LinkedIn separator), but titles that DO split into
+        # multiple dash/pipe segments must not silently lose every segment
+        # after the first -- downstream seniority/department extraction
+        # needs to see the whole role claim, not just the first fragment.
+        candidate = " / ".join(seg.strip(" .") for seg in role_segments)
+        at_split = COMPANY_AT_PATTERN.search(role_segments[0])
+        if at_split and len(role_segments) == 1:
+            candidate = role_segments[0][:at_split.start()].strip(" .,")
         return candidate
     match = CSR_ROLE_KEYWORD_PATTERN.search(f"{raw_title} {snippet}")
     return match.group(0).strip() if match else ""
@@ -230,6 +275,20 @@ def extract_full_title_text(raw_title: str, snippet: str, parts: list[str] | Non
     Foundation") is not invisible to the seniority/functional check."""
     parts = parts if parts is not None else split_linkedin_title(raw_title)
     return " ".join(parts[1:]) if len(parts) > 1 else (raw_title or "")
+
+
+def split_role_clauses(full_title_text: str) -> list[str]:
+    """Split a title blob into individual role CLAIMS on 'and'/','/';' so
+    each claim can be evaluated on its own, rather than letting a functional
+    title in one clause vouch for an unrelated senior title in another
+    clause. E.g. "Head of Social Impact at UBS and CEO UBS Optimus
+    Foundation" -> ["Head of Social Impact at UBS", "CEO UBS Optimus
+    Foundation"]. This is intentionally a light heuristic split (not a full
+    parse) since source text is short, free-form snippet/title strings."""
+    if not full_title_text:
+        return []
+    clauses = [c.strip(" .") for c in ROLE_CLAUSE_SPLIT_PATTERN.split(full_title_text) if c.strip(" .")]
+    return clauses or [full_title_text.strip(" .")]
 
 
 def extract_seniority_level(job_title: str, raw_title: str, snippet: str) -> str:
@@ -380,11 +439,13 @@ def is_currently_at_company(raw_title: str, snippet: str, affiliation: str, comp
         return False
 
     affiliation_lower = (affiliation or "").lower()
-    if affiliation_lower and any(token in affiliation_lower for token in tokens):
-        pass
-    elif not affiliation_lower:
-        return False
-    else:
+    if not affiliation_lower or not any(token in affiliation_lower for token in tokens):
+        # No affiliation string was resolved to this company at all --
+        # previously this fell through to a bare "return False" further
+        # down only after also checking former-role language, which meant
+        # a profile with NO company evidence but ALSO no former-role
+        # language could look identical, in logs, to one that legitimately
+        # matched. Fail fast and explicitly here instead.
         return False
 
     haystack = f"{raw_title} {snippet}"
@@ -413,20 +474,55 @@ def has_functional_csr_title(full_title_text: str) -> bool:
 
 def has_unverified_senior_title(full_title_text: str) -> bool:
     """True if a broad C-suite/president/founder/foundation-CEO-style title
-    is present without an accompanying, distinct functional CSR title. Broad
-    executive titles are the ones most prone to being stale in a scraped
-    snippet, since a press bio or old profile line can keep listing someone
-    as CEO/Chief.../President/Foundation CEO long after they've actually
-    moved on — the title itself carries no evidence of current-ness the way
-    a narrow functional title does. This is a structural signal, not a
-    name/company lookup, and it does not attempt to detect staleness that
-    isn't stated anywhere in the source text — it only avoids rewarding an
-    undated senior title with unearned confidence."""
+    is present WITHOUT an accompanying, distinct functional CSR title that
+    covers the SAME role claim. Broad executive titles are the ones most
+    prone to being stale in a scraped snippet, since a press bio or old
+    profile line can keep listing someone as CEO/Chief.../President/
+    Foundation CEO long after they've actually moved on -- the title itself
+    carries no evidence of current-ness the way a narrow functional title
+    does.
+
+    Fixed from a prior version: this used to check "is a functional title
+    present ANYWHERE in the full title text", which let a genuine functional
+    title in one clause (e.g. "Head of Social Impact") silently vouch for an
+    entirely separate, unrelated senior-title claim in another clause of the
+    same string (e.g. "and CEO UBS Optimus Foundation") -- two different
+    roles joined by "and" are two different claims, and a person can hold
+    one current, verifiable title and one stale one at the same time. Now
+    each role clause is checked independently: a senior title only counts as
+    "verified" if a functional title appears within THAT SAME clause, not
+    merely somewhere in the string.
+
+    This is a structural signal, not a name/company lookup, and it does not
+    attempt to detect staleness that isn't stated anywhere in the source
+    text -- it only avoids rewarding an undated senior title with unearned
+    confidence."""
     if not full_title_text:
         return False
-    if not SENIOR_EXECUTIVE_TITLE_PATTERN.search(full_title_text):
+    clauses = split_role_clauses(full_title_text)
+    for clause in clauses:
+        if SENIOR_EXECUTIVE_TITLE_PATTERN.search(clause) and not CSR_FUNCTIONAL_TITLE_PATTERN.search(clause):
+            return True
+    return False
+
+
+def has_csr_relevant_title_only(full_title_text: str) -> bool:
+    """True only if CSR_ROLE_KEYWORD_PATTERN matched on something that reads
+    as an actual title/role phrase, as opposed to matching purely inside
+    generic bio/self-description language (see
+    CSR_SELF_DESCRIPTION_ONLY_PATTERN). A bio that says "social impact
+    leader" or lists "philanthropy, employee engagement, foundation
+    management" as skills/interests is not the same evidentiary strength as
+    a title that literally reads "Head of Social Impact" or "CSR Manager",
+    and should not be treated identically when deciding whether to surface
+    a contact."""
+    if not full_title_text:
         return False
-    return not has_functional_csr_title(full_title_text)
+    if has_functional_csr_title(full_title_text) or SENIOR_EXECUTIVE_TITLE_PATTERN.search(full_title_text):
+        return True
+    # Only self-description-style matches remain possible at this point.
+    stripped = CSR_SELF_DESCRIPTION_ONLY_PATTERN.sub("", full_title_text)
+    return bool(CSR_ROLE_KEYWORD_PATTERN.search(stripped))
 
 
 def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> dict:
@@ -439,6 +535,7 @@ def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> 
     india_signal = location_mentions_india(raw_title, snippet, url)
     current_role = is_current_csr_role(raw_title, snippet)
     has_csr_signal = bool(CSR_ROLE_KEYWORD_PATTERN.search(f"{raw_title} {snippet}"))
+    title_is_bio_only = has_csr_signal and not has_csr_relevant_title_only(f"{full_title_text} {snippet}")
     company_match = is_currently_at_company(raw_title, snippet, affiliation, company)
     seniority = extract_seniority_level(job_title, raw_title, snippet)
     department = extract_department(job_title, snippet)
@@ -449,18 +546,31 @@ def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> 
 
     title_csr_match = bool(CSR_ROLE_KEYWORD_PATTERN.search(job_title))
     title_blocked = bool(NON_CSR_TITLE_KEYWORD_PATTERN.search(job_title)) and not title_csr_match
-    role_verified = has_csr_signal and not title_blocked
+    role_verified = has_csr_signal and not title_blocked and not title_is_bio_only
 
     functional_title = has_functional_csr_title(full_title_text)
     unverified_senior_title = has_unverified_senior_title(full_title_text)
 
-    if unverified_senior_title:
-        # A broad executive title (including "Foundation CEO") with no
-        # narrow functional CSR title to anchor it is treated as unverified
-        # regardless of how the other signals line up — this is the case
-        # most likely to be stale, and also the least useful contact for
-        # grassroots outreach even when accurate, so it's never allowed to
-        # reach HIGH.
+    # A profile with no confirmed employer match to the company being
+    # researched must never be treated as equivalent to one with a
+    # confirmed match, regardless of how CSR-relevant the title text reads
+    # -- otherwise a generically-worded bio with zero named employer can
+    # outrank, or simply masquerade as, a genuinely-employed contact.
+    if not company_match:
+        confidence = "LOW"
+    elif unverified_senior_title:
+        # A broad executive title (including "Foundation CEO" / "CEO ...
+        # Foundation") with no narrow functional CSR title covering that
+        # SAME role claim is treated as unverified regardless of how the
+        # other signals line up -- this is the case most likely to be
+        # stale, and also the least useful contact for grassroots outreach
+        # even when accurate, so it's never allowed to reach HIGH.
+        confidence = "MEDIUM" if (company_match and india_signal) else "LOW"
+    elif title_is_bio_only:
+        # CSR keywords matched only inside generic bio/self-description
+        # language, not an actual stated title -- never reaches HIGH even
+        # with a confirmed employer, since there's no verifiable current
+        # role, only descriptive language.
         confidence = "MEDIUM" if (company_match and india_signal) else "LOW"
     elif current_role and company_match and india_signal and functional_title:
         confidence = "HIGH"
@@ -494,10 +604,11 @@ def parse_linkedin_hit(raw_title: str, snippet: str, url: str, company: str) -> 
         "india_location_signal": india_signal,
         "is_current_csr_role": current_role,
         "has_csr_signal": has_csr_signal,
+        "title_is_bio_only": title_is_bio_only,
         "role_verified": role_verified,
         "is_current_company_match": company_match,
         "has_functional_csr_title": functional_title,
         "has_unverified_senior_title": unverified_senior_title,
         "profile_completeness": profile_completeness,
         "confidence": confidence,
-    }
+    } 
