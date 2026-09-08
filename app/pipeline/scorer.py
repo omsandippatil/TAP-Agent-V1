@@ -133,20 +133,33 @@ def determine_state(sources: list) -> str:
     return "NOT_FOUND_IN_SOURCE"
 
 
+def _coerce_criterion_score(raw_score):
+    if raw_score is None:
+        return None
+    try:
+        return float(raw_score)
+    except (TypeError, ValueError):
+        return None
+
+
 def build_score_breakdown(analysis: dict) -> dict:
     criteria = analysis.get("criteria", [])
+    scored_criteria = [c for c in criteria if _coerce_criterion_score(c.get("score")) is not None]
     average_confidence = (
-        sum(c.get("confidence", 0) for c in criteria) / len(criteria) if criteria else 0
+        sum(c.get("confidence", 0) for c in scored_criteria) / len(scored_criteria)
+        if scored_criteria else 0
     )
     weighted_confidence = llm.weighted_average_criteria_confidence(criteria)
     return {
         "average_confidence_pct": round(average_confidence, 1),
         "weighted_confidence_pct": round(weighted_confidence, 1),
+        "scored_criteria_count": len(scored_criteria),
+        "total_criteria_count": len(criteria),
         "criteria_weighted": [
             {
                 "id": c.get("id", ""),
                 "name": c.get("name") or llm.CRITERIA_TITLES.get(c.get("id", ""), c.get("id", "")),
-                "score": c.get("score", 0),
+                "score": _coerce_criterion_score(c.get("score")),
                 "confidence": c.get("confidence", 0),
                 "evidence": c.get("evidence", ""),
                 "reasoning": c.get("reasoning", ""),
@@ -158,10 +171,6 @@ def build_score_breakdown(analysis: dict) -> dict:
 
 
 def build_entity_structure_view(analysis: dict) -> dict:
-    """Renders the parent -> India entity -> foundation mapping (feedback #8)
-    as a plain dict the templates/reporters can walk directly, with an
-    `is_populated` flag so renderers can skip the section entirely when the
-    evidence never named more than one legal vehicle."""
     structure = (analysis or {}).get("entity_structure") or {}
     parent = (structure.get("parent_company") or "").strip()
     india_entity = (structure.get("india_entity") or "").strip()
@@ -225,10 +234,6 @@ def attach_linkedin_urls(decision_makers: list[dict], sources: list) -> list[dic
 
 
 def sort_decision_makers_india_first(decision_makers: list[dict]) -> list[dict]:
-    """India-titled/India-scoped contacts surface ahead of global ones
-    (feedback #6), without dropping global contacts that may still be the
-    only named contact available. Stable sort preserves the model's own
-    relative ordering within each tier."""
     return sorted(decision_makers, key=lambda person: not person.get("is_india_specific", False))
 
 
@@ -308,11 +313,6 @@ def _unscored_result(state: str, insight: str, sources: list, source_links: list
 
 
 def _never_read_silence_as_negative_prefix(company: str, existing_partner: bool, note: str) -> str:
-    """Feedback #2: the 'never read silence as negative' framing previously
-    only applied to existing TAP partners via _existing_partner_prefix. This
-    generalizes the same reassurance to every low-coverage / unscored result,
-    existing partner or not, so thin sourcing never silently reads as a
-    negative signal about the company itself."""
     if existing_partner:
         return f"**Existing TAP partner** — {company} is on TAP's active donor/partner list. {note} "
     return f"**Note:** {note} "
@@ -439,13 +439,6 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
     if obligation_signal.get("computable") and obligation_signal.get("latest_year_underspending") and obligation_signal.get("explanation"):
         insight = f"{insight} {obligation_signal['explanation']}"
 
-    # Feedback #3 (partial-coverage tier): a result can clear the hard
-    # evidence_coverage_is_too_low gate above and still land in the "Low"
-    # research-confidence band. Rather than silently showing a scored result
-    # with no visible caveat, prepend the same directional-treatment banner
-    # that thin-but-scored results deserve — this is now default behavior
-    # for every company at Low research confidence, not just existing
-    # partners (feedback #2).
     if research_confidence_label == "Low":
         insight = f"**{PARTIAL_COVERAGE_BANNER}** {insight}"
 
@@ -465,8 +458,10 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         important_links = []
 
     logger.info(
-        "score DONE company=%r mode=%r fit_score=%d tier=%s research_confidence=%s source_bank_size=%d",
+        "score DONE company=%r mode=%r fit_score=%d tier=%s research_confidence=%s source_bank_size=%d "
+        "scored_criteria=%d/%d",
         company, mode, final_score, tier.get("label"), research_confidence_label, len(registry.entries()),
+        breakdown.get("scored_criteria_count", 0), breakdown.get("total_criteria_count", 0),
     )
 
     return {
