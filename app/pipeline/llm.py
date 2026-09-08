@@ -188,29 +188,26 @@ def _mode_calibration(mode: str) -> dict:
 
 
 EVIDENCE_STATE_RULE = (
-    "EVIDENCE_STATE_RULE: every numeric or categorical field you emit must carry an "
-    "explicit state alongside it. Use exactly one of: FOUND (a source states this value), "
-    "NOT_FOUND_IN_SOURCE (the sources fetched do not mention it), CONFIRMED_ABSENT (a "
-    "source positively states the value is zero or does not exist). If the state is "
-    "NOT_FOUND_IN_SOURCE, the value field must be null/empty/0 as appropriate for its type "
-    "and any *_state field for it must say so explicitly — never write 0, 0.0, 0.0%, "
-    "\"none\", or \"nil\" for something you simply did not find. Zero is a finding. Absence "
-    "of a finding is not zero, and the two must never be rendered the same way. If you "
-    "cannot cite a source number for a value, its state cannot be FOUND."
+    "EVIDENCE_STATE_RULE: every numeric or categorical field you emit must carry an explicit "
+    "state alongside it. Use exactly one of: FOUND (a source states this value), "
+    "NOT_FOUND_IN_SOURCE (the sources fetched do not mention it), CONFIRMED_ABSENT (a source "
+    "positively states the value is zero or does not exist). If the state is "
+    "NOT_FOUND_IN_SOURCE, the value field must be null. Never write 0, 0.0, 0.0%, \"none\" or "
+    "\"nil\" for something you simply did not find. Zero is a finding. Absence of a finding is "
+    "not zero, and the two must never be rendered the same way. If you cannot cite a source "
+    "number for a value, its state cannot be FOUND."
 )
 
 TREND_RULE = (
-    "TREND_RULE: do not describe a trend in words as your primary output — emit the "
-    "underlying series (history[] with fiscal_year/inr_crore/source_excerpt pairs, ordered "
-    "oldest to newest) and let the application derive the direction from it. Do not emit "
-    "relative-time phrases such as \"eight years ago\" or \"since inception\" anywhere — "
-    "emit absolute four-digit years only, and if you know a programme's start year, emit it "
-    "as start_year (a four-digit number) so elapsed time can be computed downstream rather "
-    "than composed in prose. A trend_direction of RISING/FALLING/DECLINING/FLAT must only "
-    "ever be set when at least two distinct-year data points exist in history[] and the "
-    "label is consistent with those actual values — a single data point, or no data points, "
-    "has no trend and must be UNKNOWN. Never let a trend label contradict the very series "
-    "it is attached to."
+    "TREND_RULE: do not describe a trend in words. Emit the series and let the application "
+    "derive the direction. For any multi-year figure, emit each point as "
+    "{fiscal_year/year, value, source} ordered oldest to newest, plus a series_state of "
+    "FOUND, NOT_FOUND_IN_SOURCE, or CONFIRMED_ABSENT. Do not emit a trend label such as "
+    "RISING, FALLING, or FLAT yourself in prose fields — leave trend_direction as UNKNOWN and "
+    "let the application derive it from the series you provide. Do not emit relative-time "
+    "phrases such as \"eight years ago\" or \"since inception\" anywhere. Emit absolute years "
+    "only. A series of fewer than two points has no trend — emit the points and nothing more, "
+    "and leave trend_direction as UNKNOWN."
 )
 
 SCORING_PHILOSOPHY = (
@@ -230,29 +227,29 @@ SCORING_PHILOSOPHY = (
     "say so plainly and let the evidence-coverage gate (applied outside this prompt) handle "
     "whether the score should be shown at all — do not pre-emptively collapse toward a low "
     "score just because the sources you were given are sparse.\n\n"
-    "You may now decline to score. If a criterion has no evidence in the extracted facts, "
-    "emit score: null with confidence: 0 and a one-line reason naming what was missing. Do "
-    "not guess a low number to fill the slot. A null score is not a bad score — it is the "
-    "honest output when the research did not reach that criterion, and the application will "
-    "exclude it from the average rather than let it drag the average down. Scoring 1 out of 5 "
-    "because you found nothing is damaging precisely because it is indistinguishable "
-    "downstream from a company that was genuinely assessed and found weak. Score 0 only "
-    "where a source actively contradicts the criterion."
+    "You may now decline to score. If a criterion has no evidence in the extracted facts, emit "
+    "score: null with confidence: 0 and a one-line reason naming what was missing in the "
+    "`evidence` field. Do not guess a low number to fill the slot. A null score is not a bad "
+    "score. It is the honest output when the research did not reach that criterion, and the "
+    "application will exclude it from the average rather than let it drag the average down. "
+    "Scoring 1 out of 5 because you found nothing is damaging precisely because it is "
+    "indistinguishable downstream from a company that was genuinely assessed and found weak. "
+    "Score 0 only where a source actively contradicts the criterion."
 )
 
 CONFIDENCE_SEPARATION_RULE = (
-    "CONFIDENCE_SEPARATION_RULE: you are producing two independent judgements, and must not "
-    "let one bleed into the other. fit_score is how well the evidence you DO have indicates "
-    "alignment with the mission. research_coverage is how much of the picture was retrieved "
-    "at all. A company can be a strong fit on thin evidence, and a company can be a poor fit "
-    "on thorough evidence — those are different sentences and the report must be able to say "
-    "both. Do not compute fit_score yourself. Emit the criteria array with scores (or null) "
-    "and confidences, and stop — the application computes the weighted average from the "
-    "criteria you actually scored, and computes research_coverage from how many you declined "
-    "to score. Do not emit your own top-level fit_score field. In fit_rationale, never "
-    "explain a low score by saying evidence was limited — if evidence was limited, the "
-    "affected criteria should be null and the rationale should speak only to what was "
-    "actually found."
+    "CONFIDENCE_SEPARATION_RULE: you are producing two independent judgements. Do not let one "
+    "bleed into the other. fit_score is how well the evidence you DO have indicates alignment "
+    "with the mission. research_coverage is how much of the picture you managed to retrieve at "
+    "all. A company can be a strong fit on thin evidence. A company can be a poor fit on "
+    "thorough evidence. Those are different sentences and the report must be able to say both. "
+    "Do not compute fit_score yourself. Emit the criteria array with scores and confidences and "
+    "stop — the application computes the weighted average from the criteria you scored, and "
+    "computes research_coverage from how many you declined to score. Emitting your own "
+    "fit_score reintroduces exactly the blending this rule exists to prevent. In "
+    "fit_rationale, never explain a low score by saying evidence was limited. If evidence was "
+    "limited, the affected criteria should be null and the rationale should speak only to what "
+    "was actually found."
 )
 
 SCORING_CONSISTENCY_RULE = (
@@ -293,22 +290,18 @@ EDUCATION_SPEND_RULE = (
     "than one fiscal year — annual/CSR reports often disclose 2-3 years side by side even when "
     "only the latest year is prominently mentioned. Populate spend.history[] with every "
     "distinct (fiscal_year, figure) pair you find, education-specific if available, else total "
-    "CSR clearly marked as such via is_education_specific=false entries. Set trend_direction to "
-    "RISING/FLAT/DECLINING whenever two or more years of figures exist anywhere in the evidence "
-    "— UNKNOWN should only be used when truly one data point, or none, is available. A single "
-    "year's figure with no trend is materially less useful to a fundraiser than a 2-3 year "
-    "trend, so treat finding the trend as equally important as finding the headline number.\n\n"
+    "CSR clearly marked as such via is_education_specific=false entries. A single year's figure "
+    "with no trend is materially less useful to a fundraiser than a 2-3 year trend, so treat "
+    "finding the trend as equally important as finding the headline number — but do not label "
+    "the direction yourself; see TREND_RULE.\n\n"
     "Education spend has three distinct outcomes and they must never collapse into one "
-    "another: (1) a source gives an education-specific figure -> value populated, state "
-    "FOUND; (2) a source gives total CSR only, with no education split -> spend.inr_crore "
-    "stays empty/0, spend.is_education_specific=false, state NOT_FOUND_IN_SOURCE, and say in "
-    "spend.trend_evidence or the relevant note that only a total was available, never imply "
-    "an education-specific figure was found; (3) a source states the company funds no "
-    "education at all -> spend.inr_crore=0 with state CONFIRMED_ABSENT and the source excerpt "
-    "must show the explicit statement. Outcome 2 is the common case and it must never be "
-    "rendered as outcome 3 — a total-only figure is not a finding of zero education spend, it "
-    "is simply an unresolved split. If you only have a total CSR figure, you have not found "
-    "the education share; say so rather than implying zero."
+    "another: (1) a source gives an education-specific figure -> value populated, state FOUND; "
+    "(2) a source gives total CSR only, no education split -> spend.inr_crore/display/"
+    "fiscal_year left empty, state NOT_FOUND_IN_SOURCE, and the note must say only a total was "
+    "available; (3) a source states the company funds no education -> spend.inr_crore=0, state "
+    "CONFIRMED_ABSENT. Outcome 2 is the common case and it must never be rendered as outcome 3. "
+    "If you only have a total CSR figure, you have not found the education share — say so in "
+    "spend.trend_evidence or spend.source_excerpt rather than writing 0."
 )
 
 PROFIT_HISTORY_RULE = (
@@ -447,33 +440,32 @@ DECISION_MAKER_RULE = (
     "outreach attempt and damages credibility. The CEO/MD/Chairperson may be included only if "
     "the evidence shows them personally quoted or credited on CSR/foundation matters, not by "
     "default just for holding the top role.\n\n"
-    "SOURCE OF TRUTH, IN ORDER (only fall to the next when the one above yields nothing): "
+    "SOURCE OF TRUTH, in this order — only fall to the next when the one above yields nothing: "
     "(1) the company's own leadership or CSR team page; (2) a signed foreword or signatory in "
     "the annual or CSR report; (3) a press release naming the person in role; (4) a LinkedIn "
-    "search-result snippet. For source 4, use only the search-snippet text — do not treat a "
-    "LinkedIn profile as fetched or fetchable, since the profile page sits behind an authwall "
-    "and any attempt to read past the snippet will fail or return a login shell. If a snippet "
-    "is all you have, the contact is UNVERIFIED and must be labelled so via tenure_status or "
-    "an explicit note; never silently present a snippet-only contact with the same confidence "
-    "as a leadership-page or signed-report contact.\n\n"
-    "CURRENCY TEST (not a judgement call): reject as a current contact any person whose "
-    "title/snippet/evidence contains 'Previously', 'Formerly', 'Former', 'ex-', 'Past', or a "
-    "stated end year — a person describing a role in the past tense does not hold it now. "
-    "THREE-CHECK VERIFICATION: before including anyone, confirm from the evidence (1) they are "
-    "still at the company (no former-role language nearby — apply the currency test), (2) their "
-    "designation as stated is CSR/foundation/sustainability/philanthropy-relevant, not inferred "
-    "from context alone, and (3) the role genuinely covers this company's CSR function, not an "
-    "unrelated department. INDIA PRIORITY: when the evidence surfaces both an India-based/"
-    "India-titled CSR contact and a global-level contact for the same company, include both if "
-    "evidence supports each, but set is_india_specific=true only for the person whose title or "
-    "scope is explicitly India-focused (e.g. 'CSR Head, India', 'India Foundation Director') — "
-    "this lets the report prioritise the India contact without discarding a global one that may "
-    "still be the only named contact available. Prefer a named India-based CSR/foundation staff "
-    "member over a global executive when both are available; a global CEO quoted only in a "
-    "press release is a citation, not necessarily a route in. If no contact passes the currency "
-    "test, it is entirely acceptable to return fewer decision-makers, or none — returning nobody "
-    "is a usable result, and returning a former employee as current is worse than returning "
-    "nobody."
+    "search-result snippet. The LinkedIn authwall is real and it does not block source 4: "
+    "people_search already runs through Google Custom Search, and a LinkedIn result's search "
+    "snippet carries the name and current headline, which covers the checks below. Parse the "
+    "snippet — do not attempt to fetch the profile page itself; it sits behind an authwall and "
+    "the fetch will fail or return a login shell. If a snippet is all you have, the contact is "
+    "UNVERIFIED and must be labelled so via tenure_status/is_india_specific plus a note in "
+    "tenure_evidence.\n\n"
+    "CURRENCY TEST: reject as a current contact any headline or snippet containing Previously, "
+    "Formerly, Former, ex-, Past, or a stated end year. A person describing a role in the past "
+    "tense does not hold it — this is not a judgement call. THREE-CHECK VERIFICATION: before "
+    "including anyone, confirm from the evidence (1) they are still at the company (no "
+    "former-role language nearby, per the currency test), (2) their designation as stated is "
+    "CSR/foundation/sustainability/philanthropy-relevant, not inferred from context alone, and "
+    "(3) the role genuinely covers this company's CSR function, not an unrelated department. "
+    "INDIA PRIORITY: when the evidence surfaces both an India-based/India-titled CSR contact "
+    "and a global-level contact for the same company, include both if evidence supports each, "
+    "but set is_india_specific=true only for the person whose title or scope is explicitly "
+    "India-focused (e.g. 'CSR Head, India', 'India Foundation Director') — prefer an "
+    "India-based CSR or foundation staff member over a global executive; a global CEO quoted "
+    "in a press release is a citation, not a route in. If no contact passes the currency test, "
+    "return an empty decision_makers list rather than including a former employee as current — "
+    "returning nobody is a usable result, and returning a former employee as current is worse "
+    "than returning nobody."
 )
 
 GEOGRAPHY_RULE = (
@@ -569,7 +561,7 @@ Extract, matching the JSON shape's key order exactly:
 5. delivery_model (FUNDER/IMPLEMENTER/HYBRID/UNCLEAR) + delivery_model_evidence (1 sentence).
 6. sector — from company-description language; UNKNOWN only if truly no clue.
 7. eligibility — Section 135 applicability (LIKELY/UNLIKELY/UNKNOWN) from net worth/turnover/profit figures (kept separate from spend), plus the plain numeric business-scale fields, plus the profit history required by the PROFIT HISTORY rule.
-8. spend — apply the SPEND VS REVENUE, EDUCATION SPEND, and EVIDENCE_STATE rules strictly, including the mandatory multi-year trend search and the three-outcome distinction (education-specific found / total-only found / confirmed absent).
+8. spend — apply the SPEND VS REVENUE and EDUCATION SPEND rules strictly, including the mandatory multi-year trend search, and apply EVIDENCE_STATE_RULE / TREND_RULE to every figure and every history point.
 9. entity_structure — apply the ENTITY STRUCTURE rule; leave any layer empty rather than guessing.
 10. rfp_signal — an explicit call for NGO partners; default false/empty unless stated.
 11. board_affinity — named board/promoter personal education-philanthropy history; default false/empty unless stated.
@@ -577,7 +569,7 @@ Extract, matching the JSON shape's key order exactly:
 13. group_foundation — CSR run via a separate parent/group foundation, only if explicitly named.
 14. key_facts_summary — 3-6 short bullet-style facts (as a single string, one per line prefixed with "- ") that most directly bear on education-CSR fit — this feeds directly into the scoring pass, so include anything that would move a fit judgment either up or down. Do not use this field as a dumping ground for a named programme or initiative that belongs in the programmes array instead.
 15. open_questions[] — up to 5 short, concrete, searchable items to verify.
-16. programmes[] — apply the PROGRAMME rule, including the delivery-channel/beneficiary specificity requirement, the chain-completeness fields, and absolute years only per TREND_RULE.
+16. programmes[] — apply the PROGRAMME rule, including the delivery-channel/beneficiary specificity requirement and the chain-completeness fields.
 17. partners[] — apply the PARTNER rule, including similar_to_tap_profile, multi-year history, and named-format initiatives (DIBs, outcomes funds).
 18. decision_makers[] — apply the DECISION-MAKER source-of-truth order, currency test, and three-check verification strictly; title, public_facing_score 0-100, tenure_status, is_india_specific, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence.
 19. geographies[] — apply the GEOGRAPHY rule; prefer state/city over country/vague-region entries.
@@ -598,7 +590,7 @@ JSON shape:
   "delivery_model_evidence": "<sentence>",
   "sector": {{"sector": "<sector>", "sub_sector": "<or empty>", "reasoning": "<short>"}},
   "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number, 0 if unknown>, "net_profit_inr_crore": <number, 0 if unknown>, "net_profit_fiscal_year": "<if stated>", "net_profit_history": [{{"fiscal_year": "<year>", "net_profit_inr_crore": <number, 0 if unknown>, "source_excerpt": "<short, verbatim ok>"}}], "net_profit_trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>"}},
-  "spend": {{"inr_crore": <number, 0 if unknown, education-specific only>, "display": "<exact CSR-labeled education figure or empty>", "fiscal_year": "<if stated>", "is_education_specific": <bool>, "education_pct_of_total_csr": <number, 0 if unknown>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short, verbatim ok>", "trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>", "trend_evidence": "<short>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number, 0 if unknown>, "display": "<as stated>", "source_excerpt": "<short, verbatim ok>"}}], "total_csr_inr_crore": <number, 0 if unknown>, "total_csr_display": "<as stated or empty>", "total_csr_fiscal_year": "<if stated>"}},
+  "spend": {{"inr_crore": <number, 0 if unknown, education-specific only>, "display": "<exact CSR-labeled education figure or empty>", "fiscal_year": "<if stated>", "is_education_specific": <bool>, "education_pct_of_total_csr": <number, 0 if unknown>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short, verbatim ok>", "state": "<FOUND|NOT_FOUND_IN_SOURCE|CONFIRMED_ABSENT>", "start_year": "<four-digit year if stated, else empty>", "trend_direction": "UNKNOWN", "trend_evidence": "<short>", "series_state": "<FOUND|NOT_FOUND_IN_SOURCE|CONFIRMED_ABSENT>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number, 0 if unknown>, "display": "<as stated>", "source_excerpt": "<short, verbatim ok>"}}], "total_csr_inr_crore": <number, 0 if unknown>, "total_csr_display": "<as stated or empty>", "total_csr_fiscal_year": "<if stated>"}},
   "entity_structure": {{"parent_company": "<name or empty>", "india_entity": "<name or empty>", "foundation_entity": "<name or empty>", "notes": "<short, only if evidence clarifies how these relate>"}},
   "rfp_signal": {{"present": <bool>, "channel": "<short>", "evidence": "<short>"}},
   "board_affinity": {{"present": <bool>, "person_name": "<name or empty>", "connection": "<short>", "source_excerpt": "<short, verbatim ok>"}},
@@ -646,20 +638,21 @@ SOURCES:
 {obligation_block}
 {SCORING_PHILOSOPHY}
 
-{CONFIDENCE_SEPARATION_RULE}
-
 {SCORING_CONSISTENCY_RULE}
+
+{CONFIDENCE_SEPARATION_RULE}
 
 {HIGHLIGHT_RULE}
 
 Produce, in this order:
-1. criteria[] — all 17 ids below, in order, each with id, name (copy exactly as given), score (0-5, or null if you are declining to score this criterion per the SCORING PHILOSOPHY), confidence 0-100 (0 if score is null), short evidence, short reasoning, drawn only from the extracted facts above. Follow the CONSISTENCY rule above for every score you do give. IMPORTANT: `confidence` must reflect how directly the extracted facts support THIS criterion specifically — not your confidence in the company overall, and not the confidence you assigned to a different criterion. A criterion resting on an inferred/sector-default judgment (per the SCORING PHILOSOPHY) should carry a materially lower confidence than one resting on an explicit, named fact:
+1. criteria[] — all 17 ids below, in order, each with id, name (copy exactly as given), score 0-5 or null, confidence 0-100, short evidence, short reasoning, drawn only from the extracted facts above. Follow the CONSISTENCY rule above for every score. IMPORTANT: `confidence` must reflect how directly the extracted facts support THIS criterion specifically — not your confidence in the company overall, and not the confidence you assigned to a different criterion. A criterion resting on an inferred/sector-default judgment (per the SCORING PHILOSOPHY) should carry a materially lower confidence than one resting on an explicit, named fact. If a criterion has no evidence at all in the extracted facts, emit score: null, confidence: 0, and say what was missing in `evidence` — per SCORING PHILOSOPHY, do not guess a low number just to fill the slot:
 {_rubric_block()}
-2. fit_rationale (2-4 sentences): justify the scoring from the extracted facts, stating plainly what's confirmed vs inferred vs undocumented. If a named partner/programme suggests a plausible but unconfirmed entry path, you may add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme — never invent one not in the extracted facts. If decision_makers and/or partners/programmes are non-empty, end with one short sentence "Key contacts: A (Title), B (Title); Key partners: X, Y" using only names from the extracted facts. Omit that closing sentence if both lists are empty.
-3. overall_semantic_alignment (0-100) + alignment_rationale (1-2 sentences) — how well the company's actual activity matches the NGO mission semantically, independent of documentation completeness.
-4. strategic_insight — a 150-280 word standalone narrative (this is the lead summary shown to the user first, and should read as usable outreach material, not just an internal note): measured and evidence-grounded, leading with genuine strengths before caveats, stating plainly whether/why this is a good fit, naming strongest/weakest dimensions without dwelling on the weakest, flagging group-foundation routing if present, noting eligibility if uncertain, weaving in the CSR obligation signal above if present, and giving one concrete next step. When spend is discussed, lead with the education-specific figure/trend over the total CSR figure if both are available, and never state a total-only CSR figure as if it were the education figure. When a specific programme or partner is TAP-relevant, name its delivery channel explicitly (in-school/curriculum vs adult/standalone vs digital, etc.) and state concretely how TAP's own model (AI-enabled WhatsApp delivery, government-school, curriculum-embedded electives) does or doesn't overlap with it — write this so a sentence could be lifted directly into an outreach email, rather than a generic theme match like "both work in education." If TAP-similar partners exist, mention that positively. {"Since this is a screen-mode pass, if the signal is promising but sourcing is thin, say plainly that a deep-research pass would surface more (spend figures, named partners, a decision-maker) rather than treating the gap as a weakness." if mode == "screen" else ""} End with the same "Key contacts: ...; Key partners: ..." sentence format as fit_rationale (only using names from the extracted facts), omitted if both lists are empty.
+2. Do NOT compute or emit fit_score yourself — per CONFIDENCE_SEPARATION_RULE, the application computes it deterministically from the criteria array above. Stop after criteria and move directly to the narrative fields below.
+3. fit_rationale (2-4 sentences): justify the scoring from the extracted facts, stating plainly what's confirmed vs inferred vs undocumented. Never explain a low score by citing limited evidence — a criterion with limited evidence should be null, not low. If a named partner/programme suggests a plausible but unconfirmed entry path, you may add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme — never invent one not in the extracted facts. If decision_makers and/or partners/programmes are non-empty, end with one short sentence "Key contacts: A (Title), B (Title); Key partners: X, Y" using only names from the extracted facts. Omit that closing sentence if both lists are empty.
+4. overall_semantic_alignment (0-100) + alignment_rationale (1-2 sentences) — how well the company's actual activity matches the NGO mission semantically, independent of documentation completeness.
+5. strategic_insight — a 150-280 word standalone narrative (this is the lead summary shown to the user first, and should read as usable outreach material, not just an internal note): measured and evidence-grounded, leading with genuine strengths before caveats, stating plainly whether/why this is a good fit, naming strongest/weakest dimensions without dwelling on the weakest, flagging group-foundation routing if present, noting eligibility if uncertain, weaving in the CSR obligation signal above if present, and giving one concrete next step. When spend is discussed, lead with the education-specific figure/trend over the total CSR figure if both are available, and never state a trend word unless the spend series actually supports it (per TREND_RULE) — if only one year of spend is known, describe the single figure and do not claim a trend. When a specific programme or partner is TAP-relevant, name its delivery channel explicitly (in-school/curriculum vs adult/standalone vs digital, etc.) and state concretely how TAP's own model (AI-enabled WhatsApp delivery, government-school, curriculum-embedded electives) does or doesn't overlap with it — write this so a sentence could be lifted directly into an outreach email, rather than a generic theme match like "both work in education." If TAP-similar partners exist, mention that positively. {"Since this is a screen-mode pass, if the signal is promising but sourcing is thin, say plainly that a deep-research pass would surface more (spend figures, named partners, a decision-maker) rather than treating the gap as a weakness." if mode == "screen" else ""} End with the same "Key contacts: ...; Key partners: ..." sentence format as fit_rationale (only using names from the extracted facts), omitted if both lists are empty.
 
-All criteria ids appear exactly once, in the order listed, each with its name copied exactly as given above. Do not emit a top-level fit_score field — the application computes it from your criteria. Keep every string concise so the full reply fits comfortably in your output budget.
+All criteria ids appear exactly once, in the order listed, each with its name copied exactly as given above. Keep every string concise so the full reply fits comfortably in your output budget.
 
 Reply with ONE JSON object, nothing else, no markdown fences.
 
@@ -703,9 +696,12 @@ class SpendSchema(BaseModel):
     confidence: int = Field(ge=0, le=100, default=0)
     source_excerpt: str = Field(default="", max_length=260)
     source: str = ""
+    state: str = "NOT_FOUND_IN_SOURCE"
+    start_year: str = ""
     trend_direction: str = "UNKNOWN"
     trend_evidence: str = Field(default="", max_length=240)
     trend_source: str = ""
+    series_state: str = "NOT_FOUND_IN_SOURCE"
     history: list[SpendYearSchema] = Field(default_factory=list)
     total_csr_inr_crore: float = 0.0
     total_csr_display: str = ""
@@ -726,6 +722,9 @@ PROGRAMME_CHAIN_ELEMENTS = frozenset([
     "beneficiaries", "geography", "partner", "government_school_involvement",
     "scale_or_outcomes", "funding_amount",
 ])
+
+EVIDENCE_STATES = frozenset(["FOUND", "NOT_FOUND_IN_SOURCE", "CONFIRMED_ABSENT"])
+TREND_DIRECTIONS = frozenset(["RISING", "FLAT", "DECLINING", "UNKNOWN"])
 
 
 class ProgrammeSchema(BaseModel):
@@ -863,6 +862,7 @@ class CsrObligationSignalSchema(BaseModel):
 
 class FullAnalysisSchema(BaseModel):
     fit_score: int | None = Field(ge=0, le=100, default=None)
+    research_coverage: int = Field(ge=0, le=100, default=0)
     fit_rationale: str = Field(default="", max_length=600)
     overall_semantic_alignment: int = Field(ge=0, le=100, default=0)
     alignment_rationale: str = Field(default="", max_length=500)
@@ -892,13 +892,73 @@ class FullAnalysisSchema(BaseModel):
     strategic_insight: str = Field(default="", max_length=2200)
     scoring_incomplete: bool = False
     csr_obligation_signal: CsrObligationSignalSchema = CsrObligationSignalSchema()
-    research_coverage_pct: int = Field(ge=0, le=100, default=0)
 
 
 SECTION_135_CSR_RATE = 0.02
 MIN_PROFIT_YEARS_FOR_TREND = 2
 
-COVERAGE_FLOOR = 60
+
+def _derive_trend_direction(history: list[dict], value_key: str = "inr_crore") -> str:
+    valid_points = [
+        entry for entry in (history or [])
+        if isinstance(entry, dict) and entry.get("fiscal_year") and entry.get(value_key, 0)
+    ]
+    if len(valid_points) < 2:
+        return "UNKNOWN"
+    ordered = sorted(valid_points, key=lambda e: e.get("fiscal_year", ""))
+    first_value = ordered[0].get(value_key, 0)
+    last_value = ordered[-1].get(value_key, 0)
+    if first_value <= 0:
+        return "UNKNOWN"
+    if last_value > first_value * 1.05:
+        return "RISING"
+    if last_value < first_value * 0.95:
+        return "DECLINING"
+    return "FLAT"
+
+
+def _apply_derived_spend_trend(spend: dict) -> dict:
+    spend = dict(spend or {})
+    history = spend.get("history") or []
+    if len(history) >= 2:
+        spend["trend_direction"] = _derive_trend_direction(history, value_key="inr_crore")
+        spend["series_state"] = "FOUND"
+    elif len(history) == 1:
+        spend["trend_direction"] = "UNKNOWN"
+        if spend.get("series_state") not in EVIDENCE_STATES:
+            spend["series_state"] = "FOUND"
+    else:
+        spend["trend_direction"] = "UNKNOWN"
+        if spend.get("series_state") not in EVIDENCE_STATES:
+            spend["series_state"] = "NOT_FOUND_IN_SOURCE"
+
+    if spend.get("state") not in EVIDENCE_STATES:
+        if spend.get("is_education_specific") and (spend.get("inr_crore") or spend.get("display")):
+            spend["state"] = "FOUND"
+        elif spend.get("is_education_specific") and spend.get("inr_crore", 0) == 0 and spend.get("display", "") == "":
+            spend["state"] = "NOT_FOUND_IN_SOURCE"
+        else:
+            spend["state"] = "NOT_FOUND_IN_SOURCE"
+
+    if spend.get("state") == "NOT_FOUND_IN_SOURCE":
+        spend["inr_crore"] = 0.0
+        spend["display"] = spend.get("display", "") if spend.get("is_education_specific") is False else ""
+
+    return spend
+
+
+def _apply_derived_profit_trend(eligibility: dict) -> dict:
+    eligibility = dict(eligibility or {})
+    history = eligibility.get("net_profit_history") or []
+    if len(history) >= 2:
+        eligibility["net_profit_trend_direction"] = _derive_trend_direction(
+            history, value_key="net_profit_inr_crore"
+        )
+    elif eligibility.get("net_profit_trend_direction") not in TREND_DIRECTIONS:
+        eligibility["net_profit_trend_direction"] = "UNKNOWN"
+    elif len(history) < 2 and eligibility.get("net_profit_trend_direction") != "UNKNOWN":
+        eligibility["net_profit_trend_direction"] = "UNKNOWN"
+    return eligibility
 
 
 def compute_csr_obligation_signal(eligibility: dict, spend: dict) -> dict:
@@ -1115,6 +1175,10 @@ def _recover_partial_json(cleaned: str, required_key: str | None = None) -> dict
 _STRAY_MARKER = re.compile(r"\*{3,}")
 _DOUBLE_STAR = re.compile(r"\*\*")
 _LINKEDIN_PROFILE_URL = re.compile(r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[^/?#\s]+/?(?:[?#].*)?$", re.IGNORECASE)
+_FORMER_ROLE_LANGUAGE = re.compile(
+    r"\b(previously|formerly|former|ex-|past)\b|\b(19|20)\d{2}\s*[-–—]\s*(present|now|\d{4})\b",
+    re.IGNORECASE,
+)
 
 
 def _normalize_highlight_markers(text: str) -> str:
@@ -1129,6 +1193,13 @@ def _normalize_highlight_markers(text: str) -> str:
 def _sanitize_linkedin_url(url: str) -> str:
     cleaned = (url or "").strip()
     return cleaned if _LINKEDIN_PROFILE_URL.match(cleaned) else ""
+
+
+def _looks_like_former_role(*texts: str) -> bool:
+    combined = " ".join(t for t in texts if t)
+    if not combined:
+        return False
+    return bool(_FORMER_ROLE_LANGUAGE.search(combined))
 
 
 def _field_max_length(field) -> int | None:
@@ -1152,12 +1223,9 @@ def _field_numeric_bounds(field) -> tuple[float | None, float | None]:
     return lower, upper
 
 
-def _unwrap_optional(annotation):
-    type_args = typing.get_args(annotation)
-    if type_args and type(None) in type_args:
-        non_none = [a for a in type_args if a is not type(None)]
-        return non_none[0] if non_none else annotation
-    return annotation
+def _is_optional_field(field) -> bool:
+    args = typing.get_args(field.annotation)
+    return bool(args) and type(None) in args
 
 
 def _sanitize_value_for_field(value, field):
@@ -1177,15 +1245,11 @@ def _sanitize_value_for_field(value, field):
     if isinstance(annotation, type) and issubclass(annotation, BaseModel):
         return _sanitize_dict_for_model(value if isinstance(value, dict) else {}, annotation)
 
-    unwrapped = _unwrap_optional(annotation)
-
-    is_nullable_numeric = (
-        unwrapped in (int, float)
-        and typing.get_args(annotation)
-        and type(None) in typing.get_args(annotation)
-    )
-    if is_nullable_numeric and value is None:
-        return None
+    unwrapped = annotation
+    type_args = typing.get_args(annotation)
+    if type_args and type(None) in type_args:
+        non_none = [a for a in type_args if a is not type(None)]
+        unwrapped = non_none[0] if non_none else annotation
 
     if unwrapped is str:
         if value is None:
@@ -1201,8 +1265,12 @@ def _sanitize_value_for_field(value, field):
         return bool(value) if value is not None else False
 
     if unwrapped in (int, float):
+        if value is None and _is_optional_field(field):
+            return None
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             fallback = field.default
+            if value is None and _is_optional_field(field):
+                return None
             value = fallback if isinstance(fallback, (int, float)) and not isinstance(fallback, bool) else 0
         lower, upper = _field_numeric_bounds(field)
         if lower is not None and value < lower:
@@ -1280,8 +1348,7 @@ def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode:
     weighted = _compute_weighted_fit_score(criteria)
     if weighted is None:
         logger.info(
-            "compute_final_fit_score no scored criteria company=%r mode=%s — fit_score is None",
-            company, mode,
+            "compute_final_fit_score company=%r mode=%s no_scored_criteria fit_score=None", company, mode,
         )
         return None
     calibrated = _apply_authenticity_ceiling(weighted, authenticity_score, mode)
@@ -1301,6 +1368,21 @@ def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode:
             )
     return final_score
 
+
+# ---------------------------------------------------------------------------
+# EVIDENCE COVERAGE / RESEARCH CONFIDENCE GATE
+#
+# fit_score and research_coverage are now computed independently in code
+# (see _compute_weighted_fit_score / compute_research_coverage above) rather
+# than blended by the model. A criterion the model declined to score (null)
+# leaves the fit_score denominator entirely instead of entering it as a low
+# integer, and research_coverage falls out of how many criteria were left
+# null versus scored. The checks below decide whether coverage is so thin
+# that no fit score should be shown at all (the insufficient-evidence path).
+# research_confidence_label() below produces an always-shown coarse label
+# (High/Medium/Low/Insufficient) so that even when a score IS shown, the
+# reader sees, right next to it, how much to trust it.
+# ---------------------------------------------------------------------------
 
 LOW_COVERAGE_AUTHENTICITY_THRESHOLD = 30
 LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD = 45
@@ -1385,38 +1467,32 @@ def _low_confidence_share(criteria: list[dict], threshold: int) -> float:
     return low_count / len(criteria)
 
 
-def evidence_coverage_is_too_low(criteria: list[dict], authenticity_score: int,
-                                  fit_score: int | None = None, research_coverage: int | None = None) -> tuple[bool, str]:
+def evidence_coverage_is_too_low(criteria: list[dict], authenticity_score: int) -> tuple[bool, str]:
     if not criteria:
         return True, "No criteria were returned to score against."
 
-    if fit_score is None:
-        return True, "No criteria carried a scoreable value — every criterion was declined."
-
-    if research_coverage is not None and research_coverage < COVERAGE_FLOOR:
-        return True, f"Only {research_coverage} percent of criteria were confidently scored (floor is {COVERAGE_FLOOR} percent)."
+    if all(c.get("score") is None for c in criteria):
+        return True, "No criteria could be scored against the extracted evidence."
 
     if authenticity_score < LOW_COVERAGE_AUTHENTICITY_THRESHOLD:
         return True, f"Source authenticity was only {authenticity_score} percent."
 
-    scored = _scored_criteria(criteria)
-
-    weighted_confidence = weighted_average_criteria_confidence(scored)
+    weighted_confidence = weighted_average_criteria_confidence(criteria)
     if weighted_confidence < LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD:
         return True, f"Weighted criteria confidence was only {weighted_confidence:.0f} percent."
 
-    plain_confidence = average_criteria_confidence(scored)
+    plain_confidence = average_criteria_confidence(criteria)
     if plain_confidence < LOW_COVERAGE_PLAIN_AVERAGE_THRESHOLD:
         return True, f"Average criteria confidence was only {plain_confidence:.0f} percent."
 
-    weak_criterion = _low_confidence_high_weight_criterion(scored)
+    weak_criterion = _low_confidence_high_weight_criterion(criteria)
     if weak_criterion is not None:
         name = weak_criterion.get("name") or weak_criterion.get("id", "a high-weight criterion")
         confidence = weak_criterion.get("confidence", 0)
         return True, f"{name} had only {confidence} percent confidence."
 
     confident_weight_share, confident_count = _confident_weight_share(
-        scored, LOW_COVERAGE_CONFIDENT_CRITERION_THRESHOLD
+        criteria, LOW_COVERAGE_CONFIDENT_CRITERION_THRESHOLD
     )
     if (
         confident_weight_share < LOW_COVERAGE_MIN_CONFIDENT_WEIGHT_SHARE
@@ -1428,12 +1504,12 @@ def evidence_coverage_is_too_low(criteria: list[dict], authenticity_score: int,
             f"{LOW_COVERAGE_CONFIDENT_CRITERION_THRESHOLD} percent confidence."
         )
 
-    low_share = _low_confidence_share(scored, LOW_COVERAGE_LOW_CONFIDENCE_CRITERION_THRESHOLD)
+    low_share = _low_confidence_share(criteria, LOW_COVERAGE_LOW_CONFIDENCE_CRITERION_THRESHOLD)
     if low_share > LOW_COVERAGE_MAX_LOW_CONFIDENCE_SHARE:
-        low_count = round(low_share * len(scored))
+        low_count = round(low_share * len(criteria))
         return True, (
-            f"{low_count} of {len(scored)} scored criteria had "
-            f"{LOW_COVERAGE_LOW_CONFIDENCE_CRITERION_THRESHOLD} percent confidence or below."
+            f"{low_count} of {len(criteria)} criteria had {LOW_COVERAGE_LOW_CONFIDENCE_CRITERION_THRESHOLD} "
+            f"percent confidence or below."
         )
 
     return False, ""
@@ -1444,8 +1520,7 @@ def research_confidence_label(criteria: list[dict], authenticity_score: int,
     if coverage_insufficient:
         return "Insufficient"
 
-    scored = _scored_criteria(criteria)
-    weighted_confidence = weighted_average_criteria_confidence(scored)
+    weighted_confidence = weighted_average_criteria_confidence(criteria)
     if (
         authenticity_score >= RESEARCH_CONFIDENCE_HIGH_AUTHENTICITY
         and weighted_confidence >= RESEARCH_CONFIDENCE_HIGH_WEIGHTED_CONF
@@ -1476,6 +1551,22 @@ def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
             if isinstance(entry, dict) and entry.get("linkedin_url"):
                 entry["linkedin_url"] = _sanitize_linkedin_url(entry["linkedin_url"])
 
+    if isinstance(sanitized.get("decision_makers"), list) and isinstance(parsed.get("decision_makers"), list):
+        raw_people = [p for p in parsed["decision_makers"] if isinstance(p, dict)]
+        kept = []
+        for sanitized_entry, raw_entry in zip(sanitized["decision_makers"], raw_people):
+            if _looks_like_former_role(
+                raw_entry.get("title", ""), raw_entry.get("tenure_evidence", ""),
+                raw_entry.get("source_excerpt", ""),
+            ):
+                logger.info(
+                    "_repair_extraction dropped former-role decision maker caller=%s name=%r",
+                    caller, raw_entry.get("name", ""),
+                )
+                continue
+            kept.append(sanitized_entry)
+        sanitized["decision_makers"] = kept
+
     if isinstance(parsed.get("programmes"), list):
         raw_by_index = [p for p in parsed["programmes"] if isinstance(p, dict)]
         for sanitized_entry, raw_entry in zip(sanitized.get("programmes", []), raw_by_index):
@@ -1483,6 +1574,11 @@ def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
                 sanitized_entry["chain_missing_elements"] = _sanitize_chain_missing_elements(
                     raw_entry.get("chain_missing_elements")
                 )
+
+    if isinstance(sanitized.get("spend"), dict):
+        sanitized["spend"] = _apply_derived_spend_trend(sanitized["spend"])
+    if isinstance(sanitized.get("eligibility"), dict):
+        sanitized["eligibility"] = _apply_derived_profit_trend(sanitized["eligibility"])
 
     sanitized["key_facts_summary"] = str(parsed.get("key_facts_summary", "") or "")[:1500]
     sanitized["open_questions"] = [
@@ -1507,12 +1603,12 @@ def build_extraction_only_result(extraction: dict, mode: str) -> dict:
     merged.pop("key_facts_summary", None)
     merged["criteria"] = _empty_criteria()
     merged["fit_score"] = None
+    merged["research_coverage"] = 0
     merged["fit_rationale"] = ""
     merged["overall_semantic_alignment"] = 0
     merged["alignment_rationale"] = ""
     merged["strategic_insight"] = LLM_SCORING_UNAVAILABLE_NOTE
     merged["scoring_incomplete"] = True
-    merged["research_coverage_pct"] = 0
 
     validated = _repair_analysis(merged)
     result = validated.model_dump()
@@ -1532,6 +1628,7 @@ def build_extraction_only_result(extraction: dict, mode: str) -> dict:
 def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
     parsed = dict(parsed) if isinstance(parsed, dict) else {}
     original_programmes = parsed.get("programmes") if isinstance(parsed.get("programmes"), list) else []
+    original_decision_makers = parsed.get("decision_makers") if isinstance(parsed.get("decision_makers"), list) else []
     parsed = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
 
     if isinstance(parsed.get("programmes"), list):
@@ -1541,6 +1638,24 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
                 sanitized_entry["chain_missing_elements"] = _sanitize_chain_missing_elements(
                     raw_entry.get("chain_missing_elements")
                 )
+
+    if isinstance(parsed.get("decision_makers"), list):
+        raw_people = [p for p in original_decision_makers if isinstance(p, dict)]
+        kept = []
+        for sanitized_entry, raw_entry in zip(parsed["decision_makers"], raw_people):
+            if _looks_like_former_role(
+                raw_entry.get("title", ""), raw_entry.get("tenure_evidence", ""),
+                raw_entry.get("source_excerpt", ""),
+            ):
+                logger.info("_repair_analysis dropped former-role decision maker name=%r", raw_entry.get("name", ""))
+                continue
+            kept.append(sanitized_entry)
+        parsed["decision_makers"] = kept
+
+    if isinstance(parsed.get("spend"), dict):
+        parsed["spend"] = _apply_derived_spend_trend(parsed["spend"])
+    if isinstance(parsed.get("eligibility"), dict):
+        parsed["eligibility"] = _apply_derived_profit_trend(parsed["eligibility"])
 
     raw_criteria = parsed.get("criteria") if isinstance(parsed.get("criteria"), list) else []
     repaired_criteria, seen_ids = [], set()
@@ -1552,18 +1667,17 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
             continue
         seen_ids.add(criterion_id)
         raw_score = entry.get("score", None)
-        if raw_score is None:
-            normalized_score = None
-        else:
+        score_value = None
+        if raw_score is not None:
             try:
-                normalized_score = min(max(float(raw_score), 0), 5)
+                score_value = min(max(float(raw_score), 0), 5)
             except (TypeError, ValueError):
-                normalized_score = None
+                score_value = None
         repaired_criteria.append({
             "id": criterion_id,
             "name": CRITERIA_TITLES[criterion_id],
-            "score": normalized_score,
-            "confidence": int(min(max(entry.get("confidence", 0) or 0, 0), 100)) if normalized_score is not None else 0,
+            "score": score_value,
+            "confidence": int(min(max(entry.get("confidence", 0) or 0, 0), 100)),
             "evidence": str(entry.get("evidence", ""))[:240],
             "reasoning": str(entry.get("reasoning", ""))[:240],
             "source": str(entry.get("source", "")),
@@ -1577,6 +1691,7 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
             })
     ordered = {c["id"]: c for c in repaired_criteria}
     parsed["criteria"] = [ordered[cid] for cid in CRITERIA_IDS]
+    parsed["research_coverage"] = compute_research_coverage(parsed["criteria"])
 
     for field_name in ("fit_rationale", "alignment_rationale", "delivery_model_evidence",
                        "csr_head_note", "evidence_recency", "source_quality_assessment",
@@ -1590,8 +1705,6 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
         for entry in parsed["decision_makers"]:
             if isinstance(entry, dict) and entry.get("linkedin_url"):
                 entry["linkedin_url"] = _sanitize_linkedin_url(entry["linkedin_url"])
-
-    parsed["research_coverage_pct"] = compute_research_coverage(parsed["criteria"])
 
     try:
         return FullAnalysisSchema.model_validate(parsed)
@@ -1617,9 +1730,12 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
                 exc2,
             )
             safe_kwargs: dict = {
-                "fit_score": parsed.get("fit_score", None),
+                "fit_score": (
+                    int(min(max(parsed.get("fit_score", 0) or 0, 0), 100))
+                    if parsed.get("fit_score") is not None else None
+                ),
+                "research_coverage": int(min(max(parsed.get("research_coverage", 0) or 0, 0), 100)),
                 "criteria": [CriterionResultSchema(**c) for c in repaired_criteria],
-                "research_coverage_pct": parsed.get("research_coverage_pct", 0),
             }
             for scalar_field in (
                 "fit_rationale", "overall_semantic_alignment", "alignment_rationale",
@@ -1664,9 +1780,12 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
             except ValidationError:
                 logger.error("analysis validation failed even after item-level salvage — using minimal fallback")
                 return FullAnalysisSchema(
-                    fit_score=parsed.get("fit_score", None),
+                    fit_score=(
+                        int(min(max(parsed.get("fit_score", 0) or 0, 0), 100))
+                        if parsed.get("fit_score") is not None else None
+                    ),
+                    research_coverage=int(min(max(parsed.get("research_coverage", 0) or 0, 0), 100)),
                     criteria=[CriterionResultSchema(**c) for c in repaired_criteria],
-                    research_coverage_pct=parsed.get("research_coverage_pct", 0),
                 )
 
 
@@ -1866,10 +1985,8 @@ async def score_extracted_facts(
         logger.error("score_extracted_facts empty parse company=%r", company)
         return None
 
-    parsed.pop("fit_score", None)
-
     logger.info(
-        "score_extracted_facts DONE company=%r criteria_returned=%d",
+        "score_extracted_facts DONE company=%r criteria_count=%d",
         company, len(parsed.get("criteria", []) or []),
     )
     return parsed
@@ -1906,6 +2023,7 @@ async def analyze_and_score_company(
     merged.pop("key_facts_summary", None)
     merged["criteria"] = scoring.get("criteria", [])
     merged["fit_score"] = None
+    merged["research_coverage"] = 0
     merged["fit_rationale"] = scoring.get("fit_rationale", "")
     merged["overall_semantic_alignment"] = scoring.get("overall_semantic_alignment", 0)
     merged["alignment_rationale"] = scoring.get("alignment_rationale", "")
@@ -1917,29 +2035,16 @@ async def analyze_and_score_company(
 
     result["csr_obligation_signal"] = csr_obligation_signal
 
-    research_coverage = compute_research_coverage(result["criteria"])
-    result["research_coverage_pct"] = research_coverage
-
-    model_reported_score = None
-    provisional_fit_score = compute_final_fit_score(
-        criteria=result["criteria"],
-        authenticity_score=result["overall_authenticity_score"],
-        mode=mode,
-        model_reported_score=model_reported_score,
-        company=company,
-    )
-
     coverage_insufficient, coverage_reason = evidence_coverage_is_too_low(
-        result["criteria"], result["overall_authenticity_score"],
-        fit_score=provisional_fit_score, research_coverage=research_coverage,
+        result["criteria"], result["overall_authenticity_score"]
     )
     result["evidence_coverage_insufficient"] = coverage_insufficient
     result["evidence_coverage_reason"] = coverage_reason
     result["average_criteria_confidence_pct"] = round(
-        average_criteria_confidence(_scored_criteria(result["criteria"])), 1
+        average_criteria_confidence(result["criteria"]), 1
     )
     result["weighted_criteria_confidence_pct"] = round(
-        weighted_average_criteria_confidence(_scored_criteria(result["criteria"])), 1
+        weighted_average_criteria_confidence(result["criteria"]), 1
     )
 
     result["research_confidence_label"] = research_confidence_label(
@@ -1949,11 +2054,28 @@ async def analyze_and_score_company(
     if coverage_insufficient:
         result["fit_score_display_mode"] = "insufficient_evidence"
         result["fit_score_label"] = "Insufficient evidence to score confidently"
-        result["fit_score"] = None
     else:
         result["fit_score_display_mode"] = "scored"
         result["fit_score_label"] = ""
-        result["fit_score"] = provisional_fit_score
+
+    result["fit_score"] = compute_final_fit_score(
+        criteria=result["criteria"],
+        authenticity_score=result["overall_authenticity_score"],
+        mode=mode,
+        model_reported_score=None,
+        company=company,
+    )
+    result["research_coverage"] = compute_research_coverage(result["criteria"])
+
+    if result["fit_score"] is None and not coverage_insufficient:
+        coverage_insufficient = True
+        result["evidence_coverage_insufficient"] = True
+        result["evidence_coverage_reason"] = result["evidence_coverage_reason"] or (
+            "No criteria could be scored against the extracted evidence."
+        )
+        result["fit_score_display_mode"] = "insufficient_evidence"
+        result["fit_score_label"] = "Insufficient evidence to score confidently"
+        result["research_confidence_label"] = "Insufficient"
 
     if not result.get("strategic_insight", "").strip():
         result["strategic_insight"] = result.get("fit_rationale", "") or LLM_UNAVAILABLE_EVIDENCE
@@ -1961,13 +2083,13 @@ async def analyze_and_score_company(
     result["open_questions"] = [q.strip()[:200] for q in extraction.get("open_questions", []) if q and q.strip()][:5]
 
     logger.info(
-        "analyze_and_score_company DONE company=%r mode=%s final_fit_score=%s "
+        "analyze_and_score_company DONE company=%r mode=%s final_fit_score=%s research_coverage=%d "
         "authenticity=%d avg_criteria_confidence=%.1f weighted_criteria_confidence=%.1f coverage_insufficient=%s "
-        "coverage_reason=%r research_confidence=%s research_coverage_pct=%d partners=%d programmes=%d decision_makers=%d",
-        company, mode, result["fit_score"], result["overall_authenticity_score"],
+        "coverage_reason=%r research_confidence=%s partners=%d programmes=%d decision_makers=%d",
+        company, mode, result["fit_score"], result["research_coverage"], result["overall_authenticity_score"],
         result["average_criteria_confidence_pct"], result["weighted_criteria_confidence_pct"],
         result["evidence_coverage_insufficient"], result["evidence_coverage_reason"],
-        result["research_confidence_label"], result["research_coverage_pct"],
+        result["research_confidence_label"],
         len(result["partners"]), len(result["programmes"]), len(result["decision_makers"]),
     )
     logger.info(

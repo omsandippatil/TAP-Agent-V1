@@ -173,12 +173,12 @@
         <h2>Criteria scorecard</h2>
         <div class="panel">
           {% for c in score_breakdown.criteria_weighted %}
-            {% set pct = (c.score / 5 * 100) | round | int %}
+            {% set pct = ((c.score / 5 * 100) | round | int) if c.score is not none else 0 %}
             <div class="bar-row-detailed">
               <div class="bar-row">
                 <span class="bar-label">{{ c.name }}</span>
                 <span class="bar-track"><span class="bar-fill" data-pct="{{ pct }}"></span></span>
-                <span class="bar-value">{{ c.score }}/5</span>
+                <span class="bar-value">{{ (c.score ~ '/5') if c.score is not none else 'Not scored' }}</span>
               </div>
               <div class="bar-meta">
                 <span class="conf-pill">confidence {{ c.confidence }}%</span>
