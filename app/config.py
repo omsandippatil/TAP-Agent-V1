@@ -27,8 +27,12 @@ class Settings(BaseSettings):
         return bool(self.anthropic_api_key.strip())
 
     @property
+    def google_search_api_keys(self) -> list[str]:
+        return [key.strip() for key in self.google_search_api_key.split(",") if key.strip()]
+
+    @property
     def google_search_configured(self) -> bool:
-        return bool(self.google_search_api_key.strip() and self.google_search_engine_id.strip())
+        return bool(self.google_search_api_keys and self.google_search_engine_id.strip())
 
     @property
     def supabase_configured(self) -> bool:

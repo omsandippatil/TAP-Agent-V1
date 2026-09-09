@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 
 import httpx
 
@@ -16,18 +17,30 @@ _canary_checked = False
 _canary_ok: bool | None = None
 _canary_lock = asyncio.Lock()
 
+_KEY_FAILURE_RETRY_STATUSES = {400, 403, 429}
+
+
+class GoogleCseInvalidArgumentError(Exception):
+    pass
+
 
 def _log_startup_status_once():
     global _startup_logged
     if _startup_logged:
         return
     _startup_logged = True
-    key_present = bool(settings.google_search_api_key.strip())
+    keys = settings.google_search_api_keys
     cx_present = bool(settings.google_search_engine_id.strip())
     logger.info(
-        "google search config check key_present=%s engine_id_present=%s configured=%s",
-        key_present, cx_present, settings.google_search_configured,
+        "google search config check key_count=%d engine_id_present=%s configured=%s",
+        len(keys), cx_present, settings.google_search_configured,
     )
+
+
+def _shuffled_key_pool() -> list[str]:
+    keys = list(settings.google_search_api_keys)
+    random.shuffle(keys)
+    return keys
 
 
 async def run_startup_canary_check() -> bool:
@@ -74,15 +87,9 @@ async def _register_quota_usage(quota_guard) -> None:
         await quota_guard.record_usage()
 
 
-async def call_google_custom_search(query: str, num: int = 8, quota_guard=None, _is_canary: bool = False) -> list[dict]:
-    if not google_search_configured_and_available(quota_guard):
-        return []
-    if not _is_canary and not _canary_checked:
-        # Fire-and-forget: don't block real queries on the canary, but make sure it runs.
-        asyncio.ensure_future(run_startup_canary_check())
-
+async def _call_with_key(query: str, num: int, api_key: str) -> tuple[list[dict] | None, int | None]:
     params = {
-        "key": settings.google_search_api_key,
+        "key": api_key,
         "cx": settings.google_search_engine_id,
         "q": query,
         "num": min(max(num, 1), 10),
@@ -93,26 +100,63 @@ async def call_google_custom_search(query: str, num: int = 8, quota_guard=None, 
             response.raise_for_status()
             payload = response.json()
     except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code
+        body_text = exc.response.text[:300]
         logger.warning(
-            "google custom search http error status=%s body=%s query=%r",
-            exc.response.status_code, exc.response.text[:300], query,
+            "google custom search http error status=%s body=%s query=%r key_suffix=%s",
+            status_code, body_text, query, api_key[-6:],
         )
-        return []
+        if status_code == 400:
+            raise GoogleCseInvalidArgumentError(body_text) from exc
+        return None, status_code
     except httpx.HTTPError as exc:
-        logger.warning("google custom search request failed error=%s query=%r", exc, query)
+        logger.warning("google custom search request failed error=%s query=%r key_suffix=%s", exc, query, api_key[-6:])
+        return None, None
+
+    return payload.get("items", []) or [], None
+
+
+async def call_google_custom_search(query: str, num: int = 8, quota_guard=None, _is_canary: bool = False) -> list[dict]:
+    if not google_search_configured_and_available(quota_guard):
+        return []
+    if not _is_canary and not _canary_checked:
+        # Fire-and-forget: don't block real queries on the canary, but make sure it runs.
+        asyncio.ensure_future(run_startup_canary_check())
+
+    key_pool = _shuffled_key_pool()
+    if not key_pool:
+        return []
+
+    payload = None
+    last_status = None
+    for api_key in key_pool:
+        items, status_code = await _call_with_key(query, num, api_key)
+        if items is not None:
+            payload = items
+            break
+        last_status = status_code
+        if status_code in _KEY_FAILURE_RETRY_STATUSES and len(key_pool) > 1:
+            logger.info(
+                "google custom search retrying with different key after status=%s query=%r",
+                status_code, query,
+            )
+            continue
+        break
+
+    if payload is None:
+        if last_status is not None:
+            logger.warning(
+                "google custom search all keys exhausted status=%s query=%r keys_tried=%d",
+                last_status, query, len(key_pool),
+            )
         return []
 
     if not _is_canary:
         await _register_quota_usage(quota_guard)
 
-    items = payload.get("items", []) or []
-    if not items:
-        search_info = payload.get("searchInformation", {})
-        logger.info(
-            "google custom search zero results query=%r total_results=%s status_ok=%s",
-            query, search_info.get("totalResults", "?"), "items" in payload or response.status_code == 200,
-        )
-    return items
+    if not payload:
+        logger.info("google custom search zero results query=%r", query)
+    return payload
 
 
 async def google_search_web(query: str, max_results: int = 5, quota_guard=None) -> list[dict]:

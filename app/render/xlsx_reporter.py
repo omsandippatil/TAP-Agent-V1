@@ -216,6 +216,11 @@ def _confidence_fill(confidence: str):
     return PROBABLE_FILL if (confidence or "").strip().lower() == "probable" else None
 
 
+def _criterion_sort_key(criterion: dict):
+    score = criterion.get("score")
+    return (0, 0.0) if score is None else (1, score)
+
+
 async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> bytes:
     analysis = result.get("analysis") or {}
     breakdown = result.get("score_breakdown", {}) or {}
@@ -251,12 +256,15 @@ async def generate_deep_dive_xlsx(company: str, result: dict, cfg: dict) -> byte
 
     if has_analysis:
         criteria = analysis.get("criteria", []) or []
-        weakest = sorted(criteria, key=lambda x: x["score"])[:2]
+        weakest = sorted(criteria, key=_criterion_sort_key)[:2]
         red_flags = analysis.get("red_flags", []) or []
         catch = (
             "; ".join(f"{f.get('flag', '')} ({f.get('severity', '')})" for f in red_flags[:2])
             if red_flags
-            else "Weakest criteria: " + "; ".join(f"{w['name']} ({w['score']}/5)" for w in weakest)
+            else "Weakest criteria: " + "; ".join(
+                f"{w['name']} ({w['score']}/5)" if w.get("score") is not None else f"{w['name']} (not scored)"
+                for w in weakest
+            )
         )
         call_line = f"{tier.get('label', '')} — fit score {fit_score_display} — semantic alignment {analysis.get('overall_semantic_alignment', 0)}/100"
         csr_head_note = analysis.get("csr_head_note", "")
