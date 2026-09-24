@@ -149,13 +149,6 @@ def resolve_source_ref(source_ref, source_bank_numbers: dict, source_bank_names:
 
 
 def _normalize_file_entry(value) -> dict:
-    # Two shapes flow through here: a fresh in-memory job result gives a plain
-    # (filename, mime, b64) tuple from _encode_file(); a Supabase-backed result
-    # (History, or a redirect through /results/{id} right after a job finishes)
-    # gives a dict {filename, mime/mime_type, download_url}. Unpacking the dict
-    # as if it were a 3-tuple silently assigns its KEY NAMES as the values
-    # instead of raising — that was corrupting every download link. Handle both
-    # shapes explicitly instead of assuming one.
     if isinstance(value, dict):
         return {
             "filename": value.get("filename", ""),
@@ -165,6 +158,35 @@ def _normalize_file_entry(value) -> dict:
         }
     fn, mime, b64 = value
     return {"filename": fn, "mime": mime, "b64": b64, "download_url": ""}
+
+
+def _stringify_history_values(items, keys):
+    cleaned = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        for key in keys:
+            if row.get(key) is not None and not isinstance(row[key], str):
+                row[key] = str(row[key])
+        cleaned.append(row)
+    return cleaned
+
+
+def _normalize_eligibility(eligibility: dict) -> dict:
+    normalized = dict(eligibility or {})
+    normalized["net_profit_history"] = _stringify_history_values(
+        normalized.get("net_profit_history"), ("net_profit_inr_crore", "fiscal_year")
+    )
+    return normalized
+
+
+def _normalize_spend(spend: dict) -> dict:
+    normalized = dict(spend or {})
+    normalized["history"] = _stringify_history_values(
+        normalized.get("history"), ("display", "fiscal_year")
+    )
+    return normalized
 
 
 def build_context(request, company: str, mode: str, result: dict, files: dict) -> dict:
@@ -186,14 +208,14 @@ def build_context(request, company: str, mode: str, result: dict, files: dict) -
         "decision_makers": merge_decision_makers(result),
         "files": file_ctx,
         "important_links": result.get("important_links") or [],
-        "eligibility": analysis.get("eligibility", {}) or {},
+        "eligibility": _normalize_eligibility(analysis.get("eligibility", {}) or {}),
         "sector": analysis.get("sector", {}) or {},
         "group_foundation": analysis.get("group_foundation", {}) or {},
         "rfp_signal": analysis.get("rfp_signal", {}) or {},
         "board_affinity": analysis.get("board_affinity", {}) or {},
         "volunteering": analysis.get("volunteering", {}) or {},
         "contact_pathway": analysis.get("contact_pathway", {}) or {},
-        "spend": analysis.get("spend", {}) or {},
+        "spend": _normalize_spend(analysis.get("spend", {}) or {}),
         "source_urls": source_url_by_name(sources),
         "source_labels": SOURCE_LABELS,
         "source_links": build_source_links(sources),

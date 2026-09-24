@@ -25,7 +25,8 @@
 {% endmacro %}
 
 {% macro mark(text) %}
-  {%- set parts = (text or "").split("**") -%}
+  {%- set safe_text = (text | string) if (text is not none and text is defined) else "" -%}
+  {%- set parts = safe_text.split("**") -%}
   {%- for part in parts -%}
     {%- if loop.index is odd -%}{{ part }}{%- else -%}<span class="hl">{{ part }}</span>{%- endif -%}
   {%- endfor -%}
@@ -394,6 +395,9 @@
           {% endif %}
         </div>
       </section>
+
+      {% set tried_source_links = source_links | rejectattr('status', 'equalto', 'NOT_TRIED') | list %}
+      {% set found_source_links = tried_source_links | selectattr('status', 'equalto', 'FOUND') | list %}
 
       <section class="section">
         <h2>Source quality &amp; CSR leadership note</h2>
