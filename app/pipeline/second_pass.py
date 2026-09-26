@@ -12,6 +12,7 @@ from app.pipeline.scraper import (
     mentions_company,
     is_csr_relevant,
     find_india_location_mentions,
+    is_plausible_entity_name,
     NAMED_INITIATIVE_PATTERN,
     NAMED_NGO_PATTERN,
     RELATED_ENTITY_NAME_PATTERN,
@@ -35,7 +36,9 @@ def _discover_named_entities(sources):
             continue
         for pattern in (NAMED_INITIATIVE_PATTERN, NAMED_NGO_PATTERN, RELATED_ENTITY_NAME_PATTERN):
             for match in pattern.finditer(text):
-                names.add(re.sub(r"\s+", " ", match.group(1)).strip())
+                name = re.sub(r"\s+", " ", match.group(1)).strip()
+                if is_plausible_entity_name(name):
+                    names.add(name)
     return names
 
 

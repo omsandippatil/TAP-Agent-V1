@@ -189,6 +189,33 @@ NAMED_NGO_PATTERN = re.compile(
     r"(?:Foundation|Trust|Education Foundation|Infotech Foundation))\b"
 )
 
+GENERIC_PHRASE_STOPWORDS = {
+    "explore", "organizations", "organisation", "organisations", "team", "our",
+    "the", "about", "home", "menu", "navigation", "search", "contact", "click",
+    "read", "more", "learn", "view", "see", "all", "browse", "filter", "sort",
+    "share", "follow", "subscribe", "sign", "login", "register", "back", "next",
+    "previous", "related", "recommended", "featured", "trending", "latest",
+    "weekly", "newsletter", "post", "posts", "article", "articles", "page",
+    "pages", "section", "category", "categories", "tag", "tags", "download",
+    "copyright", "privacy", "terms", "cookie", "policy", "sitemap", "explore",
+    "agency", "donor", "implementing",
+}
+
+
+def _is_plausible_entity_name(name: str, min_words: int = 2, max_words: int = 7) -> bool:
+    if not name or len(name) > 100:
+        return False
+    words = name.split()
+    if not (min_words <= len(words) <= max_words):
+        return False
+    lowered_words = [w.lower().strip(".,&-") for w in words]
+    stopword_hits = sum(1 for w in lowered_words if w in GENERIC_PHRASE_STOPWORDS)
+    if stopword_hits >= 2 or stopword_hits / len(words) > 0.4:
+        return False
+    if len(set(lowered_words)) < len(lowered_words) * 0.6:
+        return False
+    return True
+
 CURRENCY_NEAR_INDIA_WINDOW_CHARS = 200
 
 CURRENT_FY_LABEL = "FY2025-26"
@@ -499,7 +526,11 @@ def _looks_like_same_entity(company: str, candidate: str) -> bool:
     return company_norm == candidate_norm
 
 
-def _extract_related_entity_candidates(company: str, text: str) -> list[dict]:
+def is_plausible_entity_name(name: str, min_words: int = 2, max_words: int = 7) -> bool:
+    return _is_plausible_entity_name(name, min_words=min_words, max_words=max_words)
+
+
+
     if not text:
         return []
     tokens = company_name_tokens(company)
@@ -512,6 +543,8 @@ def _extract_related_entity_candidates(company: str, text: str) -> list[dict]:
     ):
         for match in pattern.finditer(text):
             name = re.sub(r"\s+", " ", match.group(1)).strip()
+            if not _is_plausible_entity_name(name):
+                continue
             if _looks_like_same_entity(company, name):
                 continue
             name_lower = name.lower()
@@ -532,6 +565,8 @@ def _extract_named_partner_candidates(company: str, text: str) -> list[str]:
     ordered = []
     for match in NAMED_NGO_PATTERN.finditer(text):
         name = re.sub(r"\s+", " ", match.group(1)).strip()
+        if not _is_plausible_entity_name(name):
+            continue
         if _looks_like_same_entity(company, name):
             continue
         key = name.lower()
@@ -1097,16 +1132,29 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                 source["domain"] = urlparse(url).netloc.lower()
                 weak_snippet_fallback[0] = (score, source)
 
+    domain_miss_streak: dict[str, int] = {}
+    DOMAIN_MISS_ESCALATION_THRESHOLD = 4
+
     async def try_fetch(url: str, method: str, is_pdf: bool = False):
         if not url or url in tried_urls or remaining_budget[0] <= 0 or not await _within_deadline(deadline):
+            return
+        host = urlparse(url).netloc.lower()
+        if budget.is_domain_dead(host) or budget.is_path_dead(url):
             return
         tried_urls.add(url)
         remaining_budget[0] -= 1
         text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url))
+        if not text:
+            budget.mark_path_dead(url)
+            domain_miss_streak[host] = domain_miss_streak.get(host, 0) + 1
+            if domain_miss_streak[host] >= DOMAIN_MISS_ESCALATION_THRESHOLD:
+                budget.mark_domain_dead(host, "repeated_path_misses")
+        else:
+            domain_miss_streak[host] = 0
         consider(url, method, text)
 
     discovered_domains = await discover_company_domains(company, search_cfg, budget, quota_guard)
-    domains = list(dict.fromkeys(discovered_domains + candidate_domains(company)))
+    domains = [d for d in dict.fromkeys(discovered_domains + candidate_domains(company)) if not budget.is_domain_dead(d)]
 
     async def check_homepage(domain: str):
         try:
@@ -1116,13 +1164,20 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
             )
             if response.ok:
                 return domain, response.text
+            if response.status_code == 404:
+                budget.mark_domain_dead(domain, "homepage_404")
         except Exception as exc:
-            logger.info("homepage fetch failed domain=%s error_type=%s", domain, classify_fetch_error(exc))
+            error_type = classify_fetch_error(exc)
+            logger.info("homepage fetch failed domain=%s error_type=%s", domain, error_type)
+            if error_type in ("ssl", "dns"):
+                budget.mark_domain_dead(domain, error_type)
         return None
 
     live_homepages = []
     for domain in domains[:6]:
         await _check_job_deadline(job_deadline)
+        if budget.is_domain_dead(domain):
+            continue
         result = await check_homepage(domain)
         if result:
             live_homepages.append(result)
@@ -1149,10 +1204,14 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                 break
             if candidates_checked >= CANDIDATE_EVAL_LIMIT and best_candidate[0]:
                 break
+            if budget.is_domain_dead(domain):
+                break
             await try_fetch(f"https://{domain}{path}", "direct")
             candidates_checked += 1
         if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
             break
+        if budget.is_domain_dead(domain):
+            continue
         for sitemap_url in await sitemap_csr_urls(domain):
             if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
                 break
@@ -1711,6 +1770,8 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
         for _, _, text in candidates:
             for match in NAMED_INITIATIVE_PATTERN.finditer(text):
                 name = re.sub(r"\s+", " ", match.group(1)).strip()
+                if not _is_plausible_entity_name(name):
+                    continue
                 if name not in programme_names:
                     programme_names.append(name)
         for programme_name in programme_names[:MAX_PROGRAMME_DEEP_DIVE_NAMES]:
