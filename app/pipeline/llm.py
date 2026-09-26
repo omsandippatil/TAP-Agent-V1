@@ -472,6 +472,13 @@ DECISION_MAKER_RULE = (
     "outreach attempt and damages credibility. The CEO/MD/Chairperson may be included only if "
     "the evidence shows them personally quoted or credited on CSR/foundation matters, not by "
     "default just for holding the top role.\n\n"
+    "IMPORTANT — do not re-litigate people_search hits: any person appearing in a source with "
+    "source_name 'people_search' has already passed a currency check and a CSR-relevance check "
+    "before reaching you. Your job for those hits is to transcribe them into decision_makers[] "
+    "faithfully (name, title, source_excerpt) and set is_india_specific from what the excerpt "
+    "says, not to re-decide whether they qualify. Only exclude a people_search hit if its "
+    "excerpt itself contains explicit former-role language (Previously, Formerly, Former, ex-, "
+    "Past, or a stated end year) that the upstream check may have missed.\n\n"
     "SOURCE OF TRUTH, in this order — only fall to the next when the one above yields nothing: "
     "(1) the company's own leadership or CSR team page; (2) a signed foreword or signatory in "
     "the annual or CSR report; (3) a press release naming the person in role; (4) a LinkedIn "
@@ -628,7 +635,7 @@ Extract, matching the JSON shape's key order exactly:
 15. open_questions[] — up to 5 short, concrete, searchable items to verify.
 16. programmes[] — apply the PROGRAMME rule and the TAP_PRIORITY_RULE together: priority-area programmes (school education, STEM, AI, coding, digital skills, government schools) listed first and in full, then everything else briefly. Apply the delivery-channel/beneficiary specificity requirement and the chain-completeness fields to every entry.
 17. partners[] — apply the PARTNER rule, including similar_to_tap_profile, multi-year history, and named-format initiatives (DIBs, outcomes funds).
-18. decision_makers[] — apply the DECISION-MAKER source-of-truth order, currency test, three-check verification, and consistency sub-rule strictly; title, public_facing_score 0-100, tenure_status, is_india_specific, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence.
+18. decision_makers[] — apply the DECISION-MAKER source-of-truth order, currency test, three-check verification, and consistency sub-rule strictly; title, public_facing_score 0-100, tenure_status, is_india_specific, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence. Every people_search hit in the evidence that passes the currency test must appear here — see the people_search transcription note inside the DECISION-MAKER rule.
 19. geographies[] — apply the GEOGRAPHY rule; prefer state/city over country/vague-region entries.
 20. red_flags[] — genuine contradictions or marketing-not-substance signals, severity low/medium/high. Missing/undocumented details are NOT red flags.
 21. contact_pathway — the single most concrete real channel; "Not identified" if nothing exists.
@@ -1580,6 +1587,69 @@ def research_confidence_label(criteria: list[dict], authenticity_score: int,
     return "Low"
 
 
+def _people_search_hits_from_sources(cleaned_sources: list[dict]) -> list[dict]:
+    for source in cleaned_sources or []:
+        if source.get("source_name") == "people_search" and source.get("status") == "FOUND":
+            return source.get("people_hits") or []
+    return []
+
+
+def _decision_maker_name_key(name: str) -> str:
+    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+def _merge_verified_people_hits_into_extraction(extraction: dict, cleaned_sources: list[dict],
+                                                 caller: str = "unknown") -> dict:
+    hits = _people_search_hits_from_sources(cleaned_sources)
+    if not hits:
+        return extraction
+
+    existing = extraction.get("decision_makers") or []
+    existing_keys = {_decision_maker_name_key(person.get("name", "")) for person in existing}
+
+    added_names = []
+    for hit in hits:
+        if hit.get("confidence") not in ("HIGH", "MEDIUM"):
+            continue
+        name = hit.get("name", "")
+        key = _decision_maker_name_key(name)
+        if not key or key in existing_keys:
+            continue
+        if _looks_like_former_role(hit.get("title", ""), hit.get("snippet", "")):
+            continue
+        existing.append({
+            "name": name,
+            "title": hit.get("title", ""),
+            "public_facing_score": 60 if hit.get("confidence") == "HIGH" else 40,
+            "tenure_status": "UNKNOWN",
+            "tenure_evidence": "Verified via LinkedIn search snippet, not independently dated.",
+            "is_india_specific": bool(hit.get("india_location_signal")),
+            "source_excerpt": f"{hit.get('title', '')} — {hit.get('snippet', '')}"[:260],
+            "source": "",
+            "linkedin_url": hit.get("url", "") if is_literal_linkedin_profile_url_safe(hit.get("url", "")) else "",
+        })
+        existing_keys.add(key)
+        added_names.append(name)
+
+    if added_names:
+        extraction["decision_makers"] = existing
+        note = extraction.get("csr_head_note", "") or ""
+        if not note.strip() or "no csr head" in note.lower() or "not identified" in note.lower():
+            extraction["csr_head_note"] = (
+                f"{added_names[0]} appears in a verified LinkedIn search result tied to CSR/"
+                f"sustainability at the company; role currency beyond the snippet is unconfirmed."
+            )
+        logger.info(
+            "_merge_verified_people_hits_into_extraction recovered dropped decision-makers "
+            "caller=%s names=%s", caller, added_names,
+        )
+    return extraction
+
+
+def is_literal_linkedin_profile_url_safe(url: str) -> bool:
+    return bool(_LINKEDIN_PROFILE_URL.match((url or "").strip()))
+
+
 def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
     parsed = dict(parsed) if isinstance(parsed, dict) else {}
 
@@ -1938,6 +2008,7 @@ async def extract_company_facts(
 
     extraction = _repair_extraction(parsed, caller=f"extract_facts:{company}")
     extraction = reconcile_extraction(extraction, working_sources)
+    extraction = _merge_verified_people_hits_into_extraction(extraction, working_sources, caller=f"extract_facts:{company}")
 
     valid_sources = _valid_source_lookup(sources_manifest)
     extraction["delivery_model_source"] = _sanitize_source(extraction.get("delivery_model_source", ""), valid_sources)
