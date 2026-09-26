@@ -9,7 +9,6 @@ from app.config import settings
 logger = logging.getLogger("tap.google_search")
 
 GOOGLE_SEARCH_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
-GOOGLE_SEARCH_DAILY_CAP_DEFAULT = 90
 CANARY_QUERY = "site:wikipedia.org test"
 
 _startup_logged = False
@@ -44,11 +43,6 @@ def _shuffled_key_pool() -> list[str]:
 
 
 async def run_startup_canary_check() -> bool:
-    """Fire one known-good query at boot. A zero-result response for this query is a
-    strong signal the CSE is misconfigured (e.g. 'search entire web' is off, or the
-    engine is scoped to an empty/wrong site list) rather than normal search variance.
-    Safe to call repeatedly; only runs once.
-    """
     global _canary_checked, _canary_ok
     async with _canary_lock:
         if _canary_checked:
@@ -61,15 +55,13 @@ async def run_startup_canary_check() -> bool:
         _canary_ok = bool(items)
         if not _canary_ok:
             logger.error(
-                "GOOGLE CSE STARTUP CANARY FAILED — query=%r returned zero results. This almost "
-                "always means the Programmable Search Engine is misconfigured: check that "
-                "'Search the entire web' is enabled and the site restriction list is empty, at "
-                "https://programmablesearchengine.google.com/. All searches will silently "
-                "degrade until this is fixed.",
+                "GOOGLE CSE STARTUP CANARY FAILED — query=%r returned zero results. Check that "
+                "'Search the entire web' is enabled and the site restriction list is empty at "
+                "https://programmablesearchengine.google.com/.",
                 CANARY_QUERY,
             )
         else:
-            logger.info("google cse startup canary OK query=%r", CANARY_QUERY)
+            logger.info("google cse startup canary OK")
         return _canary_ok
 
 
@@ -103,14 +95,14 @@ async def _call_with_key(query: str, num: int, api_key: str) -> tuple[list[dict]
         status_code = exc.response.status_code
         body_text = exc.response.text[:300]
         logger.warning(
-            "google custom search http error status=%s body=%s query=%r key_suffix=%s",
-            status_code, body_text, query, api_key[-6:],
+            "google custom search http error status=%s query=%r key_suffix=%s",
+            status_code, query, api_key[-6:],
         )
         if status_code == 400:
             raise GoogleCseInvalidArgumentError(body_text) from exc
         return None, status_code
     except httpx.HTTPError as exc:
-        logger.warning("google custom search request failed error=%s query=%r key_suffix=%s", exc, query, api_key[-6:])
+        logger.warning("google custom search request failed error=%s query=%r", exc, query)
         return None, None
 
     return payload.get("items", []) or [], None
@@ -120,7 +112,6 @@ async def call_google_custom_search(query: str, num: int = 8, quota_guard=None, 
     if not google_search_configured_and_available(quota_guard):
         return []
     if not _is_canary and not _canary_checked:
-        # Fire-and-forget: don't block real queries on the canary, but make sure it runs.
         asyncio.ensure_future(run_startup_canary_check())
 
     key_pool = _shuffled_key_pool()
@@ -136,10 +127,6 @@ async def call_google_custom_search(query: str, num: int = 8, quota_guard=None, 
             break
         last_status = status_code
         if status_code in _KEY_FAILURE_RETRY_STATUSES and len(key_pool) > 1:
-            logger.info(
-                "google custom search retrying with different key after status=%s query=%r",
-                status_code, query,
-            )
             continue
         break
 
@@ -154,8 +141,6 @@ async def call_google_custom_search(query: str, num: int = 8, quota_guard=None, 
     if not _is_canary:
         await _register_quota_usage(quota_guard)
 
-    if not payload:
-        logger.info("google custom search zero results query=%r", query)
     return payload
 
 

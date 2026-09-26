@@ -2,8 +2,6 @@ import re
 import threading
 from urllib.parse import urlparse
 
-_REGISTRY_LOCK = threading.Lock()
-
 CORE_SOURCE_LABELS = {
     "india_csr_page": "Company CSR page",
     "mca_portal": "MCA portal",
@@ -91,26 +89,16 @@ class SourceRegistry:
             return list(self._entries)
 
     def as_manifest_lines(self) -> list[str]:
-        lines = []
-        for entry in self.entries():
-            lines.append(
-                f"[{entry['number']}] {entry['label']} — {entry['domain'] or entry['url']}"
-            )
-        return lines
+        return [f"[{e['number']}] {e['label']} — {e['domain'] or e['url']}" for e in self.entries()]
 
     def as_source_bank(self) -> list[dict]:
         return [
             {
-                "number": entry["number"],
-                "label": entry["label"],
-                "source_name": entry["source_name"],
-                "kind": entry["kind"],
-                "url": entry["url"],
-                "domain": entry["domain"],
-                "excerpt": entry["excerpt"],
-                "parent_number": entry["parent_number"],
+                "number": e["number"], "label": e["label"], "source_name": e["source_name"],
+                "kind": e["kind"], "url": e["url"], "domain": e["domain"],
+                "excerpt": e["excerpt"], "parent_number": e["parent_number"],
             }
-            for entry in self.entries()
+            for e in self.entries()
         ]
 
 
