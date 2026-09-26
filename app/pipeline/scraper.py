@@ -31,6 +31,29 @@ GENERIC_COMPANY_TOKENS = {
     "industries", "systems", "global",
 }
 
+ENGLISH_COMMON_WORD_TOKENS = {
+    "nice", "best", "good", "great", "prime", "apex", "peak", "smart",
+    "bright", "ace", "spark", "sharp", "clear", "true", "real", "fresh",
+    "fast", "swift", "solid", "sure", "safe", "trust", "value", "key",
+    "core", "base", "edge", "link", "unity", "one", "first", "next",
+    "target", "focus", "vision", "insight", "impact", "spring", "summit",
+    "crown", "royal", "grand", "elite", "select", "choice", "premier",
+    "pure", "vital", "active", "bold", "swift", "rise", "grow", "thrive",
+    "ask", "wish", "hope", "dream", "amaze", "delight", "please",
+}
+
+MIN_RELIABLE_TOKEN_LENGTH = 5
+
+
+def is_generic_company_name(company: str) -> bool:
+    tokens = company_name_tokens(company)
+    if not tokens:
+        return True
+    return all(
+        token in ENGLISH_COMMON_WORD_TOKENS or len(token) < MIN_RELIABLE_TOKEN_LENGTH
+        for token in tokens
+    )
+
 AGGREGATOR_DOMAINS = (
     "youtube.", "twitter.", "x.com", "facebook.", "instagram.", "linkedin.",
     "wikipedia.", "glassdoor.", "indeed.", "crunchbase.", "bloomberg.",
@@ -272,11 +295,11 @@ PRIOR_FY_LABELS = ["FY2024-25", "FY2023-24", "2024-25", "2023-24", "FY2022-23"]
 FY_YEAR_TOKEN_PATTERN = re.compile(r"FY\s?20?\d{2}[-–]\d{2,4}|20\d{2}[-–]\d{2,4}", re.IGNORECASE)
 
 EDUCATION_PROGRAMME_QUERIES = [
-    '"{c}" CSR India (STEM OR AI OR coding OR "digital skills") students beneficiaries named programme {site}',
-    '"{c}" CSR India (government school OR public school) teachers students named programme',
-    '"{c}" India CSR (education OR skilling) programme NGO partner beneficiaries annual report filetype:pdf',
-    '"{c}" CSR India (STEM OR AI OR robotics OR "digital literacy") named programme schools students',
-    '"{c}" CSR India students schools press release announcement named programme',
+    '"{c}" ("school education" OR "government school" OR "public school") CSR India named programme students {site}',
+    '"{c}" (STEM OR AI OR "artificial intelligence" OR coding OR "digital skills" OR "digital literacy") CSR India students named programme',
+    '"{c}" ("government school" OR "public school" OR teachers OR students) CSR India skilling named programme beneficiaries',
+    '"{c}" (STEM OR robotics OR "digital literacy" OR coding) CSR India schools named programme annual report filetype:pdf',
+    '"{c}" ("government school" OR STEM OR "digital skills") CSR India NGO partner beneficiaries press release',
 ]
 
 CSR_PAGE_QUERIES = [
@@ -532,9 +555,35 @@ def company_name_tokens(company: str) -> list[str]:
     ]
 
 
+_BUSINESS_CONTEXT_WORD_PATTERN = re.compile(
+    r"\b(csr|corporate|company|ltd|limited|inc|pvt|private|india|subsidiary|"
+    r"headquarter|founded|revenue|employee|annual report|sustainability|"
+    r"foundation|ceo|software|technology|platform|solutions|customer)\b",
+    re.IGNORECASE,
+)
+
+_GENERIC_NAME_CONTEXT_WINDOW_CHARS = 250
+
+
+def _mentions_generic_company_name(company: str, text: str) -> bool:
+    exact_case_positions = [m.start() for m in re.finditer(re.escape(company), text)]
+    if not exact_case_positions:
+        return False
+    context_positions = [m.start() for m in _BUSINESS_CONTEXT_WORD_PATTERN.finditer(text)]
+    if not context_positions:
+        return False
+    return any(
+        abs(name_pos - ctx_pos) <= _GENERIC_NAME_CONTEXT_WINDOW_CHARS
+        for name_pos in exact_case_positions
+        for ctx_pos in context_positions
+    )
+
+
 def mentions_company(company: str, text: str) -> bool:
     if not text:
         return False
+    if is_generic_company_name(company):
+        return _mentions_generic_company_name(company, text)
     lowered = text.lower()
     tokens = company_name_tokens(company)
     if not tokens:
@@ -545,6 +594,8 @@ def mentions_company(company: str, text: str) -> bool:
 def mentions_company_specifically(company: str, text: str) -> bool:
     if not text:
         return False
+    if is_generic_company_name(company):
+        return _mentions_generic_company_name(company, text)
     tokens = company_name_tokens(company)
     if len(tokens) < 2:
         return mentions_company(company, text)
@@ -673,6 +724,8 @@ def url_belongs_to_company(company: str, url: str, known_domains: list[str] | No
         return True
     if known_domains and any(host == d or host.endswith("." + d) for d in known_domains):
         return True
+    if is_generic_company_name(company):
+        return False
     tokens = company_name_tokens(company)
     if not tokens:
         return False
