@@ -24,6 +24,7 @@ from app.pipeline.utils import make_source, normalize_block_text
 logger = logging.getLogger("tap.second_pass")
 
 SECOND_PASS_TEXT_LENGTH_FLOOR = 500
+SECOND_PASS_THIN_EVIDENCE_FLOOR = 900
 SECOND_PASS_MAX_GOOGLE_QUERIES = 10
 SECOND_PASS_DEADLINE_SECONDS = 55.0
 SECOND_PASS_MAX_NAMED_FOLLOWUPS = 4
@@ -41,6 +42,10 @@ UNREADABLE_DOC_FOLLOWUP_QUERIES = [
     '"{company}" CSR programme name education beneficiaries press release',
     '"{company}" CSR partner NGO announcement India',
 ]
+
+GENERIC_BROAD_FALLBACK_QUERY = '"{company}" CSR school STEM partnership'
+
+_DOMAIN_LABEL_PATTERN = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$", re.IGNORECASE)
 
 
 def _discover_named_entities(sources):
@@ -70,11 +75,40 @@ def _has_unreadable_document(sources):
     )
 
 
+def _is_usable_search_label(label):
+    if not label or len(label) > 80:
+        return False
+    if label.startswith(("http://", "https://")):
+        return False
+    if bool(_DOMAIN_LABEL_PATTERN.match(label.strip())):
+        return True
+    return not re.search(r"[/?#]", label)
+
+
+def _label_for_short_extract_query(source):
+    domain = source.get("domain", "")
+    if _is_usable_search_label(domain):
+        return domain
+    title = source.get("title", "")
+    if _is_usable_search_label(title):
+        return title
+    return ""
+
+
+def _has_substantive_education_source(sources):
+    for source in sources or []:
+        if source.get("status") != "FOUND":
+            continue
+        text = source.get("text", "")
+        if not text or not has_india_or_education_signal(text):
+            continue
+        if len(text) >= SECOND_PASS_THIN_EVIDENCE_FLOOR:
+            return True
+    return False
+
+
 def _has_education_evidence(sources):
-    return any(
-        s.get("status") == "FOUND" and has_india_or_education_signal(s.get("text", ""))
-        for s in (sources or [])
-    )
+    return _has_substantive_education_source(sources)
 
 
 def should_run_second_pass(sources, coverage_pct=None, coverage_floor=45):
@@ -89,6 +123,18 @@ def should_run_second_pass(sources, coverage_pct=None, coverage_floor=45):
     return short_extract or coverage_low or missing_education or unreadable_doc
 
 
+async def _fetch_and_accept(candidate_url, relevance_check):
+    text = await (
+        fetch_pdf_text(candidate_url) if candidate_url.lower().endswith(".pdf")
+        else fetch_page_text(candidate_url)
+    )
+    if not text or len(text) <= SECOND_PASS_TEXT_LENGTH_FLOOR:
+        return None, text
+    if not relevance_check(text):
+        return None, text
+    return text, text
+
+
 async def run_second_pass_recovery(company, search_cfg, sources, registry=None, quota_guard=None,
                                     max_google_queries=SECOND_PASS_MAX_GOOGLE_QUERIES,
                                     deadline_seconds=SECOND_PASS_DEADLINE_SECONDS,
@@ -97,6 +143,7 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
     deadline = time.monotonic() + deadline_seconds
     recovered = []
     queries_run = []
+    queries_skipped_no_label = 0
 
     def is_dead(url: str) -> bool:
         host = urlparse(url).netloc.lower()
@@ -110,8 +157,11 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
     for source in short_extract_sources:
         if time.monotonic() >= deadline:
             break
-        title_guess = source.get("domain", "") or source.get("url", "")
-        query = f'"{company}" "{title_guess}"' if title_guess else f'"{company}" CSR report'
+        label = _label_for_short_extract_query(source)
+        if not label:
+            queries_skipped_no_label += 1
+            continue
+        query = f'"{company}" "{label}" CSR'
         queries_run.append(query)
         results = await search_web(query, budget, max_results=5, quota_guard=quota_guard, category="second_pass")
         for result in results:
@@ -122,22 +172,21 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
                 continue
             if is_dead(candidate_url):
                 continue
-            text = await (
-                fetch_pdf_text(candidate_url) if candidate_url.lower().endswith(".pdf")
-                else fetch_page_text(candidate_url)
+            text, raw_text = await _fetch_and_accept(
+                candidate_url, lambda t: mentions_company(company, t),
             )
-            if not text:
-                budget.mark_path_dead(candidate_url)
+            if text is None:
+                if not raw_text:
+                    budget.mark_path_dead(candidate_url)
                 continue
-            if len(text) > SECOND_PASS_TEXT_LENGTH_FLOOR and mentions_company(company, text):
-                new_source = make_source(
-                    "second_pass_recovery", 11, candidate_url, text, "FOUND", "second_pass_short_extract"
-                )
-                if registry is not None:
-                    registry.register_core_source(new_source)
-                recovered.append(new_source)
-                budget.mark_category_hit("second_pass")
-                break
+            new_source = make_source(
+                "second_pass_recovery", 11, candidate_url, text, "FOUND", "second_pass_short_extract"
+            )
+            if registry is not None:
+                registry.register_core_source(new_source)
+            recovered.append(new_source)
+            budget.mark_category_hit("second_pass")
+            break
 
     unreadable_present = _has_unreadable_document(sources)
     if unreadable_present and _budget_has_room(budget, deadline):
@@ -195,6 +244,8 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
                         registry.register_core_source(new_source)
                     recovered.append(new_source)
                     budget.mark_category_hit("second_pass")
+            if _has_education_evidence(sources + recovered):
+                break
 
     named_entities = list(_discover_named_entities(sources))[:SECOND_PASS_MAX_NAMED_FOLLOWUPS]
     states = list(_discover_states(sources))[:SECOND_PASS_MAX_STATE_FOLLOWUPS]
@@ -234,7 +285,7 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
                 budget.mark_category_hit("second_pass")
 
     if not recovered and _budget_has_room(budget, deadline):
-        query = f'"{company}" CSR school STEM partnership'
+        query = GENERIC_BROAD_FALLBACK_QUERY.format(company=company)
         queries_run.append(query)
         results = await search_web(query, budget, max_results=5, quota_guard=quota_guard, category="second_pass")
         for result in results:
@@ -256,9 +307,10 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
                 budget.mark_category_hit("second_pass")
 
     logger.info(
-        "second_pass_recovery DONE company=%r short_extract_candidates=%d unreadable_present=%s "
-        "queries_run=%d recovered=%d",
-        company, len(short_extract_sources), unreadable_present, len(queries_run), len(recovered),
+        "second_pass_recovery DONE company=%r short_extract_candidates=%d short_extract_skipped_no_label=%d "
+        "unreadable_present=%s queries_run=%d recovered=%d",
+        company, len(short_extract_sources), queries_skipped_no_label, unreadable_present,
+        len(queries_run), len(recovered),
     )
     return recovered, queries_run
 
