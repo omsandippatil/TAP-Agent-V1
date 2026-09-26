@@ -119,6 +119,7 @@ PRIORITY_EDUCATION_KEYWORDS = [
     "digital literacy", "robotics", "government school", "government schools",
     "public school", "teacher training", "teacher capacity", "girls in ai",
     "girls in data", "atal tinkering", "21st century skills", "21st-century skills",
+    "e-learning", "elearning", "science fair", "science fairs",
 ]
 
 CURRENCY_FIGURE_PATTERN = re.compile(
@@ -262,6 +263,7 @@ def _extract_entities_from_lines(text: str, patterns, filter_fn) -> list[str]:
                 found.append(name)
     return found
 
+
 CURRENCY_NEAR_INDIA_WINDOW_CHARS = 200
 
 CURRENT_FY_LABEL = "FY2025-26"
@@ -270,10 +272,11 @@ PRIOR_FY_LABELS = ["FY2024-25", "FY2023-24", "2024-25", "2023-24", "FY2022-23"]
 FY_YEAR_TOKEN_PATTERN = re.compile(r"FY\s?20?\d{2}[-–]\d{2,4}|20\d{2}[-–]\d{2,4}", re.IGNORECASE)
 
 EDUCATION_PROGRAMME_QUERIES = [
-    '"{c}" CSR India (STEM OR AI OR coding OR "digital skills") students {site}',
-    '"{c}" CSR India (government school OR public school) teachers students {site}',
-    '"{c}" India CSR (education OR skilling) programme NGO partner annual report filetype:pdf',
-    '"{c}" CSR India (STEM OR AI OR robotics OR "digital literacy") named programme beneficiaries',
+    '"{c}" CSR India (STEM OR AI OR coding OR "digital skills") students beneficiaries named programme {site}',
+    '"{c}" CSR India (government school OR public school) teachers students named programme',
+    '"{c}" India CSR (education OR skilling) programme NGO partner beneficiaries annual report filetype:pdf',
+    '"{c}" CSR India (STEM OR AI OR robotics OR "digital literacy") named programme schools students',
+    '"{c}" CSR India students schools press release announcement named programme',
 ]
 
 CSR_PAGE_QUERIES = [
@@ -291,7 +294,8 @@ MULTI_YEAR_FINANCIAL_QUERIES = [
 ]
 
 CSR_SPEND_QUERIES = [
-    '"{c}" ("CSR expenditure" OR "CSR spend") crore India {fy}',
+    '"{c}" ("CSR expenditure" OR "CSR spend" OR "amount spent" OR "total CSR") crore India {fy}',
+    '"{c}" CSR expenditure India annual report crore',
 ]
 
 MCA_CIN_QUERIES = [
@@ -317,6 +321,7 @@ RELATED_ENTITY_DISCOVERY_QUERIES = [
 PARTNER_QUERIES = [
     '"{c}" CSR (NGO partner OR "implementation partner" OR "implementing partner") India education',
     'site:linkedin.com/company "{c}" (partnered with OR MoU) NGO CSR India',
+    '"{c}" CSR partner NGO announcement press release India',
 ]
 
 PARTNER_FOLLOWUP_QUERIES = [
@@ -330,6 +335,7 @@ PLAN_QUERIES = [
 LINKEDIN_PEOPLE_QUERIES = [
     'site:linkedin.com/in "{c}" (head of CSR OR CSR head OR sustainability director OR ESG) India',
     'site:linkedin.com/in "{c}" corporate social responsibility',
+    'site:linkedin.com/in "{c}" (foundation OR trustee OR "social impact") India',
 ]
 
 LINKEDIN_PEOPLE_NAME_ONLY_FALLBACK_QUERIES = [
@@ -348,6 +354,7 @@ UNREADABLE_DOC_RECOVERY_QUERIES = [
     '"{c}" CSR (programme name OR expenditure OR "amount spent") India crore news press release',
     '"{c}" CSR (education OR STEM OR skilling) programme name students press release',
     '"{c}" CSR partner NGO announcement India',
+    '"{c}" CSR India (students OR schools OR beneficiaries) named programme site:linkedin.com/company',
 ]
 
 FOLLOWUP_QUERY_TEMPLATES = {
@@ -391,6 +398,7 @@ MAX_PDF_DOWNLOAD_BYTES = 15 * 1024 * 1024
 PDF_STREAM_CHUNK_BYTES = 262144
 MAX_PDF_PAGES_HARD_CAP = 40
 SECOND_PASS_TEXT_LENGTH_FLOOR = 500
+UNREADABLE_TEXT_LENGTH_FLOOR = 200
 
 MAX_PARTNER_SOURCES_DEEP = 10
 MAX_PARTNER_SOURCES_SCREEN = 5
@@ -596,6 +604,10 @@ def _extract_named_partner_candidates(company: str, text: str) -> list[str]:
         return []
     names = _extract_entities_from_lines(text, [NAMED_NGO_PATTERN], _is_plausible_entity_name)
     return [name for name in names if not _looks_like_same_entity(company, name)]
+
+
+def _extract_named_programme_candidates(text: str) -> list[str]:
+    return _extract_entities_from_lines(text, [NAMED_INITIATIVE_PATTERN], _is_plausible_entity_name)
 
 
 async def discover_related_entities(company: str, search_cfg: dict, budget: SearchBudget,
@@ -1138,6 +1150,40 @@ async def _recover_via_secondary_search(company: str, budget: SearchBudget, quot
     return None
 
 
+async def _recover_from_unreadable_document(company: str, budget: SearchBudget, quota_guard, deadline: float,
+                                             category: str, seed_names: list[str] | None = None,
+                                             min_len: int = UNREADABLE_TEXT_LENGTH_FLOOR) -> tuple[str, str] | None:
+    """A document belonging to the company was found (a real URL, confirmed by
+    title/snippet) but its text could not be extracted or extraction returned
+    too little to use. Instead of giving up, chase the topic the document was
+    about: named entities pulled from whatever snippet text is available,
+    then a broadening set of generic recovery queries. Returns the first
+    (url, text) pair that clears the relevance bar, or None.
+    """
+    for name in (seed_names or [])[:MAX_PARTNER_FOLLOWUP_NAMES]:
+        if not await _within_deadline(deadline):
+            return None
+        query = f'"{name}" "{company}" (partnership OR funded OR implementing OR programme)'
+        results = await search_web(query, budget, max_results=5, quota_guard=quota_guard, category=category)
+        for result in results:
+            url = result.get("href", "")
+            title = result.get("title", "")
+            body = result.get("body", "")
+            if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
+                continue
+            if not mentions_company(company, f"{title} {body}"):
+                continue
+            is_pdf = url.lower().endswith(".pdf")
+            text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
+            if text and len(text) >= min_len and mentions_company(company, text) and is_csr_relevant(text):
+                budget.mark_category_hit(category)
+                return url, text
+
+    return await _recover_via_secondary_search(
+        company, budget, quota_guard, deadline, category, UNREADABLE_DOC_RECOVERY_QUERIES, min_len=min_len,
+    )
+
+
 async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
                                 max_fetches: int = 20, registry: SourceRegistry | None = None,
                                 job_deadline: float | None = None) -> dict:
@@ -1150,6 +1196,7 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
     resolved_domain = [""]
     best_candidate = [None]
     weak_snippet_fallback = [None]
+    document_found_unreadable = [False]
 
     def consider(url: str, method: str, text: str):
         if accept_fetched_text(company, text, 250):
@@ -1179,7 +1226,9 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
         tried_urls.add(url)
         remaining_budget[0] -= 1
         text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url))
-        if not text:
+        if not text or len(text) < UNREADABLE_TEXT_LENGTH_FLOOR:
+            if url.lower().endswith(".pdf") or is_pdf:
+                document_found_unreadable[0] = True
             budget.mark_path_dead(url)
             domain_miss_streak[host] = domain_miss_streak.get(host, 0) + 1
             if domain_miss_streak[host] >= DOMAIN_MISS_ESCALATION_THRESHOLD:
@@ -1283,6 +1332,19 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                     break
 
     chosen = best_candidate[0] or weak_snippet_fallback[0]
+
+    if not chosen and document_found_unreadable[0] and await _within_deadline(deadline):
+        recovered = await _recover_from_unreadable_document(
+            company, budget, quota_guard, deadline, "csr_page",
+        )
+        if recovered:
+            url, text = recovered
+            score = score_candidate_text(company, text, url)
+            source = make_source("india_csr_page", 1, url, text, "FOUND", "unreadable_recovery")
+            source["domain"] = urlparse(url).netloc.lower()
+            chosen = (score, source)
+            logger.info("india_csr_page recovered via unreadable-document fallback company=%r url=%s", company, url)
+
     if chosen:
         result_source = chosen[1]
         if registry is not None:
@@ -1291,7 +1353,7 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
         logger.info("india_csr_page DONE company=%r found=True score=%.1f", company, chosen[0])
         return result_source
 
-    logger.info("india_csr_page DONE company=%r found=False", company)
+    logger.info("india_csr_page DONE company=%r found=False document_found_unreadable=%s", company, document_found_unreadable[0])
     fallback = make_source("india_csr_page", 1, status="NOT_FOUND")
     fallback["domain"] = resolved_domain[0]
     return fallback
@@ -1494,7 +1556,7 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
             fetch_failed = False
             if url.lower().endswith(".pdf"):
                 text = await fetch_pdf_text(url)
-                if not text:
+                if not text or len(text) < UNREADABLE_TEXT_LENGTH_FLOOR:
                     fetch_failed = True
                     pdf_found_but_unreadable = True
                     text = body if body and len(body) > 100 and mentions_company(company, body) else ""
@@ -1538,7 +1600,7 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
                 if not mentions_company(company, f"{title} {body}") or not url_belongs_to_company(company, url):
                     continue
                 text = await fetch_pdf_text(url)
-                if not text:
+                if not text or len(text) < UNREADABLE_TEXT_LENGTH_FLOOR:
                     pdf_found_but_unreadable = True
                     continue
                 if not pdf_is_csr_relevant(text):
@@ -1551,15 +1613,15 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
                 break
 
     if pdf_found_but_unreadable and (not best_candidate or count_financial_figures(best_candidate[1].get("text", "")) == 0) and await _within_deadline(deadline):
-        recovered = await _recover_via_secondary_search(
-            company, budget, quota_guard, deadline, "annual_report", UNREADABLE_DOC_RECOVERY_QUERIES,
+        recovered = await _recover_from_unreadable_document(
+            company, budget, quota_guard, deadline, "annual_report",
         )
         if recovered:
             url, text = recovered
             score = score_candidate_text(company, text, url)
             if best_candidate is None or score > best_candidate[0]:
-                best_candidate = (score, make_source("annual_report", 4, url, text, "FOUND", "pdf_unreadable_secondary_recovery"))
-            logger.info("annual_report recovered via secondary search company=%r url=%s", company, url)
+                best_candidate = (score, make_source("annual_report", 4, url, text, "FOUND", "unreadable_recovery"))
+            logger.info("annual_report recovered via unreadable-document fallback company=%r url=%s", company, url)
 
     chosen = best_candidate or weak_candidate
     if chosen and pdf_found_but_unreadable:
@@ -1632,6 +1694,16 @@ async def fetch_multi_year_financials(company: str, search_cfg: dict, budget: Se
                 best_candidate = candidate
         if best_candidate and best_candidate[0] >= 2:
             break
+
+    if not best_candidate and await _within_deadline(deadline):
+        recovered = await _recover_via_secondary_search(
+            company, budget, quota_guard, deadline, "multi_year_financials", CSR_SPEND_QUERIES, min_len=150,
+        )
+        if recovered:
+            url, text = recovered
+            year_tokens = count_distinct_year_tokens(text)
+            score = score_candidate_text(company, text, url)
+            best_candidate = (year_tokens, score, make_source("multi_year_financials", 10, url, text, "FOUND", "csr_spend_recovery"))
 
     if best_candidate:
         chosen = best_candidate[2]
@@ -1710,13 +1782,15 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
         if len(candidates) >= max_partner_sources * 2:
             break
 
-    if mode == "deep" and await _within_deadline(deadline):
-        candidate_names: list[str] = []
-        for _, _, text in candidates:
-            for name in _extract_named_partner_candidates(company, text):
-                if name not in candidate_names:
-                    candidate_names.append(name)
-        for partner_name in candidate_names[:MAX_PARTNER_FOLLOWUP_NAMES]:
+    candidate_names: list[str] = []
+    for _, _, text in candidates:
+        for name in _extract_named_partner_candidates(company, text):
+            if name not in candidate_names:
+                candidate_names.append(name)
+
+    followup_budget = MAX_PARTNER_FOLLOWUP_NAMES if mode == "deep" else max(1, MAX_PARTNER_FOLLOWUP_NAMES - 1)
+    if candidate_names and await _within_deadline(deadline):
+        for partner_name in candidate_names[:followup_budget]:
             if not await _within_deadline(deadline):
                 break
             for template in PARTNER_FOLLOWUP_QUERIES:
@@ -1737,6 +1811,15 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
                         continue
                     score = score_candidate_text(company, text, url) + 3.0
                     candidates.append((score, url, text))
+
+    if not candidates and await _within_deadline(deadline):
+        recovered = await _recover_from_unreadable_document(
+            company, budget, quota_guard, deadline, "partner_search", seed_names=candidate_names, min_len=150,
+        )
+        if recovered:
+            url, text = recovered
+            score = score_candidate_text(company, text, url)
+            candidates.append((score, url, text))
 
     logger.info(
         "partner_search DONE company=%r urls_tried=%d candidates_found=%d mode=%s",
@@ -1817,13 +1900,15 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
         if len(candidates) >= max_programme_sources * 2:
             break
 
-    if mode == "deep" and await _within_deadline(deadline):
-        programme_names: list[str] = []
-        for _, _, text in candidates:
-            for name in _extract_entities_from_lines(text, [NAMED_INITIATIVE_PATTERN], _is_plausible_entity_name):
-                if name not in programme_names:
-                    programme_names.append(name)
-        for programme_name in programme_names[:MAX_PROGRAMME_DEEP_DIVE_NAMES]:
+    programme_names: list[str] = []
+    for _, _, text in candidates:
+        for name in _extract_named_programme_candidates(text):
+            if name not in programme_names:
+                programme_names.append(name)
+
+    deep_dive_budget = MAX_PROGRAMME_DEEP_DIVE_NAMES if mode == "deep" else max(1, MAX_PROGRAMME_DEEP_DIVE_NAMES - 1)
+    if programme_names and await _within_deadline(deadline):
+        for programme_name in programme_names[:deep_dive_budget]:
             if not await _within_deadline(deadline):
                 break
             query = PROGRAMME_DEEP_DIVE_QUERY_TEMPLATE.format(programme=programme_name, c=company)
@@ -1847,9 +1932,9 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
                 candidates.append((score, url, text))
 
     if not candidates and await _within_deadline(deadline):
-        recovered = await _recover_via_secondary_search(
+        recovered = await _recover_from_unreadable_document(
             company, budget, quota_guard, deadline, "education_programme_search",
-            UNREADABLE_DOC_RECOVERY_QUERIES, min_len=150,
+            seed_names=programme_names, min_len=150,
         )
         if recovered:
             url, text = recovered
