@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 import re
@@ -8,6 +9,7 @@ import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import settings
+from app.pipeline.decision_reconciliation import reconcile_extraction
 from app.pipeline.textproc import combine_evidence_text, estimate_tokens
 
 logger = logging.getLogger("tap.llm")
@@ -33,6 +35,7 @@ DEFAULT_ANTHROPIC_CONTEXT_WINDOW = 200000
 ANTHROPIC_DEFAULT_COOLDOWN_SECONDS = 60.0
 
 _anthropic_cooldown_until = 0.0
+_http_client: httpx.AsyncClient | None = None
 
 EXTRACTION_PRIORITY_KEYS = [
     "overall_authenticity_score",
@@ -45,6 +48,13 @@ EXTRACTION_PRIORITY_KEYS = [
     "spend",
     "entity_structure",
 ]
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=ANTHROPIC_REQUEST_TIMEOUT_SECONDS)
+    return _http_client
 
 
 def _anthropic_context_window() -> int:
@@ -141,10 +151,12 @@ _RUBRIC = {
 }
 
 
+@functools.lru_cache(maxsize=1)
 def _rubric_block() -> str:
     return "\n".join(f"- {key}: {value}" for key, value in _RUBRIC.items())
 
 
+@functools.lru_cache(maxsize=1)
 def _criteria_json_template() -> str:
     return ",\n".join(
         f'    {{"id": "{cid}", "name": "{CRITERIA_TITLES[cid]}", "score": <0-5 or null>, "confidence": <0-100>, "evidence": "<short paraphrase>", "reasoning": "<short>"}}'
@@ -367,6 +379,26 @@ PARTNER_RULE = (
     "citing only the most prominent name."
 )
 
+TAP_PRIORITY_RULE = (
+    "TAP_PRIORITY_RULE (feedback priority — apply before finalizing programmes[]): rank every "
+    "programme you extract by relevance to the NGO mission — school education, STEM, AI, "
+    "coding, digital skills, government schools, students and teachers are the priority areas. "
+    "List every programme that touches a priority area first and in full: name, what it does, "
+    "beneficiaries, implementing partner, geography and scale, in that order of completeness. "
+    "Other CSR programmes (health, environment, livelihoods unrelated to schooling, employee "
+    "wellness, etc.) follow afterward, one line each, with no chain-completeness expectation. "
+    "If a programme in a priority area is named anywhere in the evidence — even a single "
+    "passing mention, a footnote, or a phrase buried inside an unrelated paragraph — it must "
+    "appear in programmes[]. Never drop or compress a TAP-relevant programme to make room for a "
+    "less relevant one, and never let a single generic theme mention ('the company supports "
+    "education') substitute for a named priority-area programme that the evidence actually "
+    "contains elsewhere. Before finalizing the programmes array, re-scan the raw evidence text "
+    "specifically for the priority-area keywords (STEM, coding, AI, digital, government school, "
+    "Atal Tinkering Lab, curriculum, teacher training, girls in tech) and confirm every "
+    "resulting mention has a corresponding entry — a keyword hit with no matching programmes[] "
+    "entry is a missed extraction, not a genuine absence."
+)
+
 PROGRAMME_RULE = (
     "PROGRAMMES: include a named programme only if you can state what is funded and who "
     "benefits, using whatever specificity the evidence actually gives — ordinary phrasing like "
@@ -465,7 +497,14 @@ DECISION_MAKER_RULE = (
     "in a press release is a citation, not a route in. If no contact passes the currency test, "
     "return an empty decision_makers list rather than including a former employee as current — "
     "returning nobody is a usable result, and returning a former employee as current is worse "
-    "than returning nobody."
+    "than returning nobody.\n\n"
+    "CONSISTENCY WITH csr_head_note (feedback priority): csr_head_note and decision_makers[] "
+    "describe the same underlying fact and must never contradict each other. If a person "
+    "appears anywhere in the evidence — company page, report signatory, press release, or "
+    "LinkedIn snippet — with a currency-test-passing CSR/foundation/sustainability title, they "
+    "must be added to decision_makers[] AND csr_head_note must reference them by name, never say "
+    "no CSR head was identified. Only state that no CSR head was identified in csr_head_note if "
+    "decision_makers[] is genuinely empty after applying every rule above."
 )
 
 GEOGRAPHY_RULE = (
@@ -511,6 +550,20 @@ FIELD_ORDER_RULE = (
     "other parts of the pipeline depend on."
 )
 
+CROSS_SECTION_CONSISTENCY_RULE = (
+    "CROSS-SECTION CONSISTENCY (feedback priority — read this last, apply it to everything "
+    "above): every fact you state in a narrative or summary field (csr_head_note, "
+    "key_facts_summary, delivery_model_evidence, fit_rationale, strategic_insight) must also "
+    "exist in the corresponding structured array (decision_makers[], programmes[], partners[]). "
+    "It is a critical error to name a person or programme in prose while leaving them out of, "
+    "or contradicting, the structured list — the structured arrays are what downstream reports "
+    "and spreadsheets read from, so anything true only in prose is invisible everywhere else and "
+    "anything contradicted in prose looks like a fabrication. Before finalizing your reply, "
+    "re-read every narrative field you wrote and confirm each named person and programme has a "
+    "matching structured entry, and that no narrative field asserts an absence ('no CSR head "
+    "identified', 'no named programmes found') that the structured arrays contradict."
+)
+
 
 def _extraction_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
     return f"""You are a meticulous fact-extraction analyst. Extract every concrete, sourced fact about {company}'s India CSR activity from the evidence below. Do NOT score or judge fit — that happens in a separate pass. Your only job here is complete, accurate, well-cited extraction.
@@ -541,6 +594,8 @@ SOURCES:
 
 {PROGRAMME_RULE}
 
+{TAP_PRIORITY_RULE}
+
 {DECISION_MAKER_RULE}
 
 {GEOGRAPHY_RULE}
@@ -551,13 +606,15 @@ SOURCES:
 
 {EVIDENCE_STYLE_RULE}
 
+{CROSS_SECTION_CONSISTENCY_RULE}
+
 {FIELD_ORDER_RULE}
 
 Extract, matching the JSON shape's key order exactly:
 1. overall_authenticity_score (0-100) — reflects sourcing quality (primary vs secondary, how many sources actually returned usable text), not evidence volume.
 2. source_quality_assessment — 1-2 sentences: primary (company/regulator) vs secondary (press/snippets) sourcing.
 3. evidence_recency — one sentence on how current the evidence appears.
-4. csr_head_note — one sentence, only from actual named-person context, never speculation from a bare title.
+4. csr_head_note — one sentence, only from actual named-person context, never speculation from a bare title. Must agree with decision_makers[] per the CONSISTENCY sub-rule inside DECISION-MAKERS.
 5. delivery_model (FUNDER/IMPLEMENTER/HYBRID/UNCLEAR) + delivery_model_evidence (1 sentence).
 6. sector — from company-description language; UNKNOWN only if truly no clue.
 7. eligibility — Section 135 applicability (LIKELY/UNLIKELY/UNKNOWN) from net worth/turnover/profit figures (kept separate from spend), plus the plain numeric business-scale fields, plus the profit history required by the PROFIT HISTORY rule.
@@ -569,14 +626,16 @@ Extract, matching the JSON shape's key order exactly:
 13. group_foundation — CSR run via a separate parent/group foundation, only if explicitly named.
 14. key_facts_summary — 3-6 short bullet-style facts (as a single string, one per line prefixed with "- ") that most directly bear on education-CSR fit — this feeds directly into the scoring pass, so include anything that would move a fit judgment either up or down. Do not use this field as a dumping ground for a named programme or initiative that belongs in the programmes array instead.
 15. open_questions[] — up to 5 short, concrete, searchable items to verify.
-16. programmes[] — apply the PROGRAMME rule, including the delivery-channel/beneficiary specificity requirement and the chain-completeness fields.
+16. programmes[] — apply the PROGRAMME rule and the TAP_PRIORITY_RULE together: priority-area programmes (school education, STEM, AI, coding, digital skills, government schools) listed first and in full, then everything else briefly. Apply the delivery-channel/beneficiary specificity requirement and the chain-completeness fields to every entry.
 17. partners[] — apply the PARTNER rule, including similar_to_tap_profile, multi-year history, and named-format initiatives (DIBs, outcomes funds).
-18. decision_makers[] — apply the DECISION-MAKER source-of-truth order, currency test, and three-check verification strictly; title, public_facing_score 0-100, tenure_status, is_india_specific, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence.
+18. decision_makers[] — apply the DECISION-MAKER source-of-truth order, currency test, three-check verification, and consistency sub-rule strictly; title, public_facing_score 0-100, tenure_status, is_india_specific, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence.
 19. geographies[] — apply the GEOGRAPHY rule; prefer state/city over country/vague-region entries.
 20. red_flags[] — genuine contradictions or marketing-not-substance signals, severity low/medium/high. Missing/undocumented details are NOT red flags.
 21. contact_pathway — the single most concrete real channel; "Not identified" if nothing exists.
 
 7b. eligibility.net_profit_history — apply the PROFIT HISTORY rule; this feeds a downstream statutory-obligation calculation, so profit-figure recall matters as much as spend-figure recall. Source 10 (multi_year_financials), when present, is specifically curated to contain side-by-side year figures — check it first for profit_history and spend.history.
+
+Before replying, run the CROSS-SECTION CONSISTENCY check once over your own draft.
 
 Reply with ONE JSON object, nothing else, no markdown fences.
 
@@ -644,13 +703,15 @@ SOURCES:
 
 {HIGHLIGHT_RULE}
 
+{CROSS_SECTION_CONSISTENCY_RULE}
+
 Produce, in this order:
 1. criteria[] — all 17 ids below, in order, each with id, name (copy exactly as given), score 0-5 or null, confidence 0-100, short evidence, short reasoning, drawn only from the extracted facts above. Follow the CONSISTENCY rule above for every score. IMPORTANT: `confidence` must reflect how directly the extracted facts support THIS criterion specifically — not your confidence in the company overall, and not the confidence you assigned to a different criterion. A criterion resting on an inferred/sector-default judgment (per the SCORING PHILOSOPHY) should carry a materially lower confidence than one resting on an explicit, named fact. If a criterion has no evidence at all in the extracted facts, emit score: null, confidence: 0, and say what was missing in `evidence` — per SCORING PHILOSOPHY, do not guess a low number just to fill the slot:
 {_rubric_block()}
 2. Do NOT compute or emit fit_score yourself — per CONFIDENCE_SEPARATION_RULE, the application computes it deterministically from the criteria array above. Stop after criteria and move directly to the narrative fields below.
-3. fit_rationale (2-4 sentences): justify the scoring from the extracted facts, stating plainly what's confirmed vs inferred vs undocumented. Never explain a low score by citing limited evidence — a criterion with limited evidence should be null, not low. If a named partner/programme suggests a plausible but unconfirmed entry path, you may add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme — never invent one not in the extracted facts. If decision_makers and/or partners/programmes are non-empty, end with one short sentence "Key contacts: A (Title), B (Title); Key partners: X, Y" using only names from the extracted facts. Omit that closing sentence if both lists are empty.
+3. fit_rationale (2-4 sentences): justify the scoring from the extracted facts, stating plainly what's confirmed vs inferred vs undocumented. Never explain a low score by citing limited evidence — a criterion with limited evidence should be null, not low. If a named partner/programme suggests a plausible but unconfirmed entry path, you may add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme — never invent one not in the extracted facts. If decision_makers and/or partners/programmes are non-empty, end with one short sentence "Key contacts: A (Title), B (Title); Key partners: X, Y" using only names from the extracted facts — never write a sentence implying no contact or programme was found if either array is non-empty. Omit that closing sentence only if both lists are empty.
 4. overall_semantic_alignment (0-100) + alignment_rationale (1-2 sentences) — how well the company's actual activity matches the NGO mission semantically, independent of documentation completeness.
-5. strategic_insight — a 150-280 word standalone narrative (this is the lead summary shown to the user first, and should read as usable outreach material, not just an internal note): measured and evidence-grounded, leading with genuine strengths before caveats, stating plainly whether/why this is a good fit, naming strongest/weakest dimensions without dwelling on the weakest, flagging group-foundation routing if present, noting eligibility if uncertain, weaving in the CSR obligation signal above if present, and giving one concrete next step. When spend is discussed, lead with the education-specific figure/trend over the total CSR figure if both are available, and never state a trend word unless the spend series actually supports it (per TREND_RULE) — if only one year of spend is known, describe the single figure and do not claim a trend. When a specific programme or partner is TAP-relevant, name its delivery channel explicitly (in-school/curriculum vs adult/standalone vs digital, etc.) and state concretely how TAP's own model (AI-enabled WhatsApp delivery, government-school, curriculum-embedded electives) does or doesn't overlap with it — write this so a sentence could be lifted directly into an outreach email, rather than a generic theme match like "both work in education." If TAP-similar partners exist, mention that positively. {"Since this is a screen-mode pass, if the signal is promising but sourcing is thin, say plainly that a deep-research pass would surface more (spend figures, named partners, a decision-maker) rather than treating the gap as a weakness." if mode == "screen" else ""} End with the same "Key contacts: ...; Key partners: ..." sentence format as fit_rationale (only using names from the extracted facts), omitted if both lists are empty.
+5. strategic_insight — a 150-280 word standalone narrative (this is the lead summary shown to the user first, and should read as usable outreach material, not just an internal note): measured and evidence-grounded, leading with genuine strengths before caveats, stating plainly whether/why this is a good fit, naming strongest/weakest dimensions without dwelling on the weakest, flagging group-foundation routing if present, noting eligibility if uncertain, weaving in the CSR obligation signal above if present, and giving one concrete next step. Lead with priority-area programmes (school education, STEM, AI, coding, digital skills, government schools) over generic CSR themes when both exist in the extracted facts. When spend is discussed, lead with the education-specific figure/trend over the total CSR figure if both are available, and never state a trend word unless the spend series actually supports it (per TREND_RULE) — if only one year of spend is known, describe the single figure and do not claim a trend. When a specific programme or partner is TAP-relevant, name its delivery channel explicitly (in-school/curriculum vs adult/standalone vs digital, etc.) and state concretely how TAP's own model (AI-enabled WhatsApp delivery, government-school, curriculum-embedded electives) does or doesn't overlap with it — write this so a sentence could be lifted directly into an outreach email, rather than a generic theme match like "both work in education." If TAP-similar partners exist, mention that positively. {"Since this is a screen-mode pass, if the signal is promising but sourcing is thin, say plainly that a deep-research pass would surface more (spend figures, named partners, a decision-maker) rather than treating the gap as a weakness." if mode == "screen" else ""} End with the same "Key contacts: ...; Key partners: ..." sentence format as fit_rationale (only using names from the extracted facts, and never contradicting a non-empty decision_makers/partners/programmes list), omitted only if both lists are empty.
 
 All criteria ids appear exactly once, in the order listed, each with its name copied exactly as given above. Keep every string concise so the full reply fits comfortably in your output budget.
 
@@ -1073,16 +1134,16 @@ async def call_anthropic_chat(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=ANTHROPIC_REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.post(
-                ANTHROPIC_MESSAGES_URL,
-                headers={
-                    "x-api-key": settings.anthropic_api_key,
-                    "anthropic-version": ANTHROPIC_API_VERSION,
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
+        client = _get_http_client()
+        response = await client.post(
+            ANTHROPIC_MESSAGES_URL,
+            headers={
+                "x-api-key": settings.anthropic_api_key,
+                "anthropic-version": ANTHROPIC_API_VERSION,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
     except httpx.HTTPError as exc:
         logger.error("anthropic transport error caller=%s error=%s", caller, exc)
         return None
@@ -1368,21 +1429,6 @@ def compute_final_fit_score(criteria: list[dict], authenticity_score: int, mode:
             )
     return final_score
 
-
-# ---------------------------------------------------------------------------
-# EVIDENCE COVERAGE / RESEARCH CONFIDENCE GATE
-#
-# fit_score and research_coverage are now computed independently in code
-# (see _compute_weighted_fit_score / compute_research_coverage above) rather
-# than blended by the model. A criterion the model declined to score (null)
-# leaves the fit_score denominator entirely instead of entering it as a low
-# integer, and research_coverage falls out of how many criteria were left
-# null versus scored. The checks below decide whether coverage is so thin
-# that no fit score should be shown at all (the insufficient-evidence path).
-# research_confidence_label() below produces an always-shown coarse label
-# (High/Medium/Low/Insufficient) so that even when a score IS shown, the
-# reader sees, right next to it, how much to trust it.
-# ---------------------------------------------------------------------------
 
 LOW_COVERAGE_AUTHENTICITY_THRESHOLD = 30
 LOW_COVERAGE_CRITERIA_CONFIDENCE_THRESHOLD = 45
@@ -1891,6 +1937,7 @@ async def extract_company_facts(
         return None
 
     extraction = _repair_extraction(parsed, caller=f"extract_facts:{company}")
+    extraction = reconcile_extraction(extraction, working_sources)
 
     valid_sources = _valid_source_lookup(sources_manifest)
     extraction["delivery_model_source"] = _sanitize_source(extraction.get("delivery_model_source", ""), valid_sources)

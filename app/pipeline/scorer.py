@@ -1,7 +1,7 @@
 import logging
 import re
 
-from app.pipeline import google_search, llm, logo
+from app.pipeline import google_search, llm, logo, second_pass
 from app.pipeline.source_registry import SourceRegistry, extract_cited_numbers, strip_unknown_citation_tokens
 from app.pipeline.textproc import clean_and_budget_sources
 from app.pipeline.utils import build_sources_manifest, evidence_hash, merge_manifest_with_registry, mission_hash
@@ -74,6 +74,7 @@ SOURCE_LABELS = {
     "plans_search": "Partnerships & plans search",
     "sector_eligibility_search": "Sector & eligibility search",
     "education_programme_search": "Education programme search",
+    "second_pass_recovery": "Second-pass recovery search",
 }
 
 _COMPANY_SUFFIX_PATTERN = re.compile(
@@ -318,6 +319,36 @@ def _never_read_silence_as_negative_prefix(company: str, existing_partner: bool,
     return f"**Note:** {note} "
 
 
+async def _run_second_pass_if_warranted(company: str, mission: str, mode: str, cfg: dict, sources: list,
+                                         analysis: dict, registry: SourceRegistry, quota_guard=None) -> tuple[dict, list]:
+    coverage_pct = analysis.get("weighted_criteria_confidence_pct", 0)
+    if not second_pass.should_run_second_pass(sources, coverage_pct):
+        return analysis, sources
+
+    search_cfg = cfg.get("search_source_toggles", {})
+    recovered_sources, second_pass_queries = await second_pass.run_second_pass_recovery(
+        company, search_cfg, sources, registry=registry, quota_guard=quota_guard,
+    )
+    logger.info(
+        "score second_pass company=%r mode=%r queries_run=%d recovered=%d",
+        company, mode, len(second_pass_queries), len(recovered_sources),
+    )
+    if not recovered_sources:
+        return analysis, sources
+
+    merged_sources = sources + recovered_sources
+    sources_manifest = merge_manifest_with_registry(build_sources_manifest(merged_sources), registry)
+    cleaned_sources = clean_and_budget_sources(
+        merged_sources, llm.evidence_token_budget(company, mission, sources_manifest)
+    )
+    retried_analysis = await llm.analyze_and_score_company(
+        company, mission, cleaned_sources, sources_manifest, mode=mode, cfg=cfg,
+    )
+    if retried_analysis:
+        return retried_analysis, merged_sources
+    return analysis, merged_sources
+
+
 async def score(company: str, sources: list, cfg: dict, quota_guard=None,
                  registry: SourceRegistry | None = None, mode: str = "deep") -> dict:
     registry = registry or SourceRegistry(company)
@@ -329,7 +360,6 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
     logger.info("score START company=%r mode=%r state=%s source_bank_size=%d", company, mode, state, len(registry.entries()))
 
     existing_partner = is_existing_tap_partner(company, cfg)
-    source_links = build_source_links(sources)
     logo_url = await resolve_logo(company, sources, cfg, quota_guard)
 
     mission = cfg.get("org_mission") or llm.DEFAULT_MISSION
@@ -337,6 +367,7 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
 
     found_count = sum(1 for s in sources if s.get("status") == "FOUND")
     if found_count == 0:
+        source_links = build_source_links(sources)
         insight = (
             f"No publicly available India CSR data was found for {company} across the sources "
             "checked. This does not mean the company is a poor fit — it may simply mean their "
@@ -362,6 +393,13 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
     analysis = await llm.analyze_and_score_company(
         company, mission, cleaned_sources, sources_manifest, mode=mode, cfg=cfg,
     )
+
+    if analysis and analysis.get("evidence_coverage_insufficient"):
+        analysis, sources = await _run_second_pass_if_warranted(
+            company, mission, mode, cfg, sources, analysis, registry, quota_guard=quota_guard,
+        )
+
+    source_links = build_source_links(sources)
 
     if not analysis:
         cooldown_remaining = llm.anthropic_cooldown_remaining_seconds()

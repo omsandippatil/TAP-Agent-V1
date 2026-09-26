@@ -9,8 +9,9 @@ DEFAULT_MAX_DDGS_QUERIES = 8
 
 CATEGORY_FLOORS_DEFAULT = {
     "partner_search": 6,
-    "education_programme_search": 5,
+    "education_programme_search": 8,
     "people_search": 4,
+    "second_pass": 6,
 }
 
 DDGS_MIN_INTERVAL_SECONDS = 1.5
@@ -33,6 +34,8 @@ class SearchBudget:
         self.category_used: dict[str, int] = {}
         self.legal_entity_name_cache = None
         self.legal_entity_name_resolved = False
+        self.related_entities_cache = None
+        self.related_entities_resolved = False
 
     def google_has_budget(self, category: str = "") -> bool:
         if self.google_queries_used >= self.max_google_queries:

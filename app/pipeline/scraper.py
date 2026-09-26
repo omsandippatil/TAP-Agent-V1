@@ -177,13 +177,6 @@ INDIA_LEGAL_ENTITY_PATTERN = re.compile(
     r"(?:Foundation|Trust|Chapter))\b"
 )
 
-# Feedback item #8: companies frequently run CSR through more than one distinct
-# legal vehicle — the parent/global brand, a separately incorporated India
-# entity/branch, and a separately-named foundation or trust (UBS AG Mumbai
-# Branch vs UBS Optimus Foundation is the case that motivated this). This
-# pattern specifically hunts for a "<Brand> Foundation" / "<Brand> Trust" /
-# "<Brand> AG/Branch" style name so discover_related_entities() below can find
-# these even when they don't share the exact company string passed in.
 RELATED_ENTITY_NAME_PATTERN = re.compile(
     r"\b([A-Z][\w&.\-]*(?:\s+[A-Z][\w&.\-]*){0,4}\s+"
     r"(?:Foundation|Trust|CSR\s+Foundation|Charitable\s+Trust))\b"
@@ -238,13 +231,6 @@ LEGAL_ENTITY_RESOLUTION_QUERIES = [
     '"{c}" India Pvt Ltd registered company name MCA',
 ]
 
-# Feedback item #8: dedicated query set to discover related legal vehicles —
-# a separately-named foundation/trust, or a separately incorporated India
-# branch/subsidiary — that may run CSR under a different name than the parent
-# company string the analyst typed in. Run once per company (cached on the
-# SearchBudget, same pattern as resolve_india_legal_entity_name) and the
-# resulting entity names are then also used as extra query substitutions in
-# the partner/programme/CSR-page fetchers, not just recorded for the report.
 RELATED_ENTITY_DISCOVERY_QUERIES = [
     '"{c}" foundation CSR India',
     '"{c}" "group foundation" OR "CSR arm" OR "CSR trust" India',
@@ -283,13 +269,6 @@ CSR_SPEND_ENTITY_QUERIES = [
     '"{legal_name}" "CSR expenditure" crore {fy}',
 ]
 
-# Feedback item #5: the original query set relied on a handful of generic
-# "partner" phrasings and missed named-format initiatives entirely (the UBS
-# Educate Girls / Quality Education India Development Impact Bonds were not
-# surfaced because nothing here searched for that vocabulary specifically).
-# Added: an explicit DIB/outcomes-fund query, an annual-report/impact-report
-# grant-recipients query, and a multi-year angle so partner history isn't
-# limited to whatever the single most recent press release mentions.
 PARTNER_QUERIES = [
     '"{c}" CSR "implementation partner" OR "implementing partner" India NGO named',
     '"{c}" foundation "grant recipients" OR "funded organisations" India CSR named',
@@ -302,12 +281,6 @@ PARTNER_QUERIES = [
     '"{c}" CSR partner {fy1} OR {fy2} OR {fy3} named NGO',
 ]
 
-# Feedback item #5: once an initial pass finds candidate NGO/partner names, run
-# a second round of targeted queries per name to confirm and expand — this is
-# what catches a partner *network* (e.g. Gyan Shala, Kaivalya Education
-# Foundation, Educational Initiatives, Pratham Infotech Foundation, Society
-# for All Round Development all appearing around the same UBS DIBs) instead of
-# reporting only the single most prominent name from the first pass.
 PARTNER_FOLLOWUP_QUERIES = [
     '"{partner}" "{c}" partnership OR funded OR implementing',
 ]
@@ -336,15 +309,13 @@ LINKEDIN_PEOPLE_GLOBAL_FALLBACK_QUERIES = [
     'site:linkedin.com/in "{c}" "head of sustainability" OR "chief sustainability officer"',
 ]
 
-# Feedback item #4: the original single flat query bucket recognised broad
-# themes ("education", "STEM") but rarely surfaced the fuller
-# programme -> intervention -> beneficiary -> geography -> partner chain a
-# fundraiser actually needs. The named-initiative and outcomes-fund queries
-# below are the "stage 1" broad pass; fetch_education_programme_source now
-# also runs a "stage 2" follow-up (see PROGRAMME_DEEP_DIVE_QUERY_TEMPLATE)
-# per named programme it finds, specifically hunting for the missing chain
-# elements (geography, beneficiaries, partner, scale/outcomes).
 EDUCATION_PROGRAMME_QUERIES = [
+    '"{c}" CSR STEM government schools India',
+    '"{c}" CSR coding OR AI students India',
+    '"{c}" "Atal Tinkering Lab"',
+    '"{c}" digital classroom CSR NGO partner',
+    '"{c}" girls STEM programme India',
+    '"{c}" teacher training CSR India',
     '"{c}" CSR "digital literacy" OR STEM OR coding OR skilling India students',
     '"{c}" "21st century skills" OR "21st-century skills" India CSR',
     '"{c}" CSR education programme India',
@@ -352,22 +323,11 @@ EDUCATION_PROGRAMME_QUERIES = [
     '"{c}" education programme "in partnership with" OR "delivered by" OR "implemented by" India',
 ]
 
-# Feedback item #4 (stage 2 — programme chain deep-dive). Fired once per
-# distinct named programme discovered in stage 1, to fill in exactly the
-# chain elements a fundraiser needs (geography, beneficiaries, partner,
-# government-school involvement, scale/outcomes) that a generic theme query
-# routinely misses.
 PROGRAMME_DEEP_DIVE_QUERY_TEMPLATE = (
     '"{programme}" "{c}" geography OR beneficiaries OR students OR partner OR scale OR outcomes'
 )
 MAX_PROGRAMME_DEEP_DIVE_NAMES = 4
 
-# Heuristic extraction of candidate named-programme / named-partner phrases
-# from already-fetched snippet text, used to seed the stage-2 follow-up
-# queries above without waiting for the LLM extraction pass (which runs much
-# later, after all sources are already fetched). This is intentionally loose
-# — false positives here just mean one extra wasted search query, whereas
-# missing a real name here means the deep-dive follow-up never fires at all.
 NAMED_INITIATIVE_PATTERN = re.compile(
     r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){1,5}\s+"
     r"(?:Development Impact Bond|Outcomes Fund|Programme|Program|Initiative|Project|Mission|Scholarship))\b"
@@ -423,15 +383,11 @@ SOURCE_DEADLINE_SECONDS = 18
 FOLLOWUP_DEADLINE_SECONDS = 10
 CONCURRENT_FETCH_LIMIT = 2
 
-# Feedback items #1 and #5 call for materially deeper retrieval (entity
-# resolution, wider partner search, programme deep-dives). That extra work
-# needs a longer hard deadline and a larger query budget in deep mode, or the
-# new passes would simply get starved by sources 1-4 as before. Screen mode
-# keeps its original, faster ceiling since it is explicitly a triage pass.
 DEEP_JOB_HARD_DEADLINE_SECONDS = 150
 MAX_PDF_DOWNLOAD_BYTES = 15 * 1024 * 1024
 PDF_STREAM_CHUNK_BYTES = 262144
 MAX_PDF_PAGES_HARD_CAP = 40
+SECOND_PASS_TEXT_LENGTH_FLOOR = 500
 
 _FETCH_SEMAPHORE = asyncio.Semaphore(CONCURRENT_FETCH_LIMIT)
 
@@ -550,23 +506,7 @@ def mentions_company_specifically(company: str, text: str) -> bool:
     return any(b - a < _ENTITY_PROXIMITY_WINDOW_CHARS for a, b in zip(positions, positions[1:]))
 
 
-# ---------------------------------------------------------------------------
-# ENTITY RESOLUTION (feedback item #8)
-#
-# Companies frequently run CSR through more than one distinct legal vehicle —
-# a global/parent brand, a separately incorporated India entity or branch,
-# and/or a separately-named foundation or trust. Prior to this, every fetcher
-# searched only for the literal company string typed in, so evidence sitting
-# under a differently-named foundation (UBS Optimus Foundation vs "UBS") was
-# invisible to the whole pipeline. discover_related_entities() below finds
-# these once per company and callers can fold the results into their own
-# query substitutions.
-# ---------------------------------------------------------------------------
-
-
 def _looks_like_same_entity(company: str, candidate: str) -> bool:
-    """True if candidate is just the company name with corporate suffixes —
-    i.e. not actually a distinct related entity worth tracking separately."""
     company_norm = re.sub(r"[^a-z0-9]", "", company.lower())
     candidate_norm = re.sub(r"[^a-z0-9]", "", candidate.lower())
     return company_norm == candidate_norm
@@ -600,11 +540,6 @@ def _extract_related_entity_candidates(company: str, text: str) -> list[dict]:
 
 async def discover_related_entities(company: str, search_cfg: dict, budget: SearchBudget,
                                      quota_guard=None, deadline: float | None = None) -> list[dict]:
-    """Search for a separately-named foundation/trust or a separately
-    incorporated India branch/subsidiary connected to `company`. Cached on
-    the SearchBudget instance for the lifetime of one company run, the same
-    pattern as resolve_india_legal_entity_name, since this is a one-time
-    lookup other fetchers reuse rather than repeat per-source."""
     if getattr(budget, "related_entities_resolved", False):
         return budget.related_entities_cache or []
 
@@ -939,6 +874,27 @@ def _download_pdf_bytes(url: str) -> tuple[bytes, str]:
     return b"".join(chunks), ""
 
 
+def _ocr_pdf_pages(pdf_bytes: bytes, max_pages: int) -> str:
+    try:
+        import pytesseract
+        from pdf2image import convert_from_bytes
+    except Exception:
+        return ""
+    try:
+        images = convert_from_bytes(pdf_bytes, first_page=1, last_page=max(1, max_pages))
+    except Exception:
+        return ""
+    texts = []
+    for image in images:
+        try:
+            texts.append(pytesseract.image_to_string(image))
+        except Exception:
+            continue
+        finally:
+            image.close()
+    return clean_text(" ".join(texts), MAX_PDF_TEXT_CHARS)
+
+
 def _fetch_pdf_text_sync(url: str, max_chars: int, max_pages: int) -> tuple[str, str]:
     if is_known_blocked_domain(url):
         return "", "known_blocked_domain"
@@ -970,9 +926,13 @@ def _fetch_pdf_text_sync(url: str, max_chars: int, max_pages: int) -> tuple[str,
                         break
         finally:
             buffer.close()
-            del pdf_bytes
 
-        return clean_text(" ".join(pages_text), max_chars), ""
+        combined_text = clean_text(" ".join(pages_text), max_chars)
+        if len(combined_text) < SECOND_PASS_TEXT_LENGTH_FLOOR:
+            ocr_text = _ocr_pdf_pages(pdf_bytes, min(capped_pages, 8))
+            if len(ocr_text) > len(combined_text):
+                return ocr_text, ""
+        return combined_text, ""
     except Exception as exc:
         error_type = classify_fetch_error(exc)
         logger.info("fetch_pdf_text failed url=%s error_type=%s error=%s", url, error_type, exc)
@@ -1692,11 +1652,6 @@ _PARTNER_RELEVANCE_KEYWORD_PATTERN = re.compile(
 
 
 def _extract_named_partner_candidates(company: str, text: str) -> list[str]:
-    """Loose heuristic used to seed the stage-2 partner follow-up (feedback
-    #5). Pulls candidate NGO/foundation names out of already-fetched text so
-    a second round of targeted queries can confirm/expand the partner
-    network instead of stopping at whichever name appeared in the single
-    most prominent result."""
     if not text:
         return []
     seen = set()
@@ -1725,10 +1680,6 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
     seen_urls: set[str] = set()
     urls_tried = 0
 
-    # Run the standard query set against both the company name and any
-    # related entities discovered upstream (feedback #8) — a foundation's
-    # partners are frequently only discoverable by searching the foundation's
-    # own name, not the parent brand.
     search_targets = [company] + related_entity_names(related_entities)[:2]
 
     for target in search_targets:
@@ -1783,10 +1734,6 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
         if len(candidates) >= max_partner_sources * 2:
             break
 
-    # Stage 2 (feedback #5): pull candidate partner org names out of what we
-    # already fetched, then run a small number of targeted follow-up queries
-    # per name to confirm/expand the partner network rather than reporting
-    # only whichever single name surfaced first.
     if mode == "deep" and await _within_deadline(deadline):
         candidate_names: list[str] = []
         for _, _, text in candidates:
@@ -1895,10 +1842,6 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
         if len(candidates) >= max_programme_sources * 2:
             break
 
-    # Stage 2 (feedback #4): for named programmes/initiatives found in stage 1
-    # text, run a targeted deep-dive query to fill in the chain elements a
-    # fundraiser actually needs (geography, beneficiaries, partner, scale)
-    # rather than leaving the report with just the theme-level mention.
     if mode == "deep" and await _within_deadline(deadline):
         programme_names: list[str] = []
         for _, _, text in candidates:
@@ -2035,10 +1978,6 @@ async def fetch_linkedin_people(company: str, search_cfg: dict, budget: SearchBu
     if not hits:
         return make_source("people_search", 6, status="NOT_FOUND")
 
-    # India-specific contacts are prioritised ahead of global ones (feedback
-    # #6) — the confidence ordering already exists, this adds a location-aware
-    # tiebreak within each confidence tier so an India-titled contact of equal
-    # confidence surfaces above a global one.
     hits.sort(key=lambda h: (
         h.get("confidence") != "HIGH",
         h.get("confidence") != "MEDIUM",
@@ -2260,11 +2199,6 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
     related_entities: list[dict] = []
 
     try:
-        # Feedback item #8: resolve related legal entities (foundation, India
-        # branch/subsidiary) BEFORE the retrieval-heavy fetchers run, so their
-        # query templates can also search under those names. This is cheap
-        # relative to the rest of the pipeline and directly targets cases
-        # like UBS Optimus Foundation being invisible to a "UBS" search.
         await advance_step("Mapping related entities — parent, India branch, foundation...")
         related_entities = await discover_related_entities(
             company, search_cfg, budget, quota_guard, deadline=job_deadline,
