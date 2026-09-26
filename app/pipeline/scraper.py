@@ -1177,13 +1177,25 @@ async def _check_job_deadline(job_deadline: float | None) -> None:
         raise DeepJobDeadlineExceeded()
 
 
+def _format_query_template(query_template: str, company: str) -> str:
+    try:
+        return query_template.format(c=company, fy=CURRENT_FY_LABEL)
+    except KeyError as exc:
+        logger.warning(
+            "query template has unsupported placeholder %s, skipping template=%r", exc, query_template,
+        )
+        return ""
+
+
 async def _recover_via_secondary_search(company: str, budget: SearchBudget, quota_guard, deadline: float,
                                          category: str, query_templates: list[str],
                                          min_len: int = 200) -> tuple[str, str] | None:
     for query_template in query_templates:
         if not await _within_deadline(deadline):
             break
-        query = query_template.format(c=company)
+        query = _format_query_template(query_template, company)
+        if not query:
+            continue
         results = await search_web(query, budget, max_results=6, quota_guard=quota_guard, category=category)
         for result in results:
             if not await _within_deadline(deadline):
