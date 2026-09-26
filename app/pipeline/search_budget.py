@@ -30,6 +30,8 @@ class SearchBudget:
         self.legal_entity_name_resolved = False
         self.related_entities_cache = None
         self.related_entities_resolved = False
+        self.dead_domains: set[str] = set()
+        self.dead_paths: set[str] = set()
 
     def google_has_budget(self, category: str = "") -> bool:
         if self.google_queries_used >= self.max_google_queries:
@@ -62,10 +64,33 @@ class SearchBudget:
     def record_ddgs_query(self):
         return
 
+    def mark_domain_dead(self, domain: str, reason: str = ""):
+        if not domain:
+            return
+        domain = domain.lower()
+        if domain not in self.dead_domains:
+            self.dead_domains.add(domain)
+            logger.info(
+                "domain marked dead for this run company=%r domain=%s reason=%s",
+                self.company, domain, reason,
+            )
+
+    def is_domain_dead(self, domain: str) -> bool:
+        return bool(domain) and domain.lower() in self.dead_domains
+
+    def mark_path_dead(self, url: str):
+        if url:
+            self.dead_paths.add(url)
+
+    def is_path_dead(self, url: str) -> bool:
+        return url in self.dead_paths
+
     def summary(self) -> dict:
         return {
             "google_queries_used": self.google_queries_used,
             "google_budget": self.max_google_queries,
             "category_used": dict(self.category_used),
             "category_floors": dict(self.category_floors),
+            "dead_domains": len(self.dead_domains),
+            "dead_paths": len(self.dead_paths),
         }
