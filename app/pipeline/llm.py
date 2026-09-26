@@ -1270,6 +1270,107 @@ def _looks_like_former_role(*texts: str) -> bool:
     return bool(_FORMER_ROLE_LANGUAGE.search(combined))
 
 
+_NARRATIVE_CSR_TITLE_PATTERN = re.compile(
+    r"\b(csr|corporate social responsibility|esg|sustainability|corporate responsibility|"
+    r"social impact|community relations|philanthrop|csr\s*&?\s*esg|foundation)\b.{0,40}"
+    r"\b(lead|leader|head|director|manager|officer|committee|partner|chair)\b"
+    r"|\b(head|director|lead|leader|partner|chair|manager)\b.{0,40}"
+    r"\b(csr|corporate social responsibility|esg|sustainability|corporate responsibility|"
+    r"social impact|community relations|philanthrop|foundation)\b",
+    re.IGNORECASE,
+)
+
+_NARRATIVE_NAME_PATTERN = re.compile(
+    r"\b((?:Dr\.?\s+)?[A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+){1,3})\b"
+)
+
+_NARRATIVE_NAME_STOPWORDS = {
+    "CGI", "CSR", "ESG", "India", "TAP", "NGO", "MCD", "BMC", "SCERT",
+    "CEO", "MD", "The", "This", "That",
+}
+
+
+def _looks_like_person_name_token_run(candidate: str) -> bool:
+    tokens = [t for t in candidate.replace("Dr.", "Dr").split() if t]
+    core_tokens = [t.rstrip(".") for t in tokens if t.rstrip(".") not in ("Dr",)]
+    if not (1 < len(core_tokens) <= 4):
+        return False
+    if any(tok in _NARRATIVE_NAME_STOPWORDS for tok in core_tokens):
+        return False
+    return all(tok[0].isupper() for tok in core_tokens if tok)
+
+
+def _extract_named_people_from_narrative(*texts: str) -> list[dict]:
+    found = []
+    seen_keys = set()
+    for text in texts:
+        if not text:
+            continue
+        for match in _NARRATIVE_NAME_PATTERN.finditer(text):
+            candidate = match.group(1).strip()
+            if not _looks_like_person_name_token_run(candidate):
+                continue
+            window_start = max(0, match.start() - 80)
+            window_end = min(len(text), match.end() + 80)
+            window = text[window_start:window_end]
+            if not _NARRATIVE_CSR_TITLE_PATTERN.search(window):
+                continue
+            if _looks_like_former_role(window):
+                continue
+            key = "".join(ch for ch in candidate.lower() if ch.isalnum())
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            found.append({
+                "name": candidate,
+                "title": "",
+                "source_excerpt": window.strip()[:260],
+            })
+    return found
+
+
+def _reconcile_narrative_named_people_into_decision_makers(extraction: dict, caller: str = "unknown") -> dict:
+    decision_makers = extraction.get("decision_makers") or []
+    existing_keys = {
+        "".join(ch for ch in (person.get("name", "") or "").lower() if ch.isalnum())
+        for person in decision_makers
+    }
+
+    narrative_fields = (
+        extraction.get("csr_head_note", ""),
+        extraction.get("key_facts_summary", ""),
+        extraction.get("delivery_model_evidence", ""),
+    )
+    narrative_people = _extract_named_people_from_narrative(*narrative_fields)
+
+    added_names = []
+    for person in narrative_people:
+        key = "".join(ch for ch in person["name"].lower() if ch.isalnum())
+        if not key or key in existing_keys:
+            continue
+        existing_keys.add(key)
+        decision_makers.append({
+            "name": person["name"],
+            "title": person.get("title", ""),
+            "public_facing_score": 45,
+            "tenure_status": "UNKNOWN",
+            "tenure_evidence": "Named in narrative evidence text; not independently structured or dated.",
+            "is_india_specific": False,
+            "source_excerpt": person.get("source_excerpt", "")[:260],
+            "source": "",
+            "linkedin_url": "",
+        })
+        added_names.append(person["name"])
+
+    if added_names:
+        extraction["decision_makers"] = decision_makers
+        logger.info(
+            "_reconcile_narrative_named_people_into_decision_makers recovered names not in structured "
+            "array caller=%s names=%s", caller, added_names,
+        )
+    return extraction
+
+
 def _field_max_length(field) -> int | None:
     for constraint in field.metadata:
         if hasattr(constraint, "max_length"):
@@ -2009,6 +2110,7 @@ async def extract_company_facts(
     extraction = _repair_extraction(parsed, caller=f"extract_facts:{company}")
     extraction = reconcile_extraction(extraction, working_sources)
     extraction = _merge_verified_people_hits_into_extraction(extraction, working_sources, caller=f"extract_facts:{company}")
+    extraction = _reconcile_narrative_named_people_into_decision_makers(extraction, caller=f"extract_facts:{company}")
 
     valid_sources = _valid_source_lookup(sources_manifest)
     extraction["delivery_model_source"] = _sanitize_source(extraction.get("delivery_model_source", ""), valid_sources)

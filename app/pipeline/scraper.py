@@ -455,6 +455,35 @@ def is_csr_relevant(text: str) -> bool:
     return sum(1 for kw in relevance_keywords if kw in lowered) >= 2
 
 
+NON_INDIA_CSR_GEO_PATTERN = re.compile(
+    r"\b(finland|finnish|estonia|tallinn|sweden|swedish|norway|norwegian|denmark|danish|"
+    r"ukraine|ukrainian|erasmus\+?|european\s+union|\beu\b\s+programme|ukraine\s+government|"
+    r"government\s+of\s+ukraine|germany|german|netherlands|dutch|belgium|belgian|"
+    r"united\s+kingdom|\buk\b(?!\w)|canada|canadian|australia|australian|"
+    r"united\s+states|\busa\b|\bus\b(?!\w))\b",
+    re.IGNORECASE,
+)
+
+
+def has_india_or_education_signal(text: str) -> bool:
+    if not text:
+        return False
+    if has_india_location_signal(text):
+        return True
+    lowered = text.lower()
+    return any(kw in lowered for kw in EDUCATION_KEYWORDS)
+
+
+def is_non_india_geo_dominant(text: str) -> bool:
+    if not text:
+        return False
+    non_india_hits = len(NON_INDIA_CSR_GEO_PATTERN.findall(text))
+    if non_india_hits == 0:
+        return False
+    india_hits = len(find_india_location_mentions(text))
+    return non_india_hits > india_hits
+
+
 def has_financial_figures(text: str) -> bool:
     return bool(CURRENCY_FIGURE_PATTERN.search(text))
 
@@ -1809,7 +1838,11 @@ async def fetch_partner_source(company: str, search_cfg: dict, budget: SearchBud
                     continue
                 if not is_csr_relevant(text) and not _PARTNER_RELEVANCE_KEYWORD_PATTERN.search(text):
                     continue
+                if is_non_india_geo_dominant(text) and not has_india_location_signal(text):
+                    continue
                 score = score_candidate_text(company, text, url)
+                if has_india_location_signal(text):
+                    score += 3.0
                 candidates.append((score, url, text))
 
             if len(candidates) >= max_partner_sources * 2:
@@ -1915,9 +1948,13 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
                 text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url)) or body
                 if not text or len(text) < 150 or not mentions_company(company, text):
                     continue
-                if "education" not in text.lower() and not any(kw in text.lower() for kw in EDUCATION_KEYWORDS):
+                if not has_india_or_education_signal(text):
+                    continue
+                if is_non_india_geo_dominant(text) and not has_india_location_signal(text):
                     continue
                 score = score_candidate_text(company, text, url) + 5.0
+                if has_india_location_signal(text):
+                    score += 3.0
                 candidates.append((score, url, text))
 
             if len(candidates) >= max_programme_sources * 2:
@@ -1952,6 +1989,8 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
                 urls_tried += 1
                 text = await fetch_page_text(url) or body
                 if not text or len(text) < 120 or not mentions_company(company, text):
+                    continue
+                if is_non_india_geo_dominant(text) and not has_india_location_signal(text):
                     continue
                 score = score_candidate_text(company, text, url) + 4.0
                 candidates.append((score, url, text))

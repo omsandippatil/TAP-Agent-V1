@@ -56,6 +56,7 @@ IMPORTANT_LINK_QUERIES = (
     '"{company}" India "CSR-2" OR "Form CSR-2" OR MCA filing',
     '"{company}" annual report OR sustainability report CSR India filetype:pdf',
     '"{company}" CSR "request for proposal" OR "open call" OR "looking for partners" India',
+    '"{company}" CSR OR ESG OR sustainability leader OR head India',
 )
 MAX_IMPORTANT_LINKS = 8
 IMPORTANT_LINK_SEARCH_RESULTS = 5
@@ -75,6 +76,7 @@ SOURCE_LABELS = {
     "sector_eligibility_search": "Sector & eligibility search",
     "education_programme_search": "Education programme search",
     "second_pass_recovery": "Second-pass recovery search",
+    "important_link": "Important link",
 }
 
 _COMPANY_SUFFIX_PATTERN = re.compile(
@@ -82,6 +84,66 @@ _COMPANY_SUFFIX_PATTERN = re.compile(
     r"corporation|llp|india)\b",
     re.IGNORECASE,
 )
+
+_CSR_TITLE_SIGNAL_PATTERN = re.compile(
+    r"\b(csr|corporate social responsibility|esg|sustainability|corporate responsibility|"
+    r"social impact|community relations|philanthrop|csr\s*&?\s*esg)\b.{0,40}"
+    r"\b(lead|leader|head|director|manager|officer|committee|foundation)\b"
+    r"|\b(head|director|lead|leader|vp|vice\s*president|manager)\b.{0,40}"
+    r"\b(csr|corporate social responsibility|esg|sustainability|corporate responsibility|"
+    r"social impact|community relations|philanthrop)\b",
+    re.IGNORECASE,
+)
+
+_FORMER_ROLE_PATTERN = re.compile(
+    r"\b(previously|formerly|former|ex-|past|until\s+20\d{2})\b", re.IGNORECASE
+)
+
+_NAME_TITLE_SPLIT_PATTERN = re.compile(
+    r"^\s*([A-Z][a-zA-Z.\-']+(?:\s+[A-Z][a-zA-Z.\-']+){0,4})\s*[-–|:]\s*(.{4,140})"
+)
+
+_NAME_TOKEN_STOPWORDS = {
+    "The", "This", "That", "CGI", "CSR", "ESG", "India", "Ltd", "Limited", "Foundation",
+}
+
+
+def _looks_like_person_name(candidate: str) -> bool:
+    tokens = candidate.split()
+    if not (1 < len(tokens) <= 4):
+        return False
+    if any(tok.strip(".") in _NAME_TOKEN_STOPWORDS for tok in tokens):
+        return False
+    return all(tok[0].isupper() for tok in tokens if tok)
+
+
+def _extract_named_csr_people_from_snippet(title: str, body: str, url: str) -> list[dict]:
+    haystack = f"{title} — {body}".strip(" —")
+    if not _CSR_TITLE_SIGNAL_PATTERN.search(haystack):
+        return []
+    if _FORMER_ROLE_PATTERN.search(haystack):
+        return []
+
+    found = []
+    for chunk in re.split(r"[|]|(?<=[a-z])\.\s+", haystack):
+        match = _NAME_TITLE_SPLIT_PATTERN.match(chunk.strip())
+        if not match:
+            continue
+        name_candidate = match.group(1).strip()
+        title_candidate = match.group(2).strip()
+        if not _looks_like_person_name(name_candidate):
+            continue
+        if not _CSR_TITLE_SIGNAL_PATTERN.search(title_candidate) and not _CSR_TITLE_SIGNAL_PATTERN.search(haystack):
+            continue
+        if _FORMER_ROLE_PATTERN.search(title_candidate):
+            continue
+        found.append({
+            "name": name_candidate,
+            "title": title_candidate[:160],
+            "source_excerpt": haystack[:260],
+            "url": url,
+        })
+    return found
 
 
 def get_scoring_tier(score, cfg: dict) -> dict:
@@ -234,16 +296,54 @@ def attach_linkedin_urls(decision_makers: list[dict], sources: list) -> list[dic
     return decision_makers
 
 
+def merge_important_link_people_into_decision_makers(
+    decision_makers: list[dict], important_link_people: list[dict], company: str
+) -> list[dict]:
+    if not important_link_people:
+        return decision_makers
+
+    existing_keys = {_name_key(person.get("name", "")) for person in decision_makers}
+    added_names = []
+
+    for candidate in important_link_people:
+        key = _name_key(candidate.get("name", ""))
+        if not key or key in existing_keys:
+            continue
+        existing_keys.add(key)
+        decision_makers.append({
+            "name": candidate["name"],
+            "title": candidate.get("title", ""),
+            "public_facing_score": 55,
+            "tenure_status": "UNKNOWN",
+            "tenure_evidence": "Surfaced via an important-links web search, not independently dated.",
+            "is_india_specific": True,
+            "source_excerpt": candidate.get("source_excerpt", "")[:260],
+            "source": "",
+            "linkedin_url": candidate.get("url", "") if "linkedin.com/in/" in candidate.get("url", "") else "",
+        })
+        added_names.append(candidate["name"])
+
+    if added_names:
+        logger.info(
+            "merge_important_link_people_into_decision_makers recovered names company=%r names=%s",
+            company, added_names,
+        )
+    return decision_makers
+
+
 def sort_decision_makers_india_first(decision_makers: list[dict]) -> list[dict]:
     return sorted(decision_makers, key=lambda person: not person.get("is_india_specific", False))
 
 
-async def gather_important_links(company: str, quota_guard=None, registry: SourceRegistry | None = None) -> list[dict]:
+async def gather_important_links(company: str, quota_guard=None, registry: SourceRegistry | None = None) -> tuple[list[dict], list[dict]]:
     if not google_search.google_search_configured_and_available(quota_guard):
-        return []
+        return [], []
 
     seen_urls: set[str] = set()
     results: list[dict] = []
+    people_seen_keys: set[str] = set()
+    people: list[dict] = []
+
     for query_template in IMPORTANT_LINK_QUERIES:
         query = query_template.format(company=company)
         try:
@@ -259,10 +359,17 @@ async def gather_important_links(company: str, quota_guard=None, registry: Sourc
             if company.lower() not in f"{title} {body}".lower():
                 continue
             seen_urls.add(url)
-            results.append({"label": title[:80] or url, "url": url, "relevance": body[:140]})
-            if len(results) >= MAX_IMPORTANT_LINKS:
-                break
-        if len(results) >= MAX_IMPORTANT_LINKS:
+
+            for person in _extract_named_csr_people_from_snippet(title, body, url):
+                key = _name_key(person["name"])
+                if key in people_seen_keys:
+                    continue
+                people_seen_keys.add(key)
+                people.append(person)
+
+            if len(results) < MAX_IMPORTANT_LINKS:
+                results.append({"label": title[:80] or url, "url": url, "relevance": body[:140]})
+        if len(results) >= MAX_IMPORTANT_LINKS and len(people) >= MAX_IMPORTANT_LINKS:
             break
 
     if registry is not None:
@@ -273,7 +380,7 @@ async def gather_important_links(company: str, quota_guard=None, registry: Sourc
                 label=link.get("label", "") or link.get("url", ""),
                 excerpt=link.get("relevance", ""),
             )
-    return results
+    return results, people
 
 
 async def resolve_logo(company: str, sources: list, cfg: dict, quota_guard=None) -> str:
@@ -289,7 +396,8 @@ def _unscored_result(state: str, insight: str, sources: list, source_links: list
                       registry: SourceRegistry, existing_partner: bool = False,
                       analysis: dict | None = None, score_breakdown: dict | None = None,
                       decision_makers: list | None = None,
-                      research_confidence_label: str = "Insufficient") -> dict:
+                      research_confidence_label: str = "Insufficient",
+                      important_links: list | None = None) -> dict:
     return {
         "state": state,
         "fit_score": None,
@@ -301,7 +409,7 @@ def _unscored_result(state: str, insight: str, sources: list, source_links: list
         "decision_makers": decision_makers or [],
         "sources": sources,
         "source_links": source_links,
-        "important_links": [],
+        "important_links": important_links or [],
         "logo_url": logo_url,
         "is_existing_tap_partner": existing_partner,
         "source_bank": registry.as_source_bank(),
@@ -365,6 +473,12 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
     mission = cfg.get("org_mission") or llm.DEFAULT_MISSION
     sources_manifest = merge_manifest_with_registry(build_sources_manifest(sources), registry)
 
+    try:
+        important_links, important_link_people = await gather_important_links(company, quota_guard=quota_guard, registry=registry)
+    except Exception as exc:
+        logger.error("score gather_important_links raised company=%r error=%s", company, exc)
+        important_links, important_link_people = [], []
+
     found_count = sum(1 for s in sources if s.get("status") == "FOUND")
     if found_count == 0:
         source_links = build_source_links(sources)
@@ -384,7 +498,11 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             "evidence of absence of fit — follow up directly rather than deprioritising.",
         ) + insight
         logger.info("score UNSCORED company=%r mode=%r reason=no_sources_found no_anthropic_call", company, mode)
-        return _unscored_result(state, insight, sources, source_links, logo_url, registry, existing_partner)
+        decision_makers = merge_important_link_people_into_decision_makers([], important_link_people, company)
+        return _unscored_result(
+            state, insight, sources, source_links, logo_url, registry, existing_partner,
+            decision_makers=decision_makers, important_links=important_links,
+        )
 
     cleaned_sources = clean_and_budget_sources(
         sources, llm.evidence_token_budget(company, mission, sources_manifest)
@@ -421,7 +539,11 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             "Scoring could not run this time — this is an infrastructure gap, not a fit signal.",
         ) + base_note
         logger.warning("score UNSCORED company=%r mode=%r reason=analysis_call_failed", company, mode)
-        return _unscored_result(state, insight, sources, source_links, logo_url, registry, existing_partner)
+        decision_makers = merge_important_link_people_into_decision_makers([], important_link_people, company)
+        return _unscored_result(
+            state, insight, sources, source_links, logo_url, registry, existing_partner,
+            decision_makers=decision_makers, important_links=important_links,
+        )
 
     research_confidence_label = analysis.get("research_confidence_label", "Insufficient")
 
@@ -455,7 +577,10 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             company, mode, coverage_reason, avg_conf, weighted_conf, authenticity, research_confidence_label,
         )
         decision_makers = sort_decision_makers_india_first(
-            attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources)
+            merge_important_link_people_into_decision_makers(
+                attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources),
+                important_link_people, company,
+            )
         )
         return _unscored_result(
             state, insight, sources, source_links, logo_url, registry, existing_partner,
@@ -463,6 +588,7 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             score_breakdown=build_score_breakdown(analysis),
             decision_makers=decision_makers,
             research_confidence_label=research_confidence_label,
+            important_links=important_links,
         )
 
     final_score = analysis["fit_score"]
@@ -486,20 +612,18 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         ) + insight
 
     decision_makers = sort_decision_makers_india_first(
-        attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources)
+        merge_important_link_people_into_decision_makers(
+            attach_linkedin_urls(list(analysis.get("decision_makers", [])), sources),
+            important_link_people, company,
+        )
     )
-
-    try:
-        important_links = await gather_important_links(company, quota_guard=quota_guard, registry=registry)
-    except Exception as exc:
-        logger.error("score gather_important_links raised company=%r error=%s", company, exc)
-        important_links = []
 
     logger.info(
         "score DONE company=%r mode=%r fit_score=%d tier=%s research_confidence=%s source_bank_size=%d "
-        "scored_criteria=%d/%d",
+        "scored_criteria=%d/%d important_link_people=%d",
         company, mode, final_score, tier.get("label"), research_confidence_label, len(registry.entries()),
         breakdown.get("scored_criteria_count", 0), breakdown.get("total_criteria_count", 0),
+        len(important_link_people),
     )
 
     return {
