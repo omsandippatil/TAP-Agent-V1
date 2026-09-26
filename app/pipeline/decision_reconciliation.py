@@ -77,6 +77,37 @@ def people_hits_as_decision_makers(sources):
     return candidates
 
 
+def child_hits_as_decision_makers(registry):
+    if registry is None:
+        return []
+    candidates = []
+    for entry in registry.entries():
+        if entry.get("kind") != "child" or entry.get("source_name") != "people_search":
+            continue
+        label = entry.get("label", "")
+        name = label.split("—", 1)[-1].strip() if "—" in label else ""
+        if not name:
+            continue
+        excerpt = entry.get("excerpt", "")
+        haystack = f"{name} {excerpt}".lower()
+        if not any(term in haystack for term in CSR_ROLE_TERMS):
+            continue
+        if _is_former_role(excerpt):
+            continue
+        title = excerpt.split("—", 1)[0].strip() if "—" in excerpt else ""
+        candidates.append({
+            "name": name,
+            "title": title,
+            "tenure_status": "UNKNOWN",
+            "tenure_evidence": "",
+            "is_india_specific": False,
+            "source_excerpt": excerpt[:260],
+            "source": "people_search",
+            "linkedin_url": entry.get("url", ""),
+        })
+    return candidates
+
+
 def extract_named_programme_mentions(*texts):
     found, seen = [], set()
     for text in texts:
@@ -91,18 +122,27 @@ def extract_named_programme_mentions(*texts):
     return found
 
 
-def reconcile_extraction(extraction, sources):
+def _collect_all_decision_maker_candidates(extraction, sources, registry):
+    narrative_texts = [
+        extraction.get("csr_head_note", ""),
+        extraction.get("key_facts_summary", ""),
+        extraction.get("strategic_insight", ""),
+    ]
+    candidates = []
+    candidates.extend(extract_narrative_person_mentions(*narrative_texts))
+    candidates.extend(people_hits_as_decision_makers(sources))
+    candidates.extend(child_hits_as_decision_makers(registry))
+    return candidates
+
+
+def reconcile_extraction(extraction, sources, registry=None):
     if not isinstance(extraction, dict):
         return extraction
 
     existing_people = list(extraction.get("decision_makers") or [])
     existing_keys = {_name_key(p.get("name")) for p in existing_people if p.get("name")}
 
-    narrative_texts = [
-        extraction.get("csr_head_note", ""),
-        extraction.get("key_facts_summary", ""),
-    ]
-    candidates = extract_narrative_person_mentions(*narrative_texts) + people_hits_as_decision_makers(sources)
+    candidates = _collect_all_decision_maker_candidates(extraction, sources, registry)
 
     for candidate in candidates:
         key = _name_key(candidate.get("name"))
@@ -163,7 +203,18 @@ def reconcile_extraction(extraction, sources):
         })
     extraction["programmes"] = existing_programmes
 
-    if existing_people and extraction.get("csr_head_note") and NO_CSR_HEAD_CONTRADICTION_PATTERN.search(extraction["csr_head_note"]):
-        extraction["csr_head_note"] = ""
+    if existing_people:
+        note = extraction.get("csr_head_note", "")
+        if note and NO_CSR_HEAD_CONTRADICTION_PATTERN.search(note):
+            lead = existing_people[0]
+            extraction["csr_head_note"] = (
+                f"{lead.get('name', '')} — {lead.get('title', '')}".strip(" —")
+            )
+        summary = extraction.get("key_facts_summary", "")
+        if summary and NO_CSR_HEAD_CONTRADICTION_PATTERN.search(summary):
+            extraction["key_facts_summary"] = NO_CSR_HEAD_CONTRADICTION_PATTERN.sub("", summary).strip()
+    else:
+        if extraction.get("csr_head_note") and NO_CSR_HEAD_CONTRADICTION_PATTERN.search(extraction["csr_head_note"]):
+            extraction["csr_head_note"] = ""
 
     return extraction

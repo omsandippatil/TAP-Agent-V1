@@ -114,6 +114,13 @@ EDUCATION_KEYWORDS = [
     "artificial intelligence", "robotics", "government school", "teacher",
 ]
 
+PRIORITY_EDUCATION_KEYWORDS = [
+    "stem", "artificial intelligence", " ai ", "coding", "digital skills",
+    "digital literacy", "robotics", "government school", "government schools",
+    "public school", "teacher training", "teacher capacity", "girls in ai",
+    "girls in data", "atal tinkering", "21st century skills", "21st-century skills",
+]
+
 CURRENCY_FIGURE_PATTERN = re.compile(
     r"(?:(?:rs\.?|inr|₹)\s?[\d,]+(?:\.\d+)?\s?(?:crore|cr\.?|lakh|lac|million|mn|billion|bn|thousand)?"
     r"|[\d,]+(?:\.\d+)?\s?(?:crore|cr\.?|lakh|lac)\b)",
@@ -266,6 +273,7 @@ EDUCATION_PROGRAMME_QUERIES = [
     '"{c}" CSR India (STEM OR AI OR coding OR "digital skills") students {site}',
     '"{c}" CSR India (government school OR public school) teachers students {site}',
     '"{c}" India CSR (education OR skilling) programme NGO partner annual report filetype:pdf',
+    '"{c}" CSR India (STEM OR AI OR robotics OR "digital literacy") named programme beneficiaries',
 ]
 
 CSR_PAGE_QUERIES = [
@@ -338,6 +346,8 @@ PROGRAMME_DEEP_DIVE_QUERY_TEMPLATE = (
 
 UNREADABLE_DOC_RECOVERY_QUERIES = [
     '"{c}" CSR (programme name OR expenditure OR "amount spent") India crore news press release',
+    '"{c}" CSR (education OR STEM OR skilling) programme name students press release',
+    '"{c}" CSR partner NGO announcement India',
 ]
 
 FOLLOWUP_QUERY_TEMPLATES = {
@@ -434,6 +444,13 @@ def is_csr_relevant(text: str) -> bool:
         "social responsibility", "esg", "impact report",
     ]
     return sum(1 for kw in relevance_keywords if kw in lowered) >= 2
+
+
+def count_priority_education_hits(text: str) -> int:
+    if not text:
+        return 0
+    lowered = f" {text.lower()} "
+    return sum(1 for kw in PRIORITY_EDUCATION_KEYWORDS if kw in lowered)
 
 
 def has_india_or_education_signal(text: str) -> bool:
@@ -689,12 +706,13 @@ def score_candidate_text(company: str, text: str, url: str = "") -> float:
     figure_hits = count_financial_figures(text)
     india_figure_bonus = 4.0 if has_india_specific_financial_figure(text) else 0.0
     india_location_bonus = 2.0 if has_india_location_signal(text) else 0.0
+    education_priority_bonus = min(count_priority_education_hits(text) * 2.5, 10.0)
     length_bonus = min(len(text) / 2000.0, 4.0)
     domain_bonus = 6.0 if url and any(gov in url.lower() for gov in OFFICIAL_GOV_DOMAINS) else 0.0
     pdf_bonus = 1.5 if url.lower().endswith(".pdf") else 0.0
     return (
         csr_hits * 2.0 + figure_hits * 5.0 + india_figure_bonus + india_location_bonus
-        + length_bonus + domain_bonus + pdf_bonus
+        + education_priority_bonus + length_bonus + domain_bonus + pdf_bonus
     )
 
 
@@ -1532,17 +1550,20 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
             if best_candidate and count_financial_figures(best_candidate[1].get("text", "")) > 0:
                 break
 
-    if pdf_found_but_unreadable and not best_candidate and not weak_candidate and await _within_deadline(deadline):
+    if pdf_found_but_unreadable and (not best_candidate or count_financial_figures(best_candidate[1].get("text", "")) == 0) and await _within_deadline(deadline):
         recovered = await _recover_via_secondary_search(
             company, budget, quota_guard, deadline, "annual_report", UNREADABLE_DOC_RECOVERY_QUERIES,
         )
         if recovered:
             url, text = recovered
             score = score_candidate_text(company, text, url)
-            best_candidate = (score, make_source("annual_report", 4, url, text, "FOUND", "pdf_unreadable_secondary_recovery"))
+            if best_candidate is None or score > best_candidate[0]:
+                best_candidate = (score, make_source("annual_report", 4, url, text, "FOUND", "pdf_unreadable_secondary_recovery"))
             logger.info("annual_report recovered via secondary search company=%r url=%s", company, url)
 
     chosen = best_candidate or weak_candidate
+    if chosen and pdf_found_but_unreadable:
+        chosen[1]["fetch_method"] = f"{chosen[1].get('fetch_method', '')}_unreadable_recovered".strip("_")
     logger.info(
         "annual_report DONE company=%r urls_tried=%d found=%s pdf_found_but_unreadable=%s",
         company, urls_tried, bool(chosen), pdf_found_but_unreadable,
@@ -1554,7 +1575,10 @@ async def fetch_annual_report(company: str, search_cfg: dict, budget: SearchBudg
         budget.mark_category_hit("annual_report")
         return chosen[1]
 
-    return make_source("annual_report", 4, status="NOT_FOUND")
+    fallback = make_source("annual_report", 4, status="NOT_FOUND")
+    if pdf_found_but_unreadable:
+        fallback["fetch_method"] = "pdf_found_unreadable"
+    return fallback
 
 
 async def fetch_multi_year_financials(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,

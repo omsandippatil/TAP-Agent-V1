@@ -2,6 +2,7 @@ import logging
 import re
 
 from app.pipeline import google_search, llm, logo, second_pass
+from app.pipeline.decision_reconciliation import reconcile_extraction
 from app.pipeline.source_registry import SourceRegistry, extract_cited_numbers, strip_unknown_citation_tokens
 from app.pipeline.textproc import clean_and_budget_sources
 from app.pipeline.utils import build_sources_manifest, evidence_hash, merge_manifest_with_registry, mission_hash
@@ -544,6 +545,8 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             state, insight, sources, source_links, logo_url, registry, existing_partner,
             decision_makers=decision_makers, important_links=important_links,
         )
+
+    analysis = reconcile_extraction(analysis, sources, registry)
 
     research_confidence_label = analysis.get("research_confidence_label", "Insufficient")
 

@@ -1,5 +1,8 @@
 import functools
+import logging
 import re
+
+logger = logging.getLogger("tap.textproc")
 
 STOPWORDS = frozenset("""
 a an the and or but if then else for of to in on at by with from as is are
@@ -43,6 +46,8 @@ MIN_SENTENCE_LENGTH = 15
 MIN_ALPHA_RATIO = 0.4
 MIN_TRUNCATE_CHARS = 200
 FINGERPRINT_WORD_LIMIT = 20
+
+LOG_SOURCE_TEXT_PREVIEW_CHARS = 400
 
 
 def normalize_whitespace_and_html(raw_text):
@@ -99,7 +104,7 @@ def _stopword_fingerprint(sentence):
     return " ".join(words[:FINGERPRINT_WORD_LIMIT])
 
 
-def clean_source_text(raw_text, seen_fingerprints=None):
+def clean_source_text(raw_text, seen_fingerprints=None, source_name=""):
     """Strip boilerplate/nav/cookie-banner lines and cross-source duplicate
     sentences. This never rewrites, reorders, or drops sentences based on
     topical relevance — it only removes junk and exact-duplicate boilerplate
@@ -113,17 +118,32 @@ def clean_source_text(raw_text, seen_fingerprints=None):
     if seen_fingerprints is None:
         seen_fingerprints = set()
 
+    total_sentences = 0
+    boilerplate_dropped = 0
+    duplicate_dropped = 0
     kept = []
+
     for sentence in split_sentences(raw_text):
+        total_sentences += 1
         if is_boilerplate_sentence(sentence):
+            boilerplate_dropped += 1
             continue
         fingerprint = _stopword_fingerprint(sentence)
         if fingerprint:
             if fingerprint in seen_fingerprints:
+                duplicate_dropped += 1
                 continue
             seen_fingerprints.add(fingerprint)
         kept.append(sentence)
-    return " ".join(kept)
+
+    result = " ".join(kept)
+    logger.info(
+        "clean_source_text source=%r sentences_total=%d kept=%d boilerplate_dropped=%d "
+        "duplicate_dropped=%d raw_chars=%d cleaned_chars=%d",
+        source_name or "unknown", total_sentences, len(kept), boilerplate_dropped,
+        duplicate_dropped, len(raw_text), len(result),
+    )
+    return result
 
 
 @functools.lru_cache(maxsize=1)
@@ -158,6 +178,7 @@ def remove_stopwords_and_boilerplate(sources, company=""):
     whether a sentence is boilerplate or a duplicate.
     """
     if not sources:
+        logger.info("remove_stopwords_and_boilerplate company=%r no sources provided", company)
         return sources
 
     seen_fingerprints = set()
@@ -166,8 +187,17 @@ def remove_stopwords_and_boilerplate(sources, company=""):
         if source.get("status") != "FOUND" or not source.get("text"):
             cleaned.append(source)
             continue
-        cleaned_text = clean_source_text(source["text"], seen_fingerprints)
+        cleaned_text = clean_source_text(
+            source["text"], seen_fingerprints, source_name=source.get("source_name", ""),
+        )
         cleaned.append({**source, "text": cleaned_text})
+
+    logger.info(
+        "remove_stopwords_and_boilerplate DONE company=%r sources_total=%d sources_found=%d "
+        "distinct_fingerprints=%d",
+        company, len(sources), sum(1 for s in sources if s.get("status") == "FOUND"),
+        len(seen_fingerprints),
+    )
     return cleaned
 
 
@@ -180,36 +210,83 @@ def clean_and_budget_sources(sources, token_budget):
     lost, it's lost evenly across all sources, not selectively.
     """
     if not sources:
+        logger.info("clean_and_budget_sources no sources provided token_budget=%s", token_budget)
         return sources
 
     found_sources = [s for s in sources if s.get("status") == "FOUND" and s.get("text")]
     if not found_sources:
+        logger.info(
+            "clean_and_budget_sources sources_total=%d found_sources=0 token_budget=%s — nothing to send to LLM",
+            len(sources), token_budget,
+        )
         return sources
 
     token_budget = max(0, int(token_budget or 0))
 
     seen_fingerprints = set()
     cleaned = []
+    pre_clean_lengths = {}
     for source in found_sources:
-        cleaned_text = clean_source_text(source.get("text", ""), seen_fingerprints)
+        name = source.get("source_name", "")
+        pre_clean_lengths[name] = len(source.get("text", ""))
+        cleaned_text = clean_source_text(source.get("text", ""), seen_fingerprints, source_name=name)
         cleaned.append({**source, "text": cleaned_text})
 
-    total_tokens = sum(estimate_tokens(s["text"]) for s in cleaned)
+    per_source_tokens = {s.get("source_name", ""): estimate_tokens(s["text"]) for s in cleaned}
+    total_tokens = sum(per_source_tokens.values())
 
+    truncated = False
     if total_tokens == 0 or total_tokens <= token_budget:
         result_by_name = {s.get("source_name"): s for s in cleaned}
+        logger.info(
+            "clean_and_budget_sources company_evidence FITS budget token_budget=%d total_tokens=%d "
+            "sources_found=%d",
+            token_budget, total_tokens, len(cleaned),
+        )
     else:
+        truncated = True
         keep_ratio = token_budget / total_tokens if total_tokens else 0
         result_by_name = {}
         for source in cleaned:
+            name = source.get("source_name")
             text = source["text"]
             target_chars = max(MIN_TRUNCATE_CHARS, int(len(text) * keep_ratio))
-            result_by_name[source.get("source_name")] = {**source, "text": text[:target_chars]}
+            truncated_text = text[:target_chars]
+            result_by_name[name] = {**source, "text": truncated_text}
+            logger.info(
+                "clean_and_budget_sources TRUNCATED source=%r cleaned_chars=%d kept_chars=%d "
+                "pre_clean_chars=%d keep_ratio=%.3f",
+                name, len(text), len(truncated_text), pre_clean_lengths.get(name, 0), keep_ratio,
+            )
+        logger.info(
+            "clean_and_budget_sources company_evidence EXCEEDED budget token_budget=%d total_tokens=%d "
+            "keep_ratio=%.3f sources_found=%d",
+            token_budget, total_tokens, keep_ratio, len(cleaned),
+        )
 
     output = []
     for source in sources:
         name = source.get("source_name")
         output.append(result_by_name.get(name, source))
+
+    final_found = [s for s in output if s.get("status") == "FOUND" and s.get("text")]
+    final_total_chars = sum(len(s.get("text", "")) for s in final_found)
+    final_total_tokens = sum(estimate_tokens(s.get("text", "")) for s in final_found)
+    logger.info(
+        "clean_and_budget_sources FINAL PAYLOAD TO LLM sources_included=%d total_chars=%d "
+        "est_total_tokens=%d truncated=%s breakdown=%s",
+        len(final_found), final_total_chars, final_total_tokens, truncated,
+        [(s.get("source_name", ""), len(s.get("text", ""))) for s in final_found],
+    )
+    for source in final_found:
+        text = source.get("text", "")
+        preview = text[:LOG_SOURCE_TEXT_PREVIEW_CHARS].replace("\n", " ")
+        suffix = "..." if len(text) > LOG_SOURCE_TEXT_PREVIEW_CHARS else ""
+        logger.debug(
+            "clean_and_budget_sources LLM_INPUT source=%r chars=%d preview=%r%s",
+            source.get("source_name", ""), len(text), preview, suffix,
+        )
+
     return output
 
 
@@ -221,4 +298,9 @@ def combine_evidence_text(sources):
         if source.get("status") != "FOUND" or not source.get("text"):
             continue
         chunks.append(f"[{source.get('source_name', 'source')}]\n{source['text']}")
-    return "\n\n".join(chunks)
+    combined = "\n\n".join(chunks)
+    logger.info(
+        "combine_evidence_text sources_included=%d combined_chars=%d",
+        sum(1 for s in sources if s.get("status") == "FOUND" and s.get("text")), len(combined),
+    )
+    return combined

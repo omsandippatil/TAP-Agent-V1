@@ -13,7 +13,7 @@ CATEGORY_FLOORS_DEFAULT = {
     "mca_filing": 1,
     "cin": 1,
     "legal_entity": 1,
-    "second_pass": 3,
+    "second_pass": 5,
 }
 
 CATEGORY_SUCCESS_TARGET_DEFAULT = {
