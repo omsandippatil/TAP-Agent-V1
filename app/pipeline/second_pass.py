@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+from urllib.parse import urlparse
 
 from app.pipeline.search_budget import SearchBudget
 from app.pipeline.scraper import (
@@ -21,7 +22,6 @@ logger = logging.getLogger("tap.second_pass")
 
 SECOND_PASS_TEXT_LENGTH_FLOOR = 500
 SECOND_PASS_MAX_GOOGLE_QUERIES = 10
-SECOND_PASS_MAX_DDGS_QUERIES = 4
 SECOND_PASS_DEADLINE_SECONDS = 45.0
 SECOND_PASS_MAX_NAMED_FOLLOWUPS = 6
 SECOND_PASS_MAX_STATE_FOLLOWUPS = 3
@@ -60,12 +60,16 @@ def should_run_second_pass(sources, coverage_pct=None, coverage_floor=45):
 
 async def run_second_pass_recovery(company, search_cfg, sources, registry=None, quota_guard=None,
                                     max_google_queries=SECOND_PASS_MAX_GOOGLE_QUERIES,
-                                    max_ddgs_queries=SECOND_PASS_MAX_DDGS_QUERIES,
-                                    deadline_seconds=SECOND_PASS_DEADLINE_SECONDS):
-    budget = SearchBudget(company, max_google_queries=max_google_queries, max_ddgs_queries=max_ddgs_queries)
+                                    deadline_seconds=SECOND_PASS_DEADLINE_SECONDS,
+                                    budget: SearchBudget | None = None):
+    budget = budget or SearchBudget(company, max_google_queries=max_google_queries)
     deadline = time.monotonic() + deadline_seconds
     recovered = []
     queries_run = []
+
+    def is_dead(url: str) -> bool:
+        host = urlparse(url).netloc.lower()
+        return budget.is_domain_dead(host) or budget.is_path_dead(url)
 
     short_extract_sources = [
         s for s in sources
@@ -78,20 +82,23 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
         title_guess = source.get("domain", "") or source.get("url", "")
         query = f'"{company}" "{title_guess}"' if title_guess else f'"{company}" CSR report'
         queries_run.append(query)
-        results = await search_web(
-            query, budget, max_results=5, prefer_google=True, quota_guard=quota_guard, category="second_pass"
-        )
+        results = await search_web(query, budget, max_results=5, quota_guard=quota_guard, category="second_pass")
         for result in results:
             candidate_url = result.get("href", "")
             if not candidate_url or candidate_url == source.get("url") or any(
                 domain in candidate_url for domain in AGGREGATOR_DOMAINS
             ):
                 continue
+            if is_dead(candidate_url):
+                continue
             text = await (
                 fetch_pdf_text(candidate_url) if candidate_url.lower().endswith(".pdf")
                 else fetch_page_text(candidate_url)
             )
-            if text and len(text) > SECOND_PASS_TEXT_LENGTH_FLOOR and mentions_company(company, text):
+            if not text:
+                budget.mark_path_dead(candidate_url)
+                continue
+            if len(text) > SECOND_PASS_TEXT_LENGTH_FLOOR and mentions_company(company, text):
                 new_source = make_source(
                     "second_pass_recovery", 11, candidate_url, text, "FOUND", "second_pass_short_extract"
                 )
@@ -111,19 +118,22 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
         if time.monotonic() >= deadline:
             break
         queries_run.append(query)
-        results = await search_web(
-            query, budget, max_results=5, prefer_google=True, quota_guard=quota_guard, category="second_pass"
-        )
+        results = await search_web(query, budget, max_results=5, quota_guard=quota_guard, category="second_pass")
         for result in results:
             url = result.get("href", "")
             title = result.get("title", "")
             body = result.get("body", "")
             if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
                 continue
+            if is_dead(url):
+                continue
             if not mentions_company(company, f"{title} {body}"):
                 continue
             text = await (fetch_pdf_text(url) if url.lower().endswith(".pdf") else fetch_page_text(url)) or body
-            if text and len(text) > SECOND_PASS_TEXT_LENGTH_FLOOR and is_csr_relevant(text):
+            if not text:
+                budget.mark_path_dead(url)
+                continue
+            if len(text) > SECOND_PASS_TEXT_LENGTH_FLOOR and is_csr_relevant(text):
                 new_source = make_source(
                     "second_pass_recovery", 11, url, text, "FOUND", "second_pass_followup"
                 )
