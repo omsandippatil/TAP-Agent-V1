@@ -89,12 +89,6 @@ def get_session() -> requests.Session:
 
 
 def get_with_referer_fallback(url: str, timeout: float, **kwargs) -> requests.Response:
-    """GET a URL, and if it 403s with no referer, retry once with a same-origin referer.
-
-    Some WAFs specifically block direct-to-resource requests (especially PDFs) that
-    arrive with no referer chain, but allow the same request if it looks like it came
-    from a click on the site's own homepage.
-    """
     session = get_session()
     response = session.get(url, timeout=timeout, **kwargs)
     if response.status_code == 403:
@@ -113,7 +107,6 @@ def get_with_referer_fallback(url: str, timeout: float, **kwargs) -> requests.Re
 
 
 def classify_fetch_error(exc: Exception) -> str:
-    """Classify a fetch exception into a coarse error_type for structured logging."""
     text = str(exc)
     exc_type = type(exc).__name__
     if "NameResolutionError" in text or "NameResolutionError" in exc_type or "getaddrinfo" in text:
@@ -140,7 +133,6 @@ def classify_fetch_error(exc: Exception) -> str:
 
 
 def domain_resolves(domain: str, timeout: float = 1.5) -> bool:
-    """Fast DNS-only check so we don't burn fetch slots/time on domains that don't exist."""
     import socket
     try:
         socket.setdefaulttimeout(timeout)
@@ -167,6 +159,18 @@ def make_source(source_name: str, priority: int, url: str = "", text: str = "",
 def clean_text(raw_text: str, max_chars: int = 15000) -> str:
     collapsed = re.sub(r"\s+", " ", raw_text).strip()
     return collapsed[:max_chars]
+
+
+def normalize_block_text(raw_text: str, max_chars: int = 15000) -> str:
+    if not raw_text:
+        return ""
+    lines = []
+    for raw_line in raw_text.splitlines():
+        collapsed = re.sub(r"[ \t\u00a0]+", " ", raw_line).strip()
+        if collapsed:
+            lines.append(collapsed)
+    joined = "\n".join(lines)
+    return joined[:max_chars]
 
 
 def _is_boilerplate_line(line: str) -> bool:
@@ -207,10 +211,10 @@ def extract_main_text(soup, max_chars: int = 16000) -> str:
         lines.append(text)
 
     if not lines:
-        return clean_text(root.get_text(" ", strip=True), max_chars)
+        return normalize_block_text(root.get_text("\n", strip=True), max_chars)
 
     combined = "\n".join(lines)
-    return clean_text(combined, max_chars)
+    return normalize_block_text(combined, max_chars)
 
 
 def extract_table_rows(soup, max_rows: int = 200) -> list[list[str]]:

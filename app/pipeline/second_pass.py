@@ -13,19 +13,22 @@ from app.pipeline.scraper import (
     is_csr_relevant,
     find_india_location_mentions,
     is_plausible_entity_name,
+    _extract_entities_from_lines,
     NAMED_INITIATIVE_PATTERN,
     NAMED_NGO_PATTERN,
     RELATED_ENTITY_NAME_PATTERN,
 )
-from app.pipeline.utils import make_source
+from app.pipeline.utils import make_source, normalize_block_text
 
 logger = logging.getLogger("tap.second_pass")
 
 SECOND_PASS_TEXT_LENGTH_FLOOR = 500
-SECOND_PASS_MAX_GOOGLE_QUERIES = 10
+SECOND_PASS_MAX_GOOGLE_QUERIES = 8
 SECOND_PASS_DEADLINE_SECONDS = 45.0
-SECOND_PASS_MAX_NAMED_FOLLOWUPS = 6
+SECOND_PASS_MAX_NAMED_FOLLOWUPS = 4
 SECOND_PASS_MAX_STATE_FOLLOWUPS = 3
+
+_ENTITY_PATTERNS = (NAMED_INITIATIVE_PATTERN, NAMED_NGO_PATTERN, RELATED_ENTITY_NAME_PATTERN)
 
 
 def _discover_named_entities(sources):
@@ -34,11 +37,8 @@ def _discover_named_entities(sources):
         text = source.get("text", "")
         if not text:
             continue
-        for pattern in (NAMED_INITIATIVE_PATTERN, NAMED_NGO_PATTERN, RELATED_ENTITY_NAME_PATTERN):
-            for match in pattern.finditer(text):
-                name = re.sub(r"\s+", " ", match.group(1)).strip()
-                if is_plausible_entity_name(name):
-                    names.add(name)
+        for name in _extract_entities_from_lines(text, _ENTITY_PATTERNS, is_plausible_entity_name):
+            names.add(name)
     return names
 
 
@@ -108,17 +108,20 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
                 if registry is not None:
                     registry.register_core_source(new_source)
                 recovered.append(new_source)
+                budget.mark_category_hit("second_pass")
                 break
 
     named_entities = list(_discover_named_entities(sources))[:SECOND_PASS_MAX_NAMED_FOLLOWUPS]
     states = list(_discover_states(sources))[:SECOND_PASS_MAX_STATE_FOLLOWUPS]
 
-    followup_queries = [f'"{name}" "{company}" partnership OR funded OR implementing' for name in named_entities]
-    followup_queries += [f'"{company}" CSR {state}' for state in states]
-    followup_queries.append(f'"{company}" CSR school STEM partnership')
+    followup_queries = [f'"{name}" "{company}" (partnership OR funded OR implementing)' for name in named_entities]
+    if states:
+        followup_queries.append(f'"{company}" CSR ({" OR ".join(states)})')
 
     for query in followup_queries:
         if time.monotonic() >= deadline:
+            break
+        if not budget.google_has_budget("second_pass"):
             break
         queries_run.append(query)
         results = await search_web(query, budget, max_results=5, quota_guard=quota_guard, category="second_pass")
@@ -143,9 +146,36 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
                 if registry is not None:
                     registry.register_core_source(new_source)
                 recovered.append(new_source)
+                budget.mark_category_hit("second_pass")
+
+    if not recovered and _budget_has_room(budget, deadline):
+        query = f'"{company}" CSR school STEM partnership'
+        queries_run.append(query)
+        results = await search_web(query, budget, max_results=5, quota_guard=quota_guard, category="second_pass")
+        for result in results:
+            url = result.get("href", "")
+            title = result.get("title", "")
+            body = result.get("body", "")
+            if not url or any(domain in url for domain in AGGREGATOR_DOMAINS) or is_dead(url):
+                continue
+            if not mentions_company(company, f"{title} {body}"):
+                continue
+            text = await (fetch_pdf_text(url) if url.lower().endswith(".pdf") else fetch_page_text(url)) or body
+            if text and len(text) > SECOND_PASS_TEXT_LENGTH_FLOOR and is_csr_relevant(text):
+                new_source = make_source(
+                    "second_pass_recovery", 11, url, text, "FOUND", "second_pass_broad_fallback"
+                )
+                if registry is not None:
+                    registry.register_core_source(new_source)
+                recovered.append(new_source)
+                budget.mark_category_hit("second_pass")
 
     logger.info(
         "second_pass_recovery DONE company=%r short_extract_candidates=%d queries_run=%d recovered=%d",
         company, len(short_extract_sources), len(queries_run), len(recovered),
     )
     return recovered, queries_run
+
+
+def _budget_has_room(budget, deadline):
+    return time.monotonic() < deadline and budget.google_has_budget("second_pass")
