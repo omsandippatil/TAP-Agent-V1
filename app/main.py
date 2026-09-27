@@ -137,7 +137,7 @@ async def _run_screen_job(job_id: str, company: str, mode: str, user_id: str | N
         logger.info("job sources job_id=%s company=%r found=%d/%d", job_id, company, found_count, len(sources))
         db.log_job_run(company, mode, "sources_fetched", f"found={found_count}/{len(sources)}")
 
-        result = await scorer.score(company, sources, cfg, registry=registry)
+        result = await scorer.score(company, sources, cfg, registry=registry, mode=mode)
         logger.info(
             "job scored job_id=%s company=%r state=%s fit_score=%s analysis_present=%s source_bank_size=%d",
             job_id, company, result.get("state"), result.get("fit_score"), bool(result.get("analysis")),
