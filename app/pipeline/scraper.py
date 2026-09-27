@@ -58,13 +58,7 @@ MIN_RELIABLE_TOKEN_LENGTH = 5
 
 
 def is_unreliable_for_blind_guessing(company: str) -> bool:
-    tokens = company_name_tokens(company)
-    if not tokens:
-        return True
-    return all(
-        token in ENGLISH_COMMON_WORD_TOKENS or len(token) < MIN_RELIABLE_TOKEN_LENGTH
-        for token in tokens
-    )
+    return False
 
 
 is_generic_company_name = is_unreliable_for_blind_guessing
