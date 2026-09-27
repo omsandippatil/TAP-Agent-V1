@@ -5,9 +5,21 @@ CSR_ROLE_TERMS = (
     "foundation", "social impact", "corporate citizenship", "philanthropy",
 )
 
-FORMER_ROLE_PATTERN = re.compile(
+_FORMER_ROLE_KEYWORD_PATTERN = re.compile(
     r"\b(previously|formerly|former|ex-|past|until\s+\d{4})\b", re.IGNORECASE,
 )
+
+_YEAR_RANGE_PATTERN = re.compile(
+    r"\b(19|20)\d{2}\s*[-–—]\s*(present|now|\d{4})\b", re.IGNORECASE,
+)
+
+_ROLE_INDICATOR_WORD_PATTERN = re.compile(
+    r"\b(role|position|served|was|as|title|designation)\b", re.IGNORECASE,
+)
+
+FORMER_ROLE_PATTERN = _FORMER_ROLE_KEYWORD_PATTERN
+
+_FORMER_ROLE_PROXIMITY_WINDOW_CHARS = 50
 
 NARRATIVE_PERSON_PATTERN = re.compile(
     r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*(?:[-\u2013\u2014,]|\()\s*(?:is\s+)?(?:the\s+)?"
@@ -46,9 +58,33 @@ def _name_key(name):
     return re.sub(r"[^a-z]", "", (name or "").lower())
 
 
-def _is_former_role(*texts):
-    combined = " ".join(t for t in texts if t)
-    return bool(combined) and bool(FORMER_ROLE_PATTERN.search(combined))
+def _has_former_role_language_near_role_context(text: str) -> bool:
+    if not text:
+        return False
+    for match in _FORMER_ROLE_KEYWORD_PATTERN.finditer(text):
+        window_start = max(0, match.start() - _FORMER_ROLE_PROXIMITY_WINDOW_CHARS)
+        window_end = min(len(text), match.end() + _FORMER_ROLE_PROXIMITY_WINDOW_CHARS)
+        window = text[window_start:window_end]
+        if _ROLE_INDICATOR_WORD_PATTERN.search(window):
+            return True
+    for match in _YEAR_RANGE_PATTERN.finditer(text):
+        window_start = max(0, match.start() - _FORMER_ROLE_PROXIMITY_WINDOW_CHARS)
+        window_end = min(len(text), match.end() + _FORMER_ROLE_PROXIMITY_WINDOW_CHARS)
+        window = text[window_start:window_end]
+        if _ROLE_INDICATOR_WORD_PATTERN.search(window):
+            return True
+    return False
+
+
+def _is_former_role(title="", tenure_evidence="", source_excerpt=""):
+    if title and _FORMER_ROLE_KEYWORD_PATTERN.search(title):
+        return True
+    if title and _YEAR_RANGE_PATTERN.search(title):
+        return True
+    for text in (tenure_evidence, source_excerpt):
+        if text and _has_former_role_language_near_role_context(text):
+            return True
+    return False
 
 
 def extract_narrative_person_mentions(*texts):
@@ -77,7 +113,7 @@ def people_hits_as_decision_makers(sources):
         haystack = f"{hit.get('title', '')} {hit.get('snippet', '')}".lower()
         if not any(term in haystack for term in CSR_ROLE_TERMS):
             continue
-        if _is_former_role(hit.get("title", ""), hit.get("snippet", "")):
+        if _is_former_role(hit.get("title", ""), "", hit.get("snippet", "")):
             continue
         candidates.append({
             "name": hit.get("name", ""),
@@ -107,9 +143,9 @@ def child_hits_as_decision_makers(registry):
         haystack = f"{name} {excerpt}".lower()
         if not any(term in haystack for term in CSR_ROLE_TERMS):
             continue
-        if _is_former_role(excerpt):
-            continue
         title = excerpt.split("—", 1)[0].strip() if "—" in excerpt else ""
+        if _is_former_role(title, "", excerpt):
+            continue
         candidates.append({
             "name": name,
             "title": title,

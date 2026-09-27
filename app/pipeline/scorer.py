@@ -1,8 +1,10 @@
 import logging
 import re
 
-from app.pipeline import google_search, llm, logo, second_pass
+from app.config import settings
+from app.pipeline import directed_search, google_search, llm, logo, second_pass
 from app.pipeline.decision_reconciliation import reconcile_extraction
+from app.pipeline.search_budget import SearchBudget
 from app.pipeline.source_registry import SourceRegistry, extract_cited_numbers, strip_unknown_citation_tokens
 from app.pipeline.textproc import clean_and_budget_sources
 from app.pipeline.utils import build_sources_manifest, evidence_hash, merge_manifest_with_registry, mission_hash
@@ -77,6 +79,7 @@ SOURCE_LABELS = {
     "sector_eligibility_search": "Sector & eligibility search",
     "education_programme_search": "Education programme search",
     "second_pass_recovery": "Second-pass recovery search",
+    "directed_search": "Directed follow-up search",
     "important_link": "Important link",
 }
 
@@ -376,10 +379,8 @@ async def gather_important_links(company: str, quota_guard=None, registry: Sourc
     if registry is not None:
         for link in results:
             link["source_number"] = registry.register_child_hit(
-                source_name="important_link",
-                url=link.get("url", ""),
-                label=link.get("label", "") or link.get("url", ""),
-                excerpt=link.get("relevance", ""),
+                source_name="important_link", url=link.get("url", ""),
+                label=link.get("label", "") or link.get("url", ""), excerpt=link.get("relevance", ""),
             )
     return results, people
 
@@ -398,7 +399,8 @@ def _unscored_result(state: str, insight: str, sources: list, source_links: list
                       analysis: dict | None = None, score_breakdown: dict | None = None,
                       decision_makers: list | None = None,
                       research_confidence_label: str = "Insufficient",
-                      important_links: list | None = None) -> dict:
+                      important_links: list | None = None,
+                      directed_search_summary: dict | None = None) -> dict:
     return {
         "state": state,
         "fit_score": None,
@@ -419,6 +421,7 @@ def _unscored_result(state: str, insight: str, sources: list, source_links: list
         "entity_structure": build_entity_structure_view(analysis) if analysis else {
             "parent_company": "", "india_entity": "", "foundation_entity": "", "notes": "", "is_populated": False,
         },
+        "directed_search_summary": directed_search_summary or {},
     }
 
 
@@ -456,6 +459,137 @@ async def _run_second_pass_if_warranted(company: str, mission: str, mode: str, c
     if retried_analysis:
         return retried_analysis, merged_sources
     return analysis, merged_sources
+
+
+async def _run_directed_search_after_extraction(company: str, mode: str, cfg: dict, sources: list,
+                                                 extraction: dict, registry: SourceRegistry,
+                                                 budget: SearchBudget, quota_guard=None
+                                                 ) -> tuple[dict | None, list, dict | None]:
+    if not getattr(settings, "enable_directed_search", True):
+        return None, sources, None
+    directives = extraction.get("search_directives") or []
+    if not directives:
+        return None, sources, None
+
+    max_queries = (
+        settings.max_directed_search_queries_deep if mode == "deep"
+        else settings.max_directed_search_queries_screen
+    )
+    new_sources, summary = await directed_search.run_directed_search(
+        company, mode, directives, budget, quota_guard=quota_guard, registry=registry,
+        max_queries=max_queries,
+        medium_priority_enabled=settings.directed_search_medium_priority_enabled,
+    )
+    if not new_sources:
+        return summary, sources, None
+
+    merged_sources = sources + new_sources
+    mission = cfg.get("org_mission") or llm.DEFAULT_MISSION
+    sources_manifest = merge_manifest_with_registry(build_sources_manifest(merged_sources), registry)
+    cleaned_sources = clean_and_budget_sources(
+        merged_sources, llm.evidence_token_budget(company, mission, sources_manifest)
+    )
+    re_extraction = await llm.extract_company_facts(company, mission, cleaned_sources, sources_manifest)
+    return summary, merged_sources, re_extraction
+
+
+async def _run_directed_search_after_scoring(company: str, mode: str, cfg: dict, sources: list,
+                                              analysis: dict, registry: SourceRegistry,
+                                              budget: SearchBudget, quota_guard=None
+                                              ) -> tuple[dict | None, list, dict]:
+    if not getattr(settings, "enable_directed_search", True) or mode != "deep":
+        return None, sources, analysis
+    directives = analysis.get("unscored_criteria_search_directives") or []
+    if not directives:
+        return None, sources, analysis
+
+    new_sources, summary = await directed_search.run_directed_search(
+        company, mode, directives, budget, quota_guard=quota_guard, registry=registry,
+        max_queries=settings.max_directed_search_queries_deep,
+        medium_priority_enabled=settings.directed_search_medium_priority_enabled,
+    )
+    if not new_sources:
+        return summary, sources, analysis
+
+    merged_sources = sources + new_sources
+    mission = cfg.get("org_mission") or llm.DEFAULT_MISSION
+    sources_manifest = merge_manifest_with_registry(build_sources_manifest(merged_sources), registry)
+    cleaned_sources = clean_and_budget_sources(
+        merged_sources, llm.evidence_token_budget(company, mission, sources_manifest)
+    )
+
+    csr_obligation_signal = llm.compute_csr_obligation_signal(
+        analysis.get("eligibility", {}), analysis.get("spend", {})
+    )
+    scoring_extraction = {
+        k: v for k, v in analysis.items()
+        if k not in ("open_questions", "key_facts_summary", "overall_authenticity_score",
+                      "evidence_recency", "source_quality_assessment", "csr_head_note")
+    }
+    re_scoring = await llm.score_extracted_facts(
+        company, mission, mode, scoring_extraction, sources_manifest, cfg=cfg,
+        csr_obligation=csr_obligation_signal,
+    )
+    if not re_scoring:
+        return summary, merged_sources, analysis
+
+    updated_analysis = dict(analysis)
+    updated_analysis["criteria"] = re_scoring.get("criteria", analysis.get("criteria", []))
+    updated_analysis["fit_rationale"] = re_scoring.get("fit_rationale", analysis.get("fit_rationale", ""))
+    updated_analysis["overall_semantic_alignment"] = re_scoring.get(
+        "overall_semantic_alignment", analysis.get("overall_semantic_alignment", 0)
+    )
+    updated_analysis["alignment_rationale"] = re_scoring.get(
+        "alignment_rationale", analysis.get("alignment_rationale", "")
+    )
+    updated_analysis["strategic_insight"] = re_scoring.get(
+        "strategic_insight", analysis.get("strategic_insight", "")
+    )
+
+    if updated_analysis.get("criteria"):
+        coverage_insufficient, coverage_reason = llm.evidence_coverage_is_too_low(
+            updated_analysis["criteria"], updated_analysis.get("overall_authenticity_score", 0)
+        )
+        updated_analysis["evidence_coverage_insufficient"] = coverage_insufficient
+        updated_analysis["evidence_coverage_reason"] = coverage_reason
+        updated_analysis["average_criteria_confidence_pct"] = round(
+            llm.average_criteria_confidence(updated_analysis["criteria"]), 1
+        )
+        updated_analysis["weighted_criteria_confidence_pct"] = round(
+            llm.weighted_average_criteria_confidence(updated_analysis["criteria"]), 1
+        )
+        updated_analysis["research_confidence_label"] = llm.research_confidence_label(
+            updated_analysis["criteria"], updated_analysis.get("overall_authenticity_score", 0), coverage_insufficient,
+        )
+        updated_analysis["fit_score"] = llm.compute_final_fit_score(
+            criteria=updated_analysis["criteria"],
+            authenticity_score=updated_analysis.get("overall_authenticity_score", 0),
+            mode=mode,
+            company=company,
+        )
+        updated_analysis["research_coverage"] = llm.compute_research_coverage(updated_analysis["criteria"])
+
+    return summary, merged_sources, updated_analysis
+
+
+def _merge_directed_search_summaries(pre: dict | None, post: dict | None) -> dict:
+    if not pre and not post:
+        return {}
+    if pre and not post:
+        return pre
+    if post and not pre:
+        return post
+    merged = dict(pre)
+    for key in ("directives_attempted", "sources_recovered"):
+        merged[key] = pre.get(key, 0) + post.get(key, 0)
+    merged["fields_addressed"] = list(dict.fromkeys(
+        pre.get("fields_addressed", []) + post.get("fields_addressed", [])
+    ))
+    merged["fields_still_empty"] = [
+        f for f in list(dict.fromkeys(pre.get("fields_still_empty", []) + post.get("fields_still_empty", [])))
+        if f not in merged["fields_addressed"]
+    ]
+    return merged
 
 
 async def score(company: str, sources: list, cfg: dict, quota_guard=None,
@@ -509,8 +643,34 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         sources, llm.evidence_token_budget(company, mission, sources_manifest)
     )
 
-    analysis = await llm.analyze_and_score_company(
-        company, mission, cleaned_sources, sources_manifest, mode=mode, cfg=cfg,
+    directed_search_budget = SearchBudget(company, mode=mode)
+    directed_search_summary_pre: dict | None = None
+    directed_search_summary_post: dict | None = None
+
+    extraction = await llm.extract_company_facts(company, mission, cleaned_sources, sources_manifest)
+    if not extraction:
+        analysis = None
+    else:
+        directed_search_summary_pre, sources, re_extraction = await _run_directed_search_after_extraction(
+            company, mode, cfg, sources, extraction, registry, directed_search_budget, quota_guard=quota_guard,
+        )
+        if directed_search_summary_pre and directed_search_summary_pre.get("sources_recovered"):
+            sources_manifest = merge_manifest_with_registry(build_sources_manifest(sources), registry)
+            cleaned_sources = clean_and_budget_sources(
+                sources, llm.evidence_token_budget(company, mission, sources_manifest)
+            )
+
+        analysis = await llm.analyze_and_score_company(
+            company, mission, cleaned_sources, sources_manifest, mode=mode, cfg=cfg,
+        )
+
+        if analysis:
+            directed_search_summary_post, sources, analysis = await _run_directed_search_after_scoring(
+                company, mode, cfg, sources, analysis, registry, directed_search_budget, quota_guard=quota_guard,
+            )
+
+    directed_search_summary = _merge_directed_search_summaries(
+        directed_search_summary_pre, directed_search_summary_post
     )
 
     if analysis and analysis.get("evidence_coverage_insufficient"):
@@ -544,6 +704,7 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         return _unscored_result(
             state, insight, sources, source_links, logo_url, registry, existing_partner,
             decision_makers=decision_makers, important_links=important_links,
+            directed_search_summary=directed_search_summary,
         )
 
     analysis = reconcile_extraction(analysis, sources, registry)
@@ -592,6 +753,7 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
             decision_makers=decision_makers,
             research_confidence_label=research_confidence_label,
             important_links=important_links,
+            directed_search_summary=directed_search_summary,
         )
 
     final_score = analysis["fit_score"]
@@ -623,10 +785,10 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
 
     logger.info(
         "score DONE company=%r mode=%r fit_score=%d tier=%s research_confidence=%s source_bank_size=%d "
-        "scored_criteria=%d/%d important_link_people=%d",
+        "scored_criteria=%d/%d important_link_people=%d directed_search_sources=%d",
         company, mode, final_score, tier.get("label"), research_confidence_label, len(registry.entries()),
         breakdown.get("scored_criteria_count", 0), breakdown.get("total_criteria_count", 0),
-        len(important_link_people),
+        len(important_link_people), directed_search_summary.get("sources_recovered", 0),
     )
 
     return {
@@ -647,5 +809,6 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         "research_confidence_label": research_confidence_label,
         "research_confidence_badge": research_confidence_badge(research_confidence_label),
         "entity_structure": build_entity_structure_view(analysis),
+        "directed_search_summary": directed_search_summary,
         "cache_key": (mode, company.strip().lower(), evidence_hash(sources), mission_hash(mission)),
     }

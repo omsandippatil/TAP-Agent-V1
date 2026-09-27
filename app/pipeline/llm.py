@@ -51,6 +51,9 @@ EXTRACTION_PRIORITY_KEYS = [
     "entity_structure",
 ]
 
+SEARCH_DIRECTIVE_PRIORITIES = ("HIGH", "MEDIUM", "LOW")
+MAX_SEARCH_DIRECTIVES = 5
+
 
 def _verbose_logging_enabled() -> bool:
     return bool(getattr(settings, "verbose_pipeline_logging", True))
@@ -272,7 +275,10 @@ SCORING_PHILOSOPHY = (
     "application will exclude it from the average rather than let it drag the average down. "
     "Scoring 1 out of 5 because you found nothing is damaging precisely because it is "
     "indistinguishable downstream from a company that was genuinely assessed and found weak. "
-    "Score 0 only where a source actively contradicts the criterion."
+    "Score 0 only where a source actively contradicts the criterion.\n\n"
+    "For any criterion you score null, if you can see a concrete, ready-to-run search query "
+    "that would plausibly resolve it, add an entry to unscored_criteria_search_directives per "
+    "the instructions below — this is how the gap gets followed up on, not just recorded."
 )
 
 CONFIDENCE_SEPARATION_RULE = (
@@ -518,13 +524,19 @@ DECISION_MAKER_RULE = (
     "the fetch will fail or return a login shell. If a snippet is all you have, the contact is "
     "UNVERIFIED and must be labelled so via tenure_status/is_india_specific plus a note in "
     "tenure_evidence.\n\n"
-    "CURRENCY TEST: reject as a current contact any headline or snippet containing Previously, "
-    "Formerly, Former, ex-, Past, or a stated end year. A person describing a role in the past "
-    "tense does not hold it — this is not a judgement call. THREE-CHECK VERIFICATION: before "
-    "including anyone, confirm from the evidence (1) they are still at the company (no "
-    "former-role language nearby, per the currency test), (2) their designation as stated is "
-    "CSR/foundation/sustainability/philanthropy-relevant, not inferred from context alone, and "
-    "(3) the role genuinely covers this company's CSR function, not an unrelated department. "
+    "CURRENCY TEST: reject as a current contact any headline or snippet whose former-role "
+    "language (Previously, Formerly, Former, ex-, Past, or a stated end year) sits close to and "
+    "describes THIS person's role — a bare year range or former-role keyword appearing "
+    "elsewhere in the same excerpt, describing something else (a company history note, an "
+    "unrelated statute year, a different person entirely), does not disqualify them. A person "
+    "describing their own role in the past tense does not hold it — this is not a judgement "
+    "call once the language genuinely attaches to their role, but a stray date or keyword "
+    "nearby that is not actually about their tenure must not cause a false rejection. "
+    "THREE-CHECK VERIFICATION: before including anyone, confirm from the evidence (1) they are "
+    "still at the company (no former-role language describing their own role nearby, per the "
+    "currency test), (2) their designation as stated is CSR/foundation/sustainability/"
+    "philanthropy-relevant, not inferred from context alone, and (3) the role genuinely covers "
+    "this company's CSR function, not an unrelated department. "
     "INDIA PRIORITY: when the evidence surfaces both an India-based/India-titled CSR contact "
     "and a global-level contact for the same company, include both if evidence supports each, "
     "but set is_india_specific=true only for the person whose title or scope is explicitly "
@@ -600,6 +612,21 @@ CROSS_SECTION_CONSISTENCY_RULE = (
     "identified', 'no named programmes found') that the structured arrays contradict."
 )
 
+SEARCH_DIRECTIVE_RULE = (
+    "SEARCH_DIRECTIVES: for each of up to 5 genuinely open questions, emit an object with "
+    "`question` (short, human-readable), `search_query` (a concrete string you would type "
+    "directly into a search engine to resolve it — not a restatement of the question, and "
+    "specific enough to plausibly return the missing fact: include the company name and the "
+    "precise missing detail, e.g. company name plus a named programme plus \"geography\" or "
+    "\"beneficiaries\", or company name plus \"CSR spend\" plus a fiscal year), `target_field` "
+    "(the dotted path into this JSON shape the answer would fill, e.g. \"spend.history\", "
+    "\"programmes[].geography\", \"decision_makers\", \"entity_structure.foundation_entity\" — "
+    "leave empty if no single field applies), and `priority` (HIGH/MEDIUM/LOW, reflecting how "
+    "much the missing fact would change the eventual scoring). Only include a question that is "
+    "genuinely unresolved in the evidence you were given — this list is a to-do list for a "
+    "second research pass, not a general commentary field."
+)
+
 
 def _extraction_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
     return f"""You are a meticulous fact-extraction analyst. Extract every concrete, sourced fact about {company}'s India CSR activity from the evidence below. Do NOT score or judge fit — that happens in a separate pass. Your only job here is complete, accurate, well-cited extraction.
@@ -642,6 +669,8 @@ SOURCES:
 
 {EVIDENCE_STYLE_RULE}
 
+{SEARCH_DIRECTIVE_RULE}
+
 {CROSS_SECTION_CONSISTENCY_RULE}
 
 {FIELD_ORDER_RULE}
@@ -661,7 +690,7 @@ Extract, matching the JSON shape's key order exactly:
 12. volunteering — named employee volunteering/payroll-giving touching education; default false/empty unless stated.
 13. group_foundation — CSR run via a separate parent/group foundation, only if explicitly named.
 14. key_facts_summary — 3-6 short bullet-style facts (as a single string, one per line prefixed with "- ") that most directly bear on education-CSR fit — this feeds directly into the scoring pass, so include anything that would move a fit judgment either up or down. Do not use this field as a dumping ground for a named programme or initiative that belongs in the programmes array instead.
-15. open_questions[] — up to 5 short, concrete, searchable items to verify.
+15. search_directives[] — apply the SEARCH_DIRECTIVES rule; up to 5 entries, each with question, search_query, target_field, priority.
 16. programmes[] — apply the PROGRAMME rule and the TAP_PRIORITY_RULE together: priority-area programmes (school education, STEM, AI, coding, digital skills, government schools) listed first and in full, then everything else briefly. Apply the delivery-channel/beneficiary specificity requirement and the chain-completeness fields to every entry.
 17. partners[] — apply the PARTNER rule, including similar_to_tap_profile, multi-year history, and named-format initiatives (DIBs, outcomes funds).
 18. decision_makers[] — apply the DECISION-MAKER source-of-truth order, currency test, three-check verification, and consistency sub-rule strictly; title, public_facing_score 0-100, tenure_status, is_india_specific, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence. Every people_search hit in the evidence that passes the currency test must appear here — see the people_search transcription note inside the DECISION-MAKER rule.
@@ -692,7 +721,7 @@ JSON shape:
   "volunteering": {{"present": <bool>, "programme_name": "<name or empty>", "description": "<short>", "source_excerpt": "<short, verbatim ok>"}},
   "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>", "source_excerpt": "<short, verbatim ok>"}},
   "key_facts_summary": "<3-6 lines, each starting with '- '>",
-  "open_questions": ["<short item>", "..."],
+  "search_directives": [{{"question": "<short item>", "search_query": "<concrete ready-to-run search query>", "target_field": "<dotted path or empty>", "priority": "<HIGH|MEDIUM|LOW>"}}],
   "programmes": [{{"name": "<exact name>", "what_is_funded": "<precise funded activity>", "beneficiary_group": "<named beneficiary group>", "beneficiary_type": "<SCHOOL_CHILDREN_CURRICULUM|ADULT|OTHER>", "description": "<short, must cover delivery channel + beneficiary + one-off-vs-ongoing per PROGRAMME rule>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "funded_by_entity": "<name from entity_structure or empty>", "chain_missing_elements": ["<subset of beneficiaries|geography|partner|government_school_involvement|scale_or_outcomes|funding_amount>"], "source_excerpt": "<short, verbatim ok>", "confidence": "<confirmed|probable>"}}],
   "partners": [{{"name": "<exact org name>", "relationship_type": "<funder|implementer|co-design|unclear>", "programme": "<or empty>", "year": "<or empty>", "geography": "<or empty>", "similar_to_tap_profile": <bool>, "funded_by_entity": "<name from entity_structure or empty>", "source_excerpt": "<short, verbatim ok, must show relationship language>", "confidence": "<confirmed|probable>"}}],
   "decision_makers": [{{"name": "<n>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "is_india_specific": <bool>, "source_excerpt": "<short, verbatim ok>", "linkedin_url": "<url or empty>"}}],
@@ -739,6 +768,8 @@ SOURCES:
 
 {HIGHLIGHT_RULE}
 
+{SEARCH_DIRECTIVE_RULE}
+
 {CROSS_SECTION_CONSISTENCY_RULE}
 
 Produce, in this order:
@@ -748,6 +779,7 @@ Produce, in this order:
 3. fit_rationale (2-4 sentences): justify the scoring from the extracted facts, stating plainly what's confirmed vs inferred vs undocumented. Never explain a low score by citing limited evidence — a criterion with limited evidence should be null, not low. If a named partner/programme suggests a plausible but unconfirmed entry path, you may add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme — never invent one not in the extracted facts. If decision_makers and/or partners/programmes are non-empty, end with one short sentence "Key contacts: A (Title), B (Title); Key partners: X, Y" using only names from the extracted facts — never write a sentence implying no contact or programme was found if either array is non-empty. Omit that closing sentence only if both lists are empty.
 4. overall_semantic_alignment (0-100) + alignment_rationale (1-2 sentences) — how well the company's actual activity matches the NGO mission semantically, independent of documentation completeness.
 5. strategic_insight — a 150-280 word standalone narrative (this is the lead summary shown to the user first, and should read as usable outreach material, not just an internal note): measured and evidence-grounded, leading with genuine strengths before caveats, stating plainly whether/why this is a good fit, naming strongest/weakest dimensions without dwelling on the weakest, flagging group-foundation routing if present, noting eligibility if uncertain, weaving in the CSR obligation signal above if present, and giving one concrete next step. Lead with priority-area programmes (school education, STEM, AI, coding, digital skills, government schools) over generic CSR themes when both exist in the extracted facts. When spend is discussed, lead with the education-specific figure/trend over the total CSR figure if both are available, and never state a trend word unless the spend series actually supports it (per TREND_RULE) — if only one year of spend is known, describe the single figure and do not claim a trend. When a specific programme or partner is TAP-relevant, name its delivery channel explicitly (in-school/curriculum vs adult/standalone vs digital, etc.) and state concretely how TAP's own model (AI-enabled WhatsApp delivery, government-school, curriculum-embedded electives) does or doesn't overlap with it — write this so a sentence could be lifted directly into an outreach email, rather than a generic theme match like "both work in education." If TAP-similar partners exist, mention that positively. {"Since this is a screen-mode pass, if the signal is promising but sourcing is thin, say plainly that a deep-research pass would surface more (spend figures, named partners, a decision-maker) rather than treating the gap as a weakness." if mode == "screen" else ""} End with the same "Key contacts: ...; Key partners: ..." sentence format as fit_rationale (only using names from the extracted facts, and never contradicting a non-empty decision_makers/partners/programmes list), omitted only if both lists are empty.
+6. unscored_criteria_search_directives[] — apply the SEARCH_DIRECTIVES rule, but populate this only for criteria you scored null above, with target_field set to that criterion's id. Never populate this for a criterion you actually scored — this is not a general commentary field, only a follow-up list tied directly to genuine null scores.
 
 All criteria ids appear exactly once, in the order listed, each with its name copied exactly as given above. Keep every string concise so the full reply fits comfortably in your output budget.
 
@@ -761,7 +793,8 @@ JSON shape:
   "fit_rationale": "<2-4 sentences, one **2-3 word** highlight, optional Inference/Key-contacts clauses>",
   "overall_semantic_alignment": <int 0-100>,
   "alignment_rationale": "<1-2 sentences, one **2-3 word** highlight>",
-  "strategic_insight": "<150-280 word narrative, one **2-3 word** highlight, optional Inference/Key-contacts clauses>"
+  "strategic_insight": "<150-280 word narrative, one **2-3 word** highlight, optional Inference/Key-contacts clauses>",
+  "unscored_criteria_search_directives": [{{"question": "<short item>", "search_query": "<concrete ready-to-run search query>", "target_field": "<criterion id>", "priority": "<HIGH|MEDIUM|LOW>"}}]
 }}"""
 
 
@@ -957,6 +990,13 @@ class CsrObligationSignalSchema(BaseModel):
     explanation: str = Field(default="", max_length=320)
 
 
+class SearchDirectiveSchema(BaseModel):
+    question: str = Field(default="", max_length=240)
+    search_query: str = Field(default="", max_length=300)
+    target_field: str = Field(default="", max_length=160)
+    priority: str = "MEDIUM"
+
+
 class FullAnalysisSchema(BaseModel):
     fit_score: int | None = Field(ge=0, le=100, default=None)
     research_coverage: int = Field(ge=0, le=100, default=0)
@@ -986,6 +1026,8 @@ class FullAnalysisSchema(BaseModel):
     source_quality_assessment: str = Field(default="", max_length=320)
     overall_authenticity_score: int = Field(ge=0, le=100, default=0)
     open_questions: list[str] = Field(default_factory=list)
+    search_directives: list[SearchDirectiveSchema] = Field(default_factory=list)
+    unscored_criteria_search_directives: list[SearchDirectiveSchema] = Field(default_factory=list)
     strategic_insight: str = Field(default="", max_length=2200)
     scoring_incomplete: bool = False
     csr_obligation_signal: CsrObligationSignalSchema = CsrObligationSignalSchema()
@@ -1290,10 +1332,16 @@ def _recover_partial_json(cleaned: str, required_key: str | None = None) -> dict
 _STRAY_MARKER = re.compile(r"\*{3,}")
 _DOUBLE_STAR = re.compile(r"\*\*")
 _LINKEDIN_PROFILE_URL = re.compile(r"^https?://([a-z]{2,3}\.)?linkedin\.com/in/[^/?#\s]+/?(?:[?#].*)?$", re.IGNORECASE)
-_FORMER_ROLE_LANGUAGE = re.compile(
-    r"\b(previously|formerly|former|ex-|past)\b|\b(19|20)\d{2}\s*[-–—]\s*(present|now|\d{4})\b",
-    re.IGNORECASE,
+_FORMER_ROLE_KEYWORD_PATTERN = re.compile(
+    r"\b(previously|formerly|former|ex-|past)\b", re.IGNORECASE,
 )
+_FORMER_ROLE_YEAR_RANGE_PATTERN = re.compile(
+    r"\b(19|20)\d{2}\s*[-–—]\s*(present|now|\d{4})\b", re.IGNORECASE,
+)
+_ROLE_INDICATOR_WORD_PATTERN = re.compile(
+    r"\b(role|position|served|was|as|title|designation)\b", re.IGNORECASE,
+)
+_FORMER_ROLE_PROXIMITY_WINDOW_CHARS = 50
 
 
 def _normalize_highlight_markers(text: str) -> str:
@@ -1310,11 +1358,43 @@ def _sanitize_linkedin_url(url: str) -> str:
     return cleaned if _LINKEDIN_PROFILE_URL.match(cleaned) else ""
 
 
+def _former_role_language_near_role_context(text: str) -> str:
+    if not text:
+        return ""
+    for match in _FORMER_ROLE_KEYWORD_PATTERN.finditer(text):
+        window_start = max(0, match.start() - _FORMER_ROLE_PROXIMITY_WINDOW_CHARS)
+        window_end = min(len(text), match.end() + _FORMER_ROLE_PROXIMITY_WINDOW_CHARS)
+        window = text[window_start:window_end]
+        if _ROLE_INDICATOR_WORD_PATTERN.search(window):
+            return match.group(0)
+    for match in _FORMER_ROLE_YEAR_RANGE_PATTERN.finditer(text):
+        window_start = max(0, match.start() - _FORMER_ROLE_PROXIMITY_WINDOW_CHARS)
+        window_end = min(len(text), match.end() + _FORMER_ROLE_PROXIMITY_WINDOW_CHARS)
+        window = text[window_start:window_end]
+        if _ROLE_INDICATOR_WORD_PATTERN.search(window):
+            return match.group(0)
+    return ""
+
+
+def _looks_like_former_role_with_match(title: str = "", tenure_evidence: str = "",
+                                        source_excerpt: str = "") -> tuple[bool, str, str]:
+    if title:
+        match = _FORMER_ROLE_KEYWORD_PATTERN.search(title) or _FORMER_ROLE_YEAR_RANGE_PATTERN.search(title)
+        if match:
+            return True, match.group(0), "title"
+    for field_name, text in (("tenure_evidence", tenure_evidence), ("source_excerpt", source_excerpt)):
+        matched = _former_role_language_near_role_context(text)
+        if matched:
+            return True, matched, field_name
+    return False, "", ""
+
+
 def _looks_like_former_role(*texts: str) -> bool:
-    combined = " ".join(t for t in texts if t)
-    if not combined:
-        return False
-    return bool(_FORMER_ROLE_LANGUAGE.search(combined))
+    title = texts[0] if len(texts) > 0 else ""
+    tenure_evidence = texts[1] if len(texts) > 1 else ""
+    source_excerpt = texts[2] if len(texts) > 2 else ""
+    matched, _, _ = _looks_like_former_role_with_match(title, tenure_evidence, source_excerpt)
+    return matched
 
 
 _NARRATIVE_CSR_TITLE_PATTERN = re.compile(
@@ -1518,6 +1598,51 @@ def _sanitize_chain_missing_elements(values) -> list[str]:
             if value.strip() not in cleaned:
                 cleaned.append(value.strip())
     return cleaned
+
+
+def _normalize_search_directive_priority(value: str) -> str:
+    normalized = (value or "").strip().upper()
+    return normalized if normalized in SEARCH_DIRECTIVE_PRIORITIES else "MEDIUM"
+
+
+def _build_auto_search_query(company: str, question: str) -> str:
+    question = (question or "").strip()
+    if not question:
+        return ""
+    return f'"{company}" {question}'.strip()
+
+
+def _sanitize_search_directives(company: str, raw_value, cap: int = MAX_SEARCH_DIRECTIVES) -> list[dict]:
+    if not isinstance(raw_value, list):
+        return []
+    directives = []
+    for entry in raw_value:
+        if isinstance(entry, str):
+            question = entry.strip()
+            if not question:
+                continue
+            directives.append({
+                "question": question[:240],
+                "search_query": _build_auto_search_query(company, question)[:300],
+                "target_field": "",
+                "priority": "MEDIUM",
+            })
+        elif isinstance(entry, dict):
+            question = str(entry.get("question", "")).strip()
+            search_query = str(entry.get("search_query", "")).strip()
+            if not question and not search_query:
+                continue
+            if not search_query:
+                search_query = _build_auto_search_query(company, question)
+            directives.append({
+                "question": question[:240],
+                "search_query": search_query[:300],
+                "target_field": str(entry.get("target_field", "")).strip()[:160],
+                "priority": _normalize_search_directive_priority(entry.get("priority", "")),
+            })
+        if len(directives) >= cap:
+            break
+    return directives
 
 
 def _scored_criteria(criteria: list[dict]) -> list[dict]:
@@ -1763,7 +1888,7 @@ def _merge_verified_people_hits_into_extraction(extraction: dict, cleaned_source
         key = _decision_maker_name_key(name)
         if not key or key in existing_keys:
             continue
-        if _looks_like_former_role(hit.get("title", ""), hit.get("snippet", "")):
+        if _looks_like_former_role(hit.get("title", ""), "", hit.get("snippet", "")):
             continue
         existing.append({
             "name": name,
@@ -1819,13 +1944,15 @@ def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
         raw_people = [p for p in parsed["decision_makers"] if isinstance(p, dict)]
         kept = []
         for sanitized_entry, raw_entry in zip(sanitized["decision_makers"], raw_people):
-            if _looks_like_former_role(
+            matched, matched_text, matched_field = _looks_like_former_role_with_match(
                 raw_entry.get("title", ""), raw_entry.get("tenure_evidence", ""),
                 raw_entry.get("source_excerpt", ""),
-            ):
+            )
+            if matched:
                 logger.info(
-                    "_repair_extraction dropped former-role decision maker caller=%s name=%r",
-                    caller, raw_entry.get("name", ""),
+                    "_repair_extraction dropped former-role decision maker caller=%s name=%r "
+                    "matched_text=%r matched_field=%s",
+                    caller, raw_entry.get("name", ""), matched_text, matched_field,
                 )
                 continue
             kept.append(sanitized_entry)
@@ -1844,10 +1971,18 @@ def _repair_extraction(parsed: dict, caller: str = "unknown") -> dict:
     if isinstance(sanitized.get("eligibility"), dict):
         sanitized["eligibility"] = _apply_derived_profit_trend(sanitized["eligibility"])
 
+    company_for_directives = str(parsed.get("_company_hint", "") or "")
     sanitized["key_facts_summary"] = str(parsed.get("key_facts_summary", "") or "")[:1500]
+    sanitized["search_directives"] = _sanitize_search_directives(
+        company_for_directives, parsed.get("search_directives"), cap=MAX_SEARCH_DIRECTIVES,
+    )
+    if not sanitized["search_directives"] and isinstance(parsed.get("open_questions"), list):
+        sanitized["search_directives"] = _sanitize_search_directives(
+            company_for_directives, parsed.get("open_questions"), cap=MAX_SEARCH_DIRECTIVES,
+        )
     sanitized["open_questions"] = [
-        str(q).strip()[:200] for q in (parsed.get("open_questions") or []) if q and str(q).strip()
-    ][:5]
+        d["question"] for d in sanitized["search_directives"] if d.get("question")
+    ][:MAX_SEARCH_DIRECTIVES]
     return sanitized
 
 
@@ -1873,11 +2008,13 @@ def build_extraction_only_result(extraction: dict, mode: str) -> dict:
     merged["alignment_rationale"] = ""
     merged["strategic_insight"] = LLM_SCORING_UNAVAILABLE_NOTE
     merged["scoring_incomplete"] = True
+    merged["unscored_criteria_search_directives"] = []
 
     validated = _repair_analysis(merged)
     result = validated.model_dump()
     result["scoring_incomplete"] = True
-    result["open_questions"] = [q.strip()[:200] for q in extraction.get("open_questions", []) if q and q.strip()][:5]
+    result["open_questions"] = [q.strip()[:200] for q in extraction.get("open_questions", []) if q and q.strip()][:MAX_SEARCH_DIRECTIVES]
+    result["search_directives"] = extraction.get("search_directives", [])
     result["research_confidence_label"] = "Insufficient"
 
     logger.warning(
@@ -1893,7 +2030,12 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
     parsed = dict(parsed) if isinstance(parsed, dict) else {}
     original_programmes = parsed.get("programmes") if isinstance(parsed.get("programmes"), list) else []
     original_decision_makers = parsed.get("decision_makers") if isinstance(parsed.get("decision_makers"), list) else []
+    company_for_directives = str(parsed.get("_company_hint", "") or "")
+    raw_unscored_directives = parsed.get("unscored_criteria_search_directives")
     parsed = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
+    parsed["unscored_criteria_search_directives"] = _sanitize_search_directives(
+        company_for_directives, raw_unscored_directives, cap=MAX_SEARCH_DIRECTIVES,
+    )
 
     if isinstance(parsed.get("programmes"), list):
         raw_by_index = [p for p in original_programmes if isinstance(p, dict)]
@@ -1907,11 +2049,16 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
         raw_people = [p for p in original_decision_makers if isinstance(p, dict)]
         kept = []
         for sanitized_entry, raw_entry in zip(parsed["decision_makers"], raw_people):
-            if _looks_like_former_role(
+            matched, matched_text, matched_field = _looks_like_former_role_with_match(
                 raw_entry.get("title", ""), raw_entry.get("tenure_evidence", ""),
                 raw_entry.get("source_excerpt", ""),
-            ):
-                logger.info("_repair_analysis dropped former-role decision maker name=%r", raw_entry.get("name", ""))
+            )
+            if matched:
+                logger.info(
+                    "_repair_analysis dropped former-role decision maker name=%r "
+                    "matched_text=%r matched_field=%s",
+                    raw_entry.get("name", ""), matched_text, matched_field,
+                )
                 continue
             kept.append(sanitized_entry)
         parsed["decision_makers"] = kept
@@ -1957,6 +2104,12 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
     parsed["criteria"] = [ordered[cid] for cid in CRITERIA_IDS]
     parsed["research_coverage"] = compute_research_coverage(parsed["criteria"])
 
+    null_scored_ids = {c["id"] for c in parsed["criteria"] if c.get("score") is None}
+    parsed["unscored_criteria_search_directives"] = [
+        d for d in parsed["unscored_criteria_search_directives"]
+        if d.get("target_field") in null_scored_ids
+    ]
+
     for field_name in ("fit_rationale", "alignment_rationale", "delivery_model_evidence",
                        "csr_head_note", "evidence_recency", "source_quality_assessment",
                        "strategic_insight"):
@@ -1979,7 +2132,8 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
             ("board_affinity", {}), ("volunteering", {}), ("group_foundation", {}),
             ("eligibility", {}), ("sector", {}),
             ("programmes", []), ("partners", []), ("decision_makers", []), ("geographies", []),
-            ("red_flags", []), ("open_questions", []),
+            ("red_flags", []), ("open_questions", []), ("search_directives", []),
+            ("unscored_criteria_search_directives", []),
         ):
             current = parsed.get(container_field)
             expected_type = list if isinstance(default, list) else dict
@@ -2025,7 +2179,8 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
             for list_field, schema in (
                 ("programmes", ProgrammeSchema), ("partners", PartnerSchema),
                 ("decision_makers", DecisionMakerSchema), ("geographies", GeographySchema),
-                ("red_flags", RedFlagSchema),
+                ("red_flags", RedFlagSchema), ("search_directives", SearchDirectiveSchema),
+                ("unscored_criteria_search_directives", SearchDirectiveSchema),
             ):
                 candidates = parsed.get(list_field)
                 kept = []
@@ -2154,6 +2309,7 @@ async def extract_company_facts(
         logger.error("extract_company_facts empty parse company=%r", company)
         return None
 
+    parsed["_company_hint"] = company
     extraction = _repair_extraction(parsed, caller=f"extract_facts:{company}")
     extraction = reconcile_extraction(extraction, working_sources)
     extraction = _merge_verified_people_hits_into_extraction(extraction, working_sources, caller=f"extract_facts:{company}")
@@ -2195,11 +2351,12 @@ async def extract_company_facts(
 
     logger.info(
         "extract_company_facts DONE company=%r authenticity=%d partners=%d programmes=%d decision_makers=%d red_flags=%d "
-        "spend_history_years=%d geographies=%d entity_structure=%r",
+        "spend_history_years=%d geographies=%d entity_structure=%r search_directives=%d",
         company, extraction.get("overall_authenticity_score", 0), len(extraction.get("partners", [])),
         len(extraction.get("programmes", [])), len(extraction.get("decision_makers", [])),
         len(extraction.get("red_flags", [])), len((extraction.get("spend") or {}).get("history", []) or []),
         len(extraction.get("geographies", [])), extraction.get("entity_structure", {}),
+        len(extraction.get("search_directives", [])),
     )
     logger.info(
         "extract_company_facts FULL DUMP company=%r csr_head_note=%r delivery_model=%r sector=%r "
@@ -2234,6 +2391,13 @@ async def extract_company_facts(
             "extract_company_facts RED_FLAG company=%r flag=%r severity=%r explanation=%r",
             company, flag.get("flag"), flag.get("severity"), flag.get("explanation"),
         )
+    for directive in extraction.get("search_directives", []) or []:
+        logger.info(
+            "extract_company_facts SEARCH_DIRECTIVE company=%r question=%r search_query=%r "
+            "target_field=%r priority=%r",
+            company, directive.get("question"), directive.get("search_query"),
+            directive.get("target_field"), directive.get("priority"),
+        )
     return extraction
 
 
@@ -2248,8 +2412,9 @@ async def score_extracted_facts(
 ) -> dict | None:
     scoring_facts = {
         k: v for k, v in extraction.items()
-        if k not in ("open_questions", "key_facts_summary", "overall_authenticity_score",
-                      "evidence_recency", "source_quality_assessment", "csr_head_note")
+        if k not in ("open_questions", "search_directives", "key_facts_summary",
+                      "overall_authenticity_score", "evidence_recency",
+                      "source_quality_assessment", "csr_head_note")
     }
     prompt = _scoring_prompt(company, mission, mode, scoring_facts, sources_manifest, csr_obligation=csr_obligation)
     prompt_tokens = estimate_tokens(prompt)
@@ -2285,15 +2450,28 @@ async def score_extracted_facts(
         logger.error("score_extracted_facts empty parse company=%r", company)
         return None
 
+    parsed["_company_hint"] = company
+    parsed["unscored_criteria_search_directives"] = _sanitize_search_directives(
+        company, parsed.get("unscored_criteria_search_directives"), cap=MAX_SEARCH_DIRECTIVES,
+    )
+
     logger.info(
-        "score_extracted_facts DONE company=%r criteria_count=%d",
+        "score_extracted_facts DONE company=%r criteria_count=%d unscored_search_directives=%d",
         company, len(parsed.get("criteria", []) or []),
+        len(parsed.get("unscored_criteria_search_directives", []) or []),
     )
     for criterion in parsed.get("criteria", []) or []:
         logger.info(
             "score_extracted_facts CRITERION company=%r id=%r score=%r confidence=%r evidence=%r",
             company, criterion.get("id"), criterion.get("score"),
             criterion.get("confidence"), criterion.get("evidence"),
+        )
+    for directive in parsed.get("unscored_criteria_search_directives", []) or []:
+        logger.info(
+            "score_extracted_facts UNSCORED_SEARCH_DIRECTIVE company=%r question=%r search_query=%r "
+            "target_field=%r priority=%r",
+            company, directive.get("question"), directive.get("search_query"),
+            directive.get("target_field"), directive.get("priority"),
         )
     logger.info(
         "score_extracted_facts NARRATIVE company=%r fit_rationale=%r alignment_rationale=%r "
@@ -2340,7 +2518,9 @@ async def analyze_and_score_company(
     merged["overall_semantic_alignment"] = scoring.get("overall_semantic_alignment", 0)
     merged["alignment_rationale"] = scoring.get("alignment_rationale", "")
     merged["strategic_insight"] = scoring.get("strategic_insight", "")
+    merged["unscored_criteria_search_directives"] = scoring.get("unscored_criteria_search_directives", [])
     merged["scoring_incomplete"] = False
+    merged["_company_hint"] = company
 
     validated = _repair_analysis(merged)
     result = validated.model_dump()
@@ -2392,17 +2572,20 @@ async def analyze_and_score_company(
     if not result.get("strategic_insight", "").strip():
         result["strategic_insight"] = result.get("fit_rationale", "") or LLM_UNAVAILABLE_EVIDENCE
 
-    result["open_questions"] = [q.strip()[:200] for q in extraction.get("open_questions", []) if q and q.strip()][:5]
+    result["open_questions"] = [q.strip()[:200] for q in extraction.get("open_questions", []) if q and q.strip()][:MAX_SEARCH_DIRECTIVES]
+    result["search_directives"] = extraction.get("search_directives", [])
 
     logger.info(
         "analyze_and_score_company DONE company=%r mode=%s final_fit_score=%s research_coverage=%d "
         "authenticity=%d avg_criteria_confidence=%.1f weighted_criteria_confidence=%.1f coverage_insufficient=%s "
-        "coverage_reason=%r research_confidence=%s partners=%d programmes=%d decision_makers=%d",
+        "coverage_reason=%r research_confidence=%s partners=%d programmes=%d decision_makers=%d "
+        "unscored_search_directives=%d",
         company, mode, result["fit_score"], result["research_coverage"], result["overall_authenticity_score"],
         result["average_criteria_confidence_pct"], result["weighted_criteria_confidence_pct"],
         result["evidence_coverage_insufficient"], result["evidence_coverage_reason"],
         result["research_confidence_label"],
         len(result["partners"]), len(result["programmes"]), len(result["decision_makers"]),
+        len(result.get("unscored_criteria_search_directives", [])),
     )
     logger.info(
         "analyze_and_score_company criteria breakdown company=%r %s",

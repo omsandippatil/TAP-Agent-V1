@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     config_yaml_path: str = "config.yaml"
     verbose_pipeline_logging: bool = True
     llm_dump_dir: str = "/tmp/fundfinder_llm_dumps"
+    enable_directed_search: bool = True
+    max_directed_search_queries_screen: int = 4
+    max_directed_search_queries_deep: int = 8
+    directed_search_medium_priority_enabled: bool = True
 
     class Config:
         env_file = ".env"

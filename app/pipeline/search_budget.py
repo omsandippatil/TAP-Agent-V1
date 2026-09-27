@@ -5,7 +5,7 @@ logger = logging.getLogger("tap.search_budget")
 DEFAULT_MAX_GOOGLE_QUERIES = 34
 
 CATEGORY_FLOORS_DEFAULT = {
-    "csr_page": 2,
+    "csr_page": 4,
     "annual_report": 2,
     "partner_search": 2,
     "education_programme_search": 3,
@@ -40,14 +40,18 @@ class SearchBudget:
     def __init__(self, company: str, max_google_queries: int = DEFAULT_MAX_GOOGLE_QUERIES,
                  category_floors: dict[str, int] | None = None,
                  category_success_target: dict[str, int] | None = None,
-                 max_empty_streak: int = DEFAULT_MAX_EMPTY_STREAK):
+                 max_empty_streak: int = DEFAULT_MAX_EMPTY_STREAK,
+                 mode: str = "deep"):
         self.company = company
+        self.mode = mode
         self.max_google_queries = max_google_queries
         self.category_floors = dict(category_floors) if category_floors is not None else dict(CATEGORY_FLOORS_DEFAULT)
         self.category_success_target = (
             dict(category_success_target) if category_success_target is not None
             else dict(CATEGORY_SUCCESS_TARGET_DEFAULT)
         )
+        if mode == "screen":
+            self.category_success_target["education_programme_search"] = 1
         self.max_empty_streak = max_empty_streak
         self.google_queries_used = 0
         self.category_used: dict[str, int] = {}
@@ -61,6 +65,7 @@ class SearchBudget:
         self.resolved_domains: list[str] = []
         self.dead_domains: set[str] = set()
         self.dead_paths: set[str] = set()
+        self.guessed_path_miss_count: dict[str, int] = {}
 
     def set_resolved_domains(self, domains: list[str]):
         merged = list(dict.fromkeys([*self.resolved_domains, *(d for d in (domains or []) if d)]))
@@ -78,6 +83,13 @@ class SearchBudget:
             return True
         return False
 
+    def _other_reserved_remaining(self, exclude_category: str = "") -> int:
+        return sum(
+            max(0, cat_floor - self.category_used.get(cat, 0))
+            for cat, cat_floor in self.category_floors.items()
+            if cat != exclude_category and not self.category_is_satisfied(cat)
+        )
+
     def google_has_budget(self, category: str = "") -> bool:
         if self.google_queries_used >= self.max_google_queries:
             return False
@@ -87,13 +99,15 @@ class SearchBudget:
         floor = self.category_floors.get(category, 0)
         if floor and used_in_category < floor:
             return True
-        other_reserved_remaining = sum(
-            max(0, cat_floor - self.category_used.get(cat, 0))
-            for cat, cat_floor in self.category_floors.items()
-            if cat != category and not self.category_is_satisfied(cat)
-        )
+        other_reserved_remaining = self._other_reserved_remaining(exclude_category=category)
         effective_ceiling = self.max_google_queries - other_reserved_remaining
         return self.google_queries_used < effective_ceiling
+
+    def has_room_for_directed_search(self) -> bool:
+        for category, floor in self.category_floors.items():
+            if floor and self.category_used.get(category, 0) < floor and not self.category_is_satisfied(category):
+                return False
+        return True
 
     def record_google_query(self, category: str = ""):
         self.google_queries_used += 1
@@ -149,6 +163,12 @@ class SearchBudget:
 
     def is_path_dead(self, url: str) -> bool:
         return url in self.dead_paths
+
+    def record_guessed_path_miss(self, host: str) -> int:
+        if not host:
+            return 0
+        self.guessed_path_miss_count[host] = self.guessed_path_miss_count.get(host, 0) + 1
+        return self.guessed_path_miss_count[host]
 
     def summary(self) -> dict:
         return {

@@ -56,7 +56,7 @@ ENGLISH_COMMON_WORD_TOKENS = {
 MIN_RELIABLE_TOKEN_LENGTH = 5
 
 
-def is_generic_company_name(company: str) -> bool:
+def is_unreliable_for_blind_guessing(company: str) -> bool:
     tokens = company_name_tokens(company)
     if not tokens:
         return True
@@ -64,6 +64,9 @@ def is_generic_company_name(company: str) -> bool:
         token in ENGLISH_COMMON_WORD_TOKENS or len(token) < MIN_RELIABLE_TOKEN_LENGTH
         for token in tokens
     )
+
+
+is_generic_company_name = is_unreliable_for_blind_guessing
 
 AGGREGATOR_DOMAINS = (
     "youtube.", "twitter.", "x.com", "facebook.", "instagram.", "linkedin.",
@@ -132,6 +135,12 @@ CSR_PAGE_PATHS = [
     "/csr", "/corporate-social-responsibility", "/sustainability",
     "/social-responsibility", "/esg", "/about/csr", "/about-us/csr",
     "/company/csr", "/social-impact", "/community", "/impact",
+]
+
+CSR_PAGE_PATHS_LOCALE_PREFIXED = [
+    "/india/en/india/esg", "/india/en/csr", "/india/en/esg",
+    "/in/en/csr", "/en-in/csr", "/en/india/csr", "/global/india/csr",
+    "/india/en/csr", "/india/en/esg", "/in/en/csr", "/in/en/esg",
 ]
 
 CSR_KEYWORDS = [
@@ -441,6 +450,12 @@ MAX_PROGRAMME_SOURCES_SCREEN = 4
 MAX_PARTNER_FOLLOWUP_NAMES = 3
 MAX_PROGRAMME_DEEP_DIVE_NAMES = 3
 
+MAX_GUESSED_PATH_ATTEMPTS_PER_DOMAIN = 8
+DOMAIN_MISS_ESCALATION_THRESHOLD = 7
+DOMAIN_KILLING_ERROR_TYPES = {"dns", "ssl", "connection_error"}
+
+MAX_TEASER_NGO_FOLLOWUP_QUERIES = 2
+
 _FETCH_SEMAPHORE = asyncio.Semaphore(CONCURRENT_FETCH_LIMIT)
 
 _ENTITY_PROXIMITY_WINDOW_CHARS = 60
@@ -448,6 +463,11 @@ _ENTITY_PROXIMITY_WINDOW_CHARS = 60
 _PARTNER_RELEVANCE_KEYWORD_PATTERN = re.compile(
     r"\b(partner|partnered|partnership|ngo|foundation|mou|memorandum|collaborat|"
     r"implement|grant|csr|development impact bond|dib|outcomes fund)\b", re.IGNORECASE,
+)
+
+QUANTIFIED_BENEFICIARY_PATTERN = re.compile(
+    r"\b([\d][\d,]{2,})\s*\+?\s*(students|beneficiaries|children|individuals|lives)\b",
+    re.IGNORECASE,
 )
 
 
@@ -575,6 +595,12 @@ _BUSINESS_CONTEXT_WORD_PATTERN = re.compile(
 
 _GENERIC_NAME_CONTEXT_WINDOW_CHARS = 250
 
+_SEARCH_DERIVED_BUSINESS_CONTEXT_PATTERN = re.compile(
+    r"\b(official|csr|corporate|\.com|website|india\s+\w+|sustainability|foundation|"
+    r"annual report|company|subsidiary|headquarter)\b",
+    re.IGNORECASE,
+)
+
 
 def _mentions_generic_company_name(company: str, text: str) -> bool:
     exact_case_positions = [m.start() for m in re.finditer(re.escape(company), text)]
@@ -590,10 +616,24 @@ def _mentions_generic_company_name(company: str, text: str) -> bool:
     )
 
 
+def is_search_derived_domain_trustworthy(company: str, host: str, search_result_title: str,
+                                          search_result_body: str) -> bool:
+    haystack = f"{search_result_title} {search_result_body}"
+    lowered_haystack = haystack.lower()
+    lowered_host = (host or "").lower()
+    tokens = company_name_tokens(company)
+    if not tokens:
+        return False
+    token_hit = any(token in lowered_host or token in lowered_haystack for token in tokens)
+    if not token_hit:
+        return False
+    return bool(_SEARCH_DERIVED_BUSINESS_CONTEXT_PATTERN.search(haystack))
+
+
 def mentions_company(company: str, text: str) -> bool:
     if not text:
         return False
-    if is_generic_company_name(company):
+    if is_unreliable_for_blind_guessing(company):
         return _mentions_generic_company_name(company, text)
     lowered = text.lower()
     tokens = company_name_tokens(company)
@@ -605,7 +645,7 @@ def mentions_company(company: str, text: str) -> bool:
 def mentions_company_specifically(company: str, text: str) -> bool:
     if not text:
         return False
-    if is_generic_company_name(company):
+    if is_unreliable_for_blind_guessing(company):
         return _mentions_generic_company_name(company, text)
     tokens = company_name_tokens(company)
     if len(tokens) < 2:
@@ -711,6 +751,17 @@ def related_entity_names(related_entities: list[dict]) -> list[str]:
 
 
 def candidate_domains(company: str) -> list[str]:
+    if is_unreliable_for_blind_guessing(company):
+        _vlog(
+            logging.INFO,
+            "candidate_domains: skipping brute-force domain guessing for generic/ambiguous "
+            "company=%r — domain discovery continues via search-derived discovery "
+            "(discover_company_domains) and the CSR_PAGE_QUERIES search-query fallback; "
+            "this is a deferral to a still-active path, not a dead end",
+            company,
+        )
+        return []
+
     tokens = company_name_tokens(company) or [re.sub(r"[^a-z0-9]", "", company.lower())]
     slugs = list(dict.fromkeys(["".join(tokens), tokens[0]]))
     ordered = []
@@ -735,7 +786,7 @@ def url_belongs_to_company(company: str, url: str, known_domains: list[str] | No
         return True
     if known_domains and any(host == d or host.endswith("." + d) for d in known_domains):
         return True
-    if is_generic_company_name(company):
+    if is_unreliable_for_blind_guessing(company):
         return False
     tokens = company_name_tokens(company)
     if not tokens:
@@ -877,9 +928,15 @@ def _fetch_page_text_sync(url: str, max_chars: int, verify_ssl: bool) -> tuple[s
 
 
 async def fetch_page_text(url: str, max_chars: int = MAX_PAGE_TEXT_CHARS, verify_ssl: bool = True) -> str:
+    text, _ = await fetch_page_text_with_error(url, max_chars, verify_ssl)
+    return text
+
+
+async def fetch_page_text_with_error(url: str, max_chars: int = MAX_PAGE_TEXT_CHARS,
+                                      verify_ssl: bool = True) -> tuple[str, str]:
     async with _FETCH_SEMAPHORE:
         try:
-            text, _error_type = await asyncio.wait_for(
+            text, error_type = await asyncio.wait_for(
                 asyncio.to_thread(_fetch_page_text_sync, url, max_chars, verify_ssl),
                 timeout=FETCH_TASK_TIMEOUT_SECONDS,
             )
@@ -888,10 +945,10 @@ async def fetch_page_text(url: str, max_chars: int = MAX_PAGE_TEXT_CHARS, verify
                 "fetch_page_text DONE url=%s chars=%d preview=%r",
                 url, len(text or ""), (text or "")[:200].replace("\n", " "),
             )
-            return text
+            return text, error_type
         except asyncio.TimeoutError:
             logger.info("fetch_page_text timed out url=%s", url)
-            return ""
+            return "", "timeout"
 
 
 def _select_financial_pdf_pages(pdf, max_pages: int, max_scan: int) -> list[int]:
@@ -1021,9 +1078,15 @@ def _fetch_pdf_text_sync(url: str, max_chars: int, max_pages: int) -> tuple[str,
 
 
 async def fetch_pdf_text(url: str, max_chars: int = MAX_PDF_TEXT_CHARS, max_pages: int = MAX_PDF_PAGES) -> str:
+    text, _ = await fetch_pdf_text_with_error(url, max_chars, max_pages)
+    return text
+
+
+async def fetch_pdf_text_with_error(url: str, max_chars: int = MAX_PDF_TEXT_CHARS,
+                                     max_pages: int = MAX_PDF_PAGES) -> tuple[str, str]:
     async with _FETCH_SEMAPHORE:
         try:
-            text, _error_type = await asyncio.wait_for(
+            text, error_type = await asyncio.wait_for(
                 asyncio.to_thread(_fetch_pdf_text_sync, url, max_chars, max_pages),
                 timeout=FETCH_TASK_TIMEOUT_SECONDS,
             )
@@ -1032,10 +1095,10 @@ async def fetch_pdf_text(url: str, max_chars: int = MAX_PDF_TEXT_CHARS, max_page
                 "fetch_pdf_text DONE url=%s chars=%d preview=%r",
                 url, len(text or ""), (text or "")[:200].replace("\n", " "),
             )
-            return text
+            return text, error_type
         except asyncio.TimeoutError:
             logger.info("fetch_pdf_text timed out url=%s", url)
-            return ""
+            return "", "timeout"
 
 
 def csr_links_from_html(base_url: str, html: str, limit: int = 10) -> list[str]:
@@ -1152,14 +1215,21 @@ async def discover_company_domains(company: str, search_cfg: dict, budget: Searc
     )
     for result in results:
         host = urlparse(result.get("href", "")).netloc.lower()
+        title = result.get("title", "")
+        body = result.get("body", "")
         if not host or any(domain in host for domain in AGGREGATOR_DOMAINS):
             continue
         if NEGATIVE_LINK_PATTERN.search(host):
             continue
-        host_base = host.replace("www.", "").split(".")[0]
-        if any(token in host for token in tokens) or (acronym and host_base == acronym):
-            if host not in matched_domains:
-                matched_domains.append(host)
+        trustworthy = is_search_derived_domain_trustworthy(company, host, title, body)
+        _vlog(
+            logging.INFO,
+            "discover_company_domains host=%s check=search_derived (blind-guess check never "
+            "applied on this path) trustworthy=%s",
+            host, trustworthy,
+        )
+        if trustworthy and host not in matched_domains:
+            matched_domains.append(host)
 
     resolved = matched_domains[:4]
     budget.set_resolved_domains(resolved)
@@ -1252,13 +1322,6 @@ async def _recover_via_secondary_search(company: str, budget: SearchBudget, quot
 async def _recover_from_unreadable_document(company: str, budget: SearchBudget, quota_guard, deadline: float,
                                              category: str, seed_names: list[str] | None = None,
                                              min_len: int = UNREADABLE_TEXT_LENGTH_FLOOR) -> tuple[str, str] | None:
-    """A document belonging to the company was found (a real URL, confirmed by
-    title/snippet) but its text could not be extracted or extraction returned
-    too little to use. Instead of giving up, chase the topic the document was
-    about: named entities pulled from whatever snippet text is available,
-    then a broadening set of generic recovery queries. Returns the first
-    (url, text) pair that clears the relevance bar, or None.
-    """
     for name in (seed_names or [])[:MAX_PARTNER_FOLLOWUP_NAMES]:
         if not await _within_deadline(deadline):
             return None
@@ -1281,6 +1344,78 @@ async def _recover_from_unreadable_document(company: str, budget: SearchBudget, 
     return await _recover_via_secondary_search(
         company, budget, quota_guard, deadline, category, UNREADABLE_DOC_RECOVERY_QUERIES, min_len=min_len,
     )
+
+
+def spawn_teaser_ngo_followup_queries(company: str, text: str) -> list[str]:
+    names = _extract_named_partner_candidates(company, text)
+    return [f'"{name}" "{company}" partnership India' for name in names]
+
+
+def spawn_quantified_benefit_followup_query(company: str, text: str) -> str:
+    if not text:
+        return ""
+    match = QUANTIFIED_BENEFICIARY_PATTERN.search(text)
+    if not match:
+        return ""
+    number = match.group(1)
+    return f'"{company}" "{number}" students OR beneficiaries CSR India'
+
+
+async def _run_teaser_and_benefit_followups(company: str, text: str, budget: SearchBudget, quota_guard,
+                                             deadline: float, registry: SourceRegistry | None,
+                                             parent_source_name: str) -> None:
+    teaser_queries = spawn_teaser_ngo_followup_queries(company, text)[:MAX_TEASER_NGO_FOLLOWUP_QUERIES]
+    queries_used = 0
+
+    for query in teaser_queries:
+        if not await _within_deadline(deadline):
+            return
+        results = await search_web(query, budget, max_results=4, quota_guard=quota_guard, category="csr_page")
+        queries_used += 1
+        for result in results:
+            url = result.get("href", "")
+            title = result.get("title", "")
+            body = result.get("body", "")
+            if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
+                continue
+            if not mentions_company(company, f"{title} {body}"):
+                continue
+            fetched_text = await (
+                fetch_pdf_text(url) if url.lower().endswith(".pdf") else fetch_page_text(url)
+            ) or body
+            if fetched_text and len(fetched_text) > 200 and is_csr_relevant(fetched_text) and mentions_company(company, fetched_text):
+                if registry is not None:
+                    registry.register_child_hit(
+                        source_name=parent_source_name, url=url,
+                        label="NGO teaser follow-up", excerpt=fetched_text[:200],
+                    )
+                break
+
+    if queries_used >= MAX_TEASER_NGO_FOLLOWUP_QUERIES or not await _within_deadline(deadline):
+        return
+
+    benefit_query = spawn_quantified_benefit_followup_query(company, text)
+    if not benefit_query:
+        return
+    results = await search_web(benefit_query, budget, max_results=4, quota_guard=quota_guard, category="csr_page")
+    for result in results:
+        url = result.get("href", "")
+        title = result.get("title", "")
+        body = result.get("body", "")
+        if not url or any(domain in url for domain in AGGREGATOR_DOMAINS):
+            continue
+        if not mentions_company(company, f"{title} {body}"):
+            continue
+        fetched_text = await (
+            fetch_pdf_text(url) if url.lower().endswith(".pdf") else fetch_page_text(url)
+        ) or body
+        if fetched_text and len(fetched_text) > 200 and is_csr_relevant(fetched_text) and mentions_company(company, fetched_text):
+            if registry is not None:
+                registry.register_child_hit(
+                    source_name=parent_source_name, url=url,
+                    label="Quantified beneficiary follow-up", excerpt=fetched_text[:200],
+                )
+            break
 
 
 async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBudget, quota_guard=None,
@@ -1339,24 +1474,36 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                 weak_snippet_fallback[0] = (score, source)
 
     domain_miss_streak: dict[str, int] = {}
-    DOMAIN_MISS_ESCALATION_THRESHOLD = 4
 
-    async def try_fetch(url: str, method: str, is_pdf: bool = False):
+    async def try_fetch(url: str, method: str, is_pdf: bool = False, is_guessed_path: bool = False):
         if not url or url in tried_urls or remaining_budget[0] <= 0 or not await _within_deadline(deadline):
             return
         host = urlparse(url).netloc.lower()
         if budget.is_domain_dead(host) or budget.is_path_dead(url):
             return
+        if is_guessed_path and budget.guessed_path_miss_count.get(host, 0) >= MAX_GUESSED_PATH_ATTEMPTS_PER_DOMAIN:
+            return
         tried_urls.add(url)
         remaining_budget[0] -= 1
-        text = await (fetch_pdf_text(url) if is_pdf else fetch_page_text(url))
+        text, error_type = await (
+            fetch_pdf_text_with_error(url) if is_pdf else fetch_page_text_with_error(url)
+        )
         if not text or len(text) < UNREADABLE_TEXT_LENGTH_FLOOR:
             if url.lower().endswith(".pdf") or is_pdf:
                 document_found_unreadable[0] = True
             budget.mark_path_dead(url)
-            domain_miss_streak[host] = domain_miss_streak.get(host, 0) + 1
-            if domain_miss_streak[host] >= DOMAIN_MISS_ESCALATION_THRESHOLD:
-                budget.mark_domain_dead(host, "repeated_path_misses")
+            if is_guessed_path and error_type not in DOMAIN_KILLING_ERROR_TYPES and not error_type.startswith("http_4xx_403"):
+                count = budget.record_guessed_path_miss(host)
+                _vlog(
+                    logging.INFO,
+                    "india_csr_page guessed_path_miss host=%s count=%d error_type=%s "
+                    "(does not count toward domain-dead escalation)",
+                    host, count, error_type,
+                )
+            else:
+                domain_miss_streak[host] = domain_miss_streak.get(host, 0) + 1
+                if domain_miss_streak[host] >= DOMAIN_MISS_ESCALATION_THRESHOLD:
+                    budget.mark_domain_dead(host, f"repeated_genuine_failures:{error_type}")
         else:
             domain_miss_streak[host] = 0
         consider(url, method, text)
@@ -1414,8 +1561,18 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                 break
             if budget.is_domain_dead(domain):
                 break
-            await try_fetch(f"https://{domain}{path}", "direct")
+            await try_fetch(f"https://{domain}{path}", "direct", is_guessed_path=True)
             candidates_checked += 1
+        if (not best_candidate[0] or best_candidate[0][0] < MIN_ACCEPT_SCORE) and not budget.is_domain_dead(domain):
+            for path in CSR_PAGE_PATHS_LOCALE_PREFIXED:
+                if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
+                    break
+                if candidates_checked >= CANDIDATE_EVAL_LIMIT * 2 and best_candidate[0]:
+                    break
+                if budget.is_domain_dead(domain):
+                    break
+                await try_fetch(f"https://{domain}{path}", "locale_prefixed", is_guessed_path=True)
+                candidates_checked += 1
         if best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE:
             break
         if budget.is_domain_dead(domain):
@@ -1475,6 +1632,10 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
             registry.register_core_source(result_source)
         budget.mark_category_hit("csr_page")
         logger.info("india_csr_page DONE company=%r found=True score=%.1f", company, chosen[0])
+        if await _within_deadline(deadline):
+            await _run_teaser_and_benefit_followups(
+                company, result_source.get("text", ""), budget, quota_guard, deadline, registry, "india_csr_page",
+            )
         return result_source
 
     logger.info("india_csr_page DONE company=%r found=False document_found_unreadable=%s", company, document_found_unreadable[0])
@@ -2358,10 +2519,10 @@ async def run_targeted_queries(company: str, question_category: str, search_cfg:
 async def fetch_screen_sources(company: str, search_cfg: dict, quota_guard=None,
                                 registry: SourceRegistry | None = None) -> list[dict]:
     registry = registry or SourceRegistry(company)
-    budget = SearchBudget(company, max_google_queries=24)
+    budget = SearchBudget(company, max_google_queries=24, mode="screen")
 
-    source_9 = await fetch_education_programme_source(company, search_cfg, budget, quota_guard, registry=registry, mode="screen")
     source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry)
+    source_9 = await fetch_education_programme_source(company, search_cfg, budget, quota_guard, registry=registry, mode="screen")
     source_4 = await fetch_annual_report(company, search_cfg, budget, quota_guard, registry=registry)
     source_10 = await fetch_multi_year_financials(company, search_cfg, budget, quota_guard, registry=registry, annual_report_source=source_4)
     source_6 = await fetch_linkedin_people(company, search_cfg, budget, quota_guard, registry=registry)
@@ -2384,7 +2545,7 @@ async def fetch_screen_sources(company: str, search_cfg: dict, quota_guard=None,
 async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, progress_cb=None,
                               registry: SourceRegistry | None = None) -> list[dict]:
     registry = registry or SourceRegistry(company)
-    budget = SearchBudget(company)
+    budget = SearchBudget(company, mode="deep")
     job_deadline = time.monotonic() + DEEP_JOB_HARD_DEADLINE_SECONDS
 
     def not_tried(name: str, num: int) -> dict:
@@ -2397,7 +2558,8 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
     related_entities: list[dict] = []
 
     try:
-        await advance_step("Education programmes and decision-makers first...")
+        await advance_step("CSR page, education programmes and decision-makers first...")
+        source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_9 = await fetch_education_programme_source(
             company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline,
             related_entities=related_entities, mode="deep",
@@ -2414,8 +2576,7 @@ async def fetch_deep_sources(company: str, search_cfg: dict, quota_guard=None, p
                     excerpt="",
                 )
 
-        await advance_step("CSR page, MCA, National CSR Portal, annual report...")
-        source_1 = await fetch_india_csr_page(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
+        await advance_step("MCA, National CSR Portal, annual report...")
         source_2 = await fetch_mca_portal(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_3 = await fetch_national_csr_portal(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
         source_4 = await fetch_annual_report(company, search_cfg, budget, quota_guard, registry=registry, job_deadline=job_deadline)
