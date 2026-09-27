@@ -17,6 +17,7 @@ logger = logging.getLogger("tap.llm")
 
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_VERSION = "2023-06-01"
+ANTHROPIC_PROMPT_CACHING_BETA_HEADER = "prompt-caching-2024-07-31"
 
 LLM_UNAVAILABLE_EVIDENCE = "LLM unavailable — unable to generate evidence"
 LLM_SCORING_UNAVAILABLE_NOTE = (
@@ -33,6 +34,7 @@ MAX_PROMPT_SHRINK_ATTEMPTS = 6
 PROMPT_SHRINK_SAFETY_MARGIN = 120
 DEFAULT_ANTHROPIC_CONTEXT_WINDOW = 200000
 DEFAULT_LLM_DUMP_DIR = "/tmp/fundfinder_llm_dumps"
+MIN_CACHEABLE_BLOCK_TOKENS = 1024
 
 ANTHROPIC_DEFAULT_COOLDOWN_SECONDS = 60.0
 
@@ -96,6 +98,7 @@ def _anthropic_context_window() -> int:
         )
         return DEFAULT_ANTHROPIC_CONTEXT_WINDOW
     return value
+
 
 DEFAULT_MISSION = (
     "The Apprentice Project (TAP) develops 21st-century skills (critical thinking, "
@@ -196,30 +199,28 @@ def _criteria_json_template() -> str:
 MODE_CALIBRATION = {
     "screen": {
         "stance": (
-            "MODE: SCREEN (triage pass). Your job is to judge whether {company} is worth a "
-            "full deep-research pass, not to produce a final outreach-ready verdict. Screen "
-            "mode structurally sees fewer sources than deep mode — that is expected, not a "
-            "flaw in the company. Read genuinely promising but thinly-documented signals "
-            "generously: a company with clear education/CSR activity and no disqualifying "
-            "red flag should score in a range that reads as 'worth a deep dive', even if "
-            "spend figures, named partners, or a named decision-maker haven't surfaced yet. "
-            "Reserve low scores for cases with an actual negative signal (no CSR at all, "
-            "explicitly non-education CSR, or a stated policy against NGO partnerships) — "
-            "thin sourcing alone is never sufficient reason for a low score in screen mode."
+            "MODE: SCREEN (triage pass, fewer sources than deep by design). Judge whether "
+            "{company} deserves a deep-research pass, not a final verdict. Read thin-but-promising "
+            "signals generously — clear education/CSR activity with no disqualifying red flag should "
+            "score as 'worth a deep dive' even without spend figures, named partners, or a named "
+            "decision-maker yet. Reserve low scores for an actual negative signal (no CSR at all, "
+            "explicitly non-education CSR, a stated policy against NGO partnerships) — thin sourcing "
+            "alone is never sufficient reason for a low score here."
         ),
         "authenticity_cap_threshold": 15,
         "authenticity_cap_ceiling": 78,
+        "rule_detail": "short",
     },
     "deep": {
         "stance": (
-            "MODE: DEEP RESEARCH (outreach-ready brief). This analysis will inform an actual "
-            "outreach decision, so hold evidence to a stricter standard than a triage pass — "
-            "undocumented should still be read generously per the philosophy below, but "
-            "claims should be well-grounded in what was actually fetched, since a person may "
-            "act on this directly."
+            "MODE: DEEP RESEARCH (outreach-ready brief, informs an actual outreach decision). Hold "
+            "evidence to a stricter standard than a triage pass — undocumented should still read "
+            "generously per the philosophy below, but claims should be well-grounded since a person "
+            "may act on this directly."
         ),
         "authenticity_cap_threshold": 30,
         "authenticity_cap_ceiling": 65,
+        "rule_detail": "full",
     },
 }
 
@@ -228,407 +229,245 @@ def _mode_calibration(mode: str) -> dict:
     return MODE_CALIBRATION.get(mode, MODE_CALIBRATION["deep"])
 
 
-EVIDENCE_STATE_RULE = (
-    "EVIDENCE_STATE_RULE: every numeric or categorical field you emit must carry an explicit "
-    "state alongside it. Use exactly one of: FOUND (a source states this value), "
-    "NOT_FOUND_IN_SOURCE (the sources fetched do not mention it), CONFIRMED_ABSENT (a source "
-    "positively states the value is zero or does not exist). If the state is "
-    "NOT_FOUND_IN_SOURCE, the value field must be null. Never write 0, 0.0, 0.0%, \"none\" or "
-    "\"nil\" for something you simply did not find. Zero is a finding. Absence of a finding is "
-    "not zero, and the two must never be rendered the same way. If you cannot cite a source "
-    "number for a value, its state cannot be FOUND."
-)
-
-TREND_RULE = (
-    "TREND_RULE: do not describe a trend in words. Emit the series and let the application "
-    "derive the direction. For any multi-year figure, emit each point as "
-    "{fiscal_year/year, value, source} ordered oldest to newest, plus a series_state of "
-    "FOUND, NOT_FOUND_IN_SOURCE, or CONFIRMED_ABSENT. Do not emit a trend label such as "
-    "RISING, FALLING, or FLAT yourself in prose fields — leave trend_direction as UNKNOWN and "
-    "let the application derive it from the series you provide. Do not emit relative-time "
-    "phrases such as \"eight years ago\" or \"since inception\" anywhere. Emit absolute years "
-    "only. A series of fewer than two points has no trend — emit the points and nothing more, "
-    "and leave trend_direction as UNKNOWN."
-)
-
-SCORING_PHILOSOPHY = (
-    "SCORING PHILOSOPHY: most CSR activity in India is only partially documented online. "
-    "Silence about something is not evidence against it. Never score a criterion at 0, and "
-    "never treat a company as a poor fit, purely because a fact wasn't surfaced by the sources "
-    "you were given — reserve 0 only for evidence that actively contradicts fit (e.g. an "
-    "explicit statement the company does not run education CSR). Where the record is quiet on "
-    "a criterion, score it from sector, scale, and adjacent CSR behavior visible elsewhere in "
-    "the evidence, and label it in your `evidence` text as an inferred estimate, not a "
-    "confirmed absence. When genuinely torn between two adjacent scores for a criterion, prefer "
-    "the higher one — undocumented should never read as a negative signal. This applies "
-    "per-criterion; it does not mean invent facts, and it does not mean treat every company as "
-    "a great fit — evidence that actively points away from fit should bring scores down "
-    "honestly, just as evidence that supports fit should bring them up. Critically: a low "
-    "fit score and low research confidence are NOT the same conclusion. If evidence is thin, "
-    "say so plainly and let the evidence-coverage gate (applied outside this prompt) handle "
-    "whether the score should be shown at all — do not pre-emptively collapse toward a low "
-    "score just because the sources you were given are sparse.\n\n"
-    "You may now decline to score. If a criterion has no evidence in the extracted facts, emit "
-    "score: null with confidence: 0 and a one-line reason naming what was missing in the "
-    "`evidence` field. Do not guess a low number to fill the slot. A null score is not a bad "
-    "score. It is the honest output when the research did not reach that criterion, and the "
-    "application will exclude it from the average rather than let it drag the average down. "
-    "Scoring 1 out of 5 because you found nothing is damaging precisely because it is "
-    "indistinguishable downstream from a company that was genuinely assessed and found weak. "
-    "Score 0 only where a source actively contradicts the criterion.\n\n"
-    "For any criterion you score null, if you can see a concrete, ready-to-run search query "
-    "that would plausibly resolve it, add an entry to unscored_criteria_search_directives per "
-    "the instructions below — this is how the gap gets followed up on, not just recorded."
-)
-
-CONFIDENCE_SEPARATION_RULE = (
-    "CONFIDENCE_SEPARATION_RULE: you are producing two independent judgements. Do not let one "
-    "bleed into the other. fit_score is how well the evidence you DO have indicates alignment "
-    "with the mission. research_coverage is how much of the picture you managed to retrieve at "
-    "all. A company can be a strong fit on thin evidence. A company can be a poor fit on "
-    "thorough evidence. Those are different sentences and the report must be able to say both. "
-    "Do not compute fit_score yourself. Emit the criteria array with scores and confidences and "
-    "stop — the application computes the weighted average from the criteria you scored, and "
-    "computes research_coverage from how many you declined to score. Emitting your own "
-    "fit_score reintroduces exactly the blending this rule exists to prevent. In "
-    "fit_rationale, never explain a low score by saying evidence was limited. If evidence was "
-    "limited, the affected criteria should be null and the rationale should speak only to what "
-    "was actually found."
-)
-
-SCORING_CONSISTENCY_RULE = (
-    "CONSISTENCY (read before scoring): scores must be repeatable — if this exact evidence "
-    "were scored again, you should land on the same numbers. To guarantee that, never assign "
-    "a criterion score from general impression, company reputation, or brand size. For every "
-    "criterion, first identify the single most relevant fact/quote in the extracted evidence, "
-    "then map that fact to a score using the rubric line for that criterion, and write that "
-    "fact (not a vibe) into the `evidence` field. If two criteria could plausibly take the same "
-    "score for the same underlying reason, they should — do not vary scores across similar "
-    "criteria without a distinct evidentiary reason for each. Do not let overall enthusiasm "
-    "about the company inflate individual criterion scores beyond what each one's own evidence "
-    "supports."
-)
-
-SPEND_VS_REVENUE_RULE = (
-    "SPEND VS REVENUE (common error, check this carefully): revenue, turnover, net worth, "
-    "profit, market cap, and EBITDA describe business SCALE, never CSR spend. Never place them "
-    "in spend.display or spend.inr_crore, and never call them CSR spend/budget/fund. Set "
-    "spend.has_disclosed_budget=true only for a figure explicitly labeled as CSR "
-    "expenditure/spend/budget, or a stated CSR-mandate percentage applied to a stated profit "
-    "figure. Otherwise has_disclosed_budget=false and inr_crore=0. Put any business-scale "
-    "figures only in eligibility.net_worth_turnover_signal (as text) and the "
-    "eligibility.net_worth_turnover_inr_crore / eligibility.net_profit_inr_crore numeric fields "
-    "— never in spend."
-)
-
-EDUCATION_SPEND_RULE = (
-    "EDUCATION SPEND VS TOTAL CSR (second common error): most companies run CSR across several "
-    "causes, not just education. spend.inr_crore / spend.display / spend.fiscal_year / "
-    "spend.trend_* must hold ONLY the education-specific slice — set is_education_specific=true "
-    "and populate these only when the evidence states an education-specific figure or "
-    "percentage. If the evidence only gives a TOTAL CSR figure with no education breakdown, "
-    "leave spend.is_education_specific=false and spend.inr_crore/display/fiscal_year empty, and "
-    "put that total in total_csr_inr_crore / total_csr_display / total_csr_fiscal_year instead, "
-    "clearly labeled as total CSR, never as the education budget. "
-    "TREND IS MANDATORY WHENEVER POSSIBLE: actively scan the evidence for figures from more "
-    "than one fiscal year — annual/CSR reports often disclose 2-3 years side by side even when "
-    "only the latest year is prominently mentioned. Populate spend.history[] with every "
-    "distinct (fiscal_year, figure) pair you find, education-specific if available, else total "
-    "CSR clearly marked as such via is_education_specific=false entries. A single year's figure "
-    "with no trend is materially less useful to a fundraiser than a 2-3 year trend, so treat "
-    "finding the trend as equally important as finding the headline number — but do not label "
-    "the direction yourself; see TREND_RULE.\n\n"
-    "Education spend has three distinct outcomes and they must never collapse into one "
-    "another: (1) a source gives an education-specific figure -> value populated, state FOUND; "
-    "(2) a source gives total CSR only, no education split -> spend.inr_crore/display/"
-    "fiscal_year left empty, state NOT_FOUND_IN_SOURCE, and the note must say only a total was "
-    "available; (3) a source states the company funds no education -> spend.inr_crore=0, state "
-    "CONFIRMED_ABSENT. Outcome 2 is the common case and it must never be rendered as outcome 3. "
-    "If you only have a total CSR figure, you have not found the education share — say so in "
-    "spend.trend_evidence or spend.source_excerpt rather than writing 0."
-)
-
-PROFIT_HISTORY_RULE = (
-    "NET PROFIT HISTORY (for statutory obligation calculation, separate from spend): "
-    "actively scan the evidence for net profit / profit after tax figures across multiple "
-    "fiscal years, the same way you scan for CSR spend trend. Populate "
-    "eligibility.net_profit_history[] with every distinct (fiscal_year, net_profit_inr_crore) "
-    "pair you find, each with a verbatim source_excerpt. Set "
-    "eligibility.net_profit_trend_direction to RISING/FLAT/DECLINING when two or more years "
-    "exist, UNKNOWN otherwise. This is used downstream to compute the company's Section 135 "
-    "CSR obligation (2% of average net profit) and compare it against actual CSR spend — do "
-    "not perform that calculation yourself, only extract the profit figures faithfully."
-)
-
-ENTITY_STRUCTURE_RULE = (
-    "ENTITY STRUCTURE (feedback priority — do this as a distinct step before programmes/"
-    "partners): scan the evidence for every distinct named legal vehicle connected to "
-    "{company} that could plausibly run or fund CSR — the parent/global company, a "
-    "separately incorporated India entity or branch, and any separately-named foundation, "
-    "trust, or CSR arm (e.g. 'X Foundation', 'X India Private Limited', 'X AG Mumbai "
-    "Branch'). Populate entity_structure with whichever of these are actually named in the "
-    "evidence — leave a field empty rather than guessing if the evidence never names that "
-    "layer. Do not assume the parent and a named foundation are the same funding channel "
-    "just because they share a brand name — they are related but distinct, and evidence "
-    "about one is not automatically evidence about the other unless the text says so. Every "
-    "programme and partner extracted later must set funded_by_entity to whichever of these "
-    "named entities the evidence actually attributes it to (or leave it empty if the "
-    "evidence does not make that clear) — never silently default it to the parent company "
-    "name. If a single candidate legal-entity string appears to concatenate two different "
-    "companies' names (for example because a search snippet placed two unrelated company "
-    "mentions next to each other), do not treat that string as a real entity — only use "
-    "entity names that read as one coherent, single organisation."
-)
-
-PARTNER_RULE = (
-    "PARTNERS: include a named third-party organisation as a partner only if the evidence shows "
-    "an actual relationship (funds, co-designs, implements with, partners with, delivers via, "
-    "works with). Use confidence='confirmed' if the relationship verb is explicit and clear, "
-    "confidence='probable' if the org is named alongside the company in a CSR/education context "
-    "but the relationship language is vague or implied. Do not include internal campaign names "
-    "(they are not organisations), generic unnamed government references, or award/certifying "
-    "bodies. For each partner, also fill programme/year/geography if the evidence states them "
-    "(leave empty otherwise — never guess), and set similar_to_tap_profile=true if the partner "
-    "org is itself an education/skilling/government-school-facing NGO or intermediary (even if "
-    "unrelated to TAP) — this is a genuine positive signal for partnership_quality and "
-    "delivery_model_fit, so weigh it there yourself. If your own fit_rationale or "
-    "delivery_model_evidence text names a third-party org the company works with, that same org "
-    "must also appear in the partners array — never describe a partnership in prose while "
-    "leaving it out of the structured list. Set funded_by_entity per the ENTITY STRUCTURE rule. "
-    "PARTNER HISTORY DEPTH (feedback priority): a partner list is far more valuable to a "
-    "fundraiser when it spans multiple years, because it reveals whether the relationship is "
-    "one-off or sustained, and what scale of grant the company typically gives. Actively check "
-    "the evidence for partner mentions across different fiscal years / annual reports, not just "
-    "the most recent one, and include each distinct (partner, year) combination you find as a "
-    "separate entry rather than collapsing multi-year partners into a single undated entry — "
-    "this lets the reader see the funding pattern over time. NAMED-FORMAT INITIATIVES "
-    "(feedback priority, check this specifically): a Development Impact Bond, outcomes fund, "
-    "flagship-named programme, or any other formally-named initiative is exactly the kind of "
-    "detail that is easy to under-extract because it can appear as a passing mention rather "
-    "than a dedicated CSR-page paragraph. If the evidence references one anywhere, even in a "
-    "single sentence or a footnote-like mention, always extract it as its own programme entry "
-    "with confidence='probable' at minimum — never fold it into a generic theme sentence in "
-    "key_facts_summary instead of a structured programme entry. A DIB or outcomes fund also "
-    "typically involves several delivery partners, not one — actively look for every "
-    "organisation named alongside it and add each as a separate partner entry rather than "
-    "citing only the most prominent name."
-)
-
-TAP_PRIORITY_RULE = (
-    "TAP_PRIORITY_RULE (feedback priority — apply before finalizing programmes[]): rank every "
-    "programme you extract by relevance to the NGO mission — school education, STEM, AI, "
-    "coding, digital skills, government schools, students and teachers are the priority areas. "
-    "List every programme that touches a priority area first and in full: name, what it does, "
-    "beneficiaries, implementing partner, geography and scale, in that order of completeness. "
-    "Other CSR programmes (health, environment, livelihoods unrelated to schooling, employee "
-    "wellness, etc.) follow afterward, one line each, with no chain-completeness expectation. "
-    "If a programme in a priority area is named anywhere in the evidence — even a single "
-    "passing mention, a footnote, or a phrase buried inside an unrelated paragraph — it must "
-    "appear in programmes[]. Never drop or compress a TAP-relevant programme to make room for a "
-    "less relevant one, and never let a single generic theme mention ('the company supports "
-    "education') substitute for a named priority-area programme that the evidence actually "
-    "contains elsewhere. Before finalizing the programmes array, re-scan the raw evidence text "
-    "specifically for the priority-area keywords (STEM, coding, AI, digital, government school, "
-    "Atal Tinkering Lab, curriculum, teacher training, girls in tech) and confirm every "
-    "resulting mention has a corresponding entry — a keyword hit with no matching programmes[] "
-    "entry is a missed extraction, not a genuine absence."
-)
-
-PROGRAMME_RULE = (
-    "PROGRAMMES: include a named programme only if you can state what is funded and who "
-    "benefits, using whatever specificity the evidence actually gives — ordinary phrasing like "
-    "'government-school students' or 'children' is fine, it doesn't need to be unusually "
-    "precise. A bare theme mention with no named programme and nothing else to anchor it (e.g. "
-    "just 'the company supports financial literacy', no name, no beneficiary, no funded "
-    "activity) should be left out rather than invented into a full entry. confidence='confirmed' "
-    "if there's one additional concrete supporting detail (scale, duration, since-when) beyond "
-    "name/what's-funded/beneficiary; confidence='probable' otherwise. If your own fit_rationale "
-    "or delivery_model_evidence names a specific initiative, it must also appear in the "
-    "programmes array. Set funded_by_entity per the ENTITY STRUCTURE rule. "
-    "GO BEYOND THE THEME LABEL: a theme word ('financial literacy', 'skill development', "
-    "'life skills') is not on its own useful for a fundraising decision, because the same theme "
-    "can mean completely different things in practice — e.g. banking-awareness workshops for "
-    "unemployed adults versus a curriculum-embedded financial-literacy module for school "
-    "children are both 'financial literacy' but have opposite relevance to TAP. For every "
-    "programme, the `description` field must therefore state, wherever the evidence allows: "
-    "(a) the delivery channel — in-school/curriculum-embedded, standalone adult workshop, "
-    "digital/app-based, vocational/on-the-job, or other, (b) the concrete beneficiary (school-"
-    "going children vs out-of-school youth vs adults vs teachers), and (c) whether it is "
-    "one-off or ongoing. If the evidence truly does not support any of (a)-(c) beyond the theme "
-    "name, say so explicitly in `description` (e.g. 'delivery channel not stated in evidence') "
-    "rather than silently omitting the distinction — the goal is that no programme entry reads "
-    "as just a repeated theme word. "
-    "PROGRAMME CHAIN COMPLETENESS (feedback priority): the fundraising-useful shape of a "
-    "programme entry is programme -> intervention -> beneficiaries -> geography -> "
-    "implementation partner -> government-school involvement -> scale/outcomes -> funding. For "
-    "every programme, set chain_missing_elements to the subset of "
+CACHEABLE_EXTRACTION_RULES = (
+    "EVIDENCE_STATE_RULE: every numeric or categorical field carries an explicit state: FOUND "
+    "(a source states this value), NOT_FOUND_IN_SOURCE (sources don't mention it), or "
+    "CONFIRMED_ABSENT (a source positively states zero/nonexistent). If NOT_FOUND_IN_SOURCE, "
+    "the value field is null. Never write 0, 0.0, \"none\" or \"nil\" for something simply not "
+    "found — zero is a finding, absence of a finding is not zero, and the two must render "
+    "differently. A value cannot be FOUND without a citable source number.\n\n"
+    "TREND_RULE: never describe a trend in words. Emit each multi-year point as "
+    "{fiscal_year/year, value, source} oldest-to-newest plus a series_state "
+    "(FOUND/NOT_FOUND_IN_SOURCE/CONFIRMED_ABSENT). Leave trend_direction UNKNOWN in every field you "
+    "write — the application derives RISING/FLAT/DECLINING from the series, never take that label "
+    "from you. No relative-time phrases (\"eight years ago\"); absolute years only. Fewer than two "
+    "points is not a trend — emit the points, leave trend_direction UNKNOWN.\n\n"
+    "ENTITY_STRUCTURE_RULE: before programmes/partners, scan for every distinct named legal vehicle "
+    "connected to the company that could run or fund CSR — parent/global company, a separately "
+    "incorporated India entity or branch, any separately-named foundation/trust/CSR arm (e.g. 'X "
+    "Foundation', 'X India Private Limited', 'X AG Mumbai Branch'). Populate entity_structure only "
+    "with layers actually named in evidence; leave a field empty rather than guess. Do not assume a "
+    "parent and a same-branded foundation are the same funding channel unless evidence says so — every "
+    "programme/partner must set funded_by_entity to whichever named entity evidence actually "
+    "attributes it to, never silently defaulted to the parent name. If a candidate entity string "
+    "reads as two different companies concatenated (e.g. a search snippet mashing two unrelated "
+    "mentions together), it is not a real entity — only use names that read as one coherent org.\n\n"
+    "SPEND_VS_REVENUE_RULE: revenue, turnover, net worth, profit, market cap, EBITDA describe "
+    "business SCALE, never CSR spend — never place them in spend.display/inr_crore, never call them "
+    "CSR spend/budget/fund. spend.has_disclosed_budget=true only for a figure explicitly labeled CSR "
+    "expenditure/spend/budget, or a stated CSR-mandate percentage applied to a stated profit figure; "
+    "otherwise false and inr_crore=0. Business-scale figures go only in "
+    "eligibility.net_worth_turnover_signal / net_worth_turnover_inr_crore / net_profit_inr_crore, "
+    "never in spend.\n\n"
+    "EDUCATION_SPEND_RULE: spend.inr_crore/display/fiscal_year/trend_* hold ONLY the "
+    "education-specific slice — set is_education_specific=true and populate these only when evidence "
+    "states an education-specific figure or percentage. A total-CSR-only figure goes in "
+    "total_csr_inr_crore/display/fiscal_year, clearly labeled total, never as the education budget. "
+    "Three distinct outcomes, never collapsed into one another: (1) education-specific figure found "
+    "-> populate, state FOUND; (2) total CSR only, no split -> leave education fields empty, state "
+    "NOT_FOUND_IN_SOURCE, note that only a total was available; (3) source states no education "
+    "funding -> inr_crore=0, state CONFIRMED_ABSENT. Outcome 2 is the common case and must never "
+    "render as outcome 3. Actively scan for figures from more than one fiscal year — reports often "
+    "disclose 2-3 years side by side even when only the latest is prominently mentioned. Populate "
+    "spend.history[] with every distinct (fiscal_year, figure) pair found; treat finding the trend as "
+    "equally important as finding the headline number, but never label the direction yourself.\n\n"
+    "PROFIT_HISTORY_RULE: scan for net profit / profit after tax figures across multiple fiscal "
+    "years the same way you scan for CSR spend trend. Populate eligibility.net_profit_history[] with "
+    "every distinct (fiscal_year, net_profit_inr_crore) pair, each with a verbatim source_excerpt. Set "
+    "net_profit_trend_direction to RISING/FLAT/DECLINING only with two-plus years, else UNKNOWN. This "
+    "feeds a downstream Section 135 obligation calculation — do not compute it yourself, only extract "
+    "profit figures faithfully.\n\n"
+    "PARTNER_RULE: include a named third-party org as a partner only if evidence shows an actual "
+    "relationship (funds, co-designs, implements with, partners with, delivers via, works with). "
+    "confidence='confirmed' if the relationship verb is explicit; 'probable' if named alongside the "
+    "company in a CSR/education context but the language is vague/implied. Exclude internal campaign "
+    "names, generic unnamed government references, award/certifying bodies. Fill programme/year/"
+    "geography only where evidence states them. Set similar_to_tap_profile=true if the partner is "
+    "itself an education/skilling/government-school-facing NGO or intermediary (even if unrelated to "
+    "TAP) — a genuine positive signal for partnership_quality and delivery_model_fit. Any third-party "
+    "org named in your own prose fields must also appear in partners[] — never describe a partnership "
+    "in prose while leaving it out of the structured list. Actively check evidence for partner "
+    "mentions across different fiscal years / annual reports, and include each distinct (partner, "
+    "year) combination as its own entry rather than collapsing multi-year partners into one undated "
+    "entry. A Development Impact Bond, outcomes fund, flagship-named programme, or any other "
+    "formally-named initiative must be extracted as its own programme entry (confidence='probable' "
+    "at minimum) the instant it's referenced anywhere, even in a single sentence or footnote-like "
+    "mention — never folded into a generic theme sentence instead. Such initiatives typically involve "
+    "several delivery partners — look for every organisation named alongside it and add each as a "
+    "separate partner entry rather than citing only the most prominent name.\n\n"
+    "TAP_PRIORITY_RULE: rank every programme by relevance to the mission — school education, STEM, "
+    "AI, coding, digital skills, government schools, students and teachers are priority areas. List "
+    "every priority-area programme first and in full: name, what it does, beneficiaries, implementing "
+    "partner, geography and scale. Other CSR programmes (health, environment, non-schooling "
+    "livelihoods, employee wellness, etc.) follow briefly, one line each, no chain-completeness "
+    "expectation. If a priority-area programme is named anywhere — even a passing mention, a "
+    "footnote, a phrase buried in an unrelated paragraph — it must appear in programmes[]. Never drop "
+    "or compress a TAP-relevant programme to make room for a less relevant one, and never let a "
+    "generic theme mention substitute for a named priority-area programme evidence actually contains "
+    "elsewhere. Before finalizing programmes[], re-scan raw evidence specifically for priority-area "
+    "keywords (STEM, coding, AI, digital, government school, Atal Tinkering Lab, curriculum, teacher "
+    "training, girls in tech) and confirm every resulting mention has a corresponding entry — a "
+    "keyword hit with no matching entry is a missed extraction, not a genuine absence.\n\n"
+    "PROGRAMME_RULE: include a named programme only if you can state what is funded and who "
+    "benefits, at whatever specificity evidence actually gives (ordinary phrasing like 'government-"
+    "school students' is fine). A bare theme mention with no name, no beneficiary, no funded "
+    "activity should be left out rather than inflated into a full entry. confidence='confirmed' with "
+    "one additional concrete supporting detail (scale, duration, since-when) beyond name/what's-"
+    "funded/beneficiary; 'probable' otherwise. Any specific initiative named in your own prose fields "
+    "must also appear in programmes[]. For every programme, `description` must state wherever "
+    "evidence allows: (a) delivery channel (in-school/curriculum-embedded, standalone adult workshop, "
+    "digital/app-based, vocational, or other), (b) concrete beneficiary (school-going children vs "
+    "out-of-school youth vs adults vs teachers), (c) one-off vs ongoing — a theme word alone ('life "
+    "skills') is not useful since the same theme can mean opposite things in practice. If evidence "
+    "truly doesn't support (a)-(c), say so explicitly in `description` rather than silently omitting "
+    "the distinction. Set chain_missing_elements to whichever of "
     "[beneficiaries, geography, partner, government_school_involvement, scale_or_outcomes, "
-    "funding_amount] that the evidence genuinely does not state anywhere for this programme — "
-    "do not guess a value just to leave the list empty. This is not a penalty on the company; "
-    "it tells the reader exactly what still needs manual follow-up, so be precise and honest "
-    "about what is actually missing versus what you found elsewhere in the evidence and should "
-    "have already filled in above."
-)
-
-SOURCE_INTEGRITY_RULE = (
-    "SOURCE INTEGRITY: before treating a fragment as evidence, confirm it's a genuine "
-    "descriptive sentence about the company's own activity — not a nav menu, link list, or "
-    "heading run-on. Confirm any excerpt is actually about the company being analysed and not a "
-    "different entity that happens to share the page (this matters especially for "
-    "people-search/LinkedIn snippets — if a profile's employer is a different company, that "
-    "text is not evidence about this company even if this company's name appears elsewhere on "
-    "the page). A person's individual career history describes that person, never a company "
-    "programme."
-)
-
-ENTITY_DISAMBIGUATION_RULE = (
-    "ENTITY DISAMBIGUATION: some companies operate through more than one distinct legal "
-    "vehicle for CSR — e.g. a direct India branch/subsidiary AND a separately-named "
-    "foundation (such as 'UBS AG Mumbai Branch' vs 'UBS Optimus Foundation'). These are "
-    "related but not interchangeable funding channels. If the evidence names more than one "
-    "such entity, do not silently merge them into one undifferentiated profile: for every "
-    "programme, partner, and spend figure, note in its source_excerpt or description which "
-    "specific named entity the evidence actually attributes it to, whenever the evidence makes "
-    "that clear, and set funded_by_entity accordingly (see ENTITY STRUCTURE rule). If the "
-    "evidence is ambiguous about which entity is responsible, say so rather than assuming they "
-    "are the same organisation."
-)
-
-DECISION_MAKER_RULE = (
-    "DECISION-MAKERS — RELEVANCE FILTER (feedback priority, check this carefully): only include "
-    "a person if their TITLE or the EVIDENCE CONTEXT around their name specifically ties them to "
-    "CSR, sustainability, corporate foundation, community/social impact, or education/skilling "
-    "partnerships. Merely being named on the same page, in the same press release, or in the "
-    "same annual-report section as CSR content is NOT sufficient if their stated role is "
-    "unrelated (e.g. software engineer, sales/regional head, plant operations, unrelated "
-    "business-unit leadership). When uncertain whether a role qualifies, prefer to leave the "
-    "person out rather than include a functionally-irrelevant name — a fundraiser needs a "
-    "person they can credibly reach out to about CSR/education, and a wrong name wastes an "
-    "outreach attempt and damages credibility. The CEO/MD/Chairperson may be included only if "
-    "the evidence shows them personally quoted or credited on CSR/foundation matters, not by "
-    "default just for holding the top role.\n\n"
-    "IMPORTANT — do not re-litigate people_search hits: any person appearing in a source with "
-    "source_name 'people_search' has already passed a currency check and a CSR-relevance check "
-    "before reaching you. Your job for those hits is to transcribe them into decision_makers[] "
-    "faithfully (name, title, source_excerpt) and set is_india_specific from what the excerpt "
-    "says, not to re-decide whether they qualify. Only exclude a people_search hit if its "
-    "excerpt itself contains explicit former-role language (Previously, Formerly, Former, ex-, "
-    "Past, or a stated end year) that the upstream check may have missed.\n\n"
-    "SOURCE OF TRUTH, in this order — only fall to the next when the one above yields nothing: "
-    "(1) the company's own leadership or CSR team page; (2) a signed foreword or signatory in "
-    "the annual or CSR report; (3) a press release naming the person in role; (4) a LinkedIn "
-    "search-result snippet. The LinkedIn authwall is real and it does not block source 4: "
-    "people_search already runs through Google Custom Search, and a LinkedIn result's search "
-    "snippet carries the name and current headline, which covers the checks below. Parse the "
-    "snippet — do not attempt to fetch the profile page itself; it sits behind an authwall and "
-    "the fetch will fail or return a login shell. If a snippet is all you have, the contact is "
-    "UNVERIFIED and must be labelled so via tenure_status/is_india_specific plus a note in "
-    "tenure_evidence.\n\n"
-    "CURRENCY TEST: reject as a current contact any headline or snippet whose former-role "
-    "language (Previously, Formerly, Former, ex-, Past, or a stated end year) sits close to and "
-    "describes THIS person's role — a bare year range or former-role keyword appearing "
-    "elsewhere in the same excerpt, describing something else (a company history note, an "
-    "unrelated statute year, a different person entirely), does not disqualify them. A person "
-    "describing their own role in the past tense does not hold it — this is not a judgement "
-    "call once the language genuinely attaches to their role, but a stray date or keyword "
-    "nearby that is not actually about their tenure must not cause a false rejection. "
-    "THREE-CHECK VERIFICATION: before including anyone, confirm from the evidence (1) they are "
-    "still at the company (no former-role language describing their own role nearby, per the "
-    "currency test), (2) their designation as stated is CSR/foundation/sustainability/"
-    "philanthropy-relevant, not inferred from context alone, and (3) the role genuinely covers "
-    "this company's CSR function, not an unrelated department. "
-    "INDIA PRIORITY: when the evidence surfaces both an India-based/India-titled CSR contact "
-    "and a global-level contact for the same company, include both if evidence supports each, "
-    "but set is_india_specific=true only for the person whose title or scope is explicitly "
-    "India-focused (e.g. 'CSR Head, India', 'India Foundation Director') — prefer an "
-    "India-based CSR or foundation staff member over a global executive; a global CEO quoted "
-    "in a press release is a citation, not a route in. If no contact passes the currency test, "
-    "return an empty decision_makers list rather than including a former employee as current — "
-    "returning nobody is a usable result, and returning a former employee as current is worse "
-    "than returning nobody.\n\n"
-    "CONSISTENCY WITH csr_head_note (feedback priority): csr_head_note and decision_makers[] "
-    "describe the same underlying fact and must never contradict each other. If a person "
-    "appears anywhere in the evidence — company page, report signatory, press release, or "
-    "LinkedIn snippet — with a currency-test-passing CSR/foundation/sustainability title, they "
-    "must be added to decision_makers[] AND csr_head_note must reference them by name, never say "
-    "no CSR head was identified. Only state that no CSR head was identified in csr_head_note if "
-    "decision_makers[] is genuinely empty after applying every rule above."
-)
-
-GEOGRAPHY_RULE = (
-    "GEOGRAPHIES: capture every state/city explicitly named in the evidence as a separate "
-    "entry — prefer this granular level over country-level ('India') or vague scope phrases "
-    "('across India', 'pan-India', 'multiple states') whenever ANY more specific place is named "
-    "anywhere in the evidence, since state/city is what tells a fundraiser whether this overlaps "
-    "with TAP's existing footprint. If the evidence genuinely only supports a vague scope with no "
-    "state/city named anywhere, include that vague entry rather than omitting geography "
-    "entirely, but do not let a vague entry substitute for specific ones that are available "
-    "elsewhere in the evidence — include both if both exist."
-)
-
-EVIDENCE_STYLE_RULE = (
-    "EVERY field must trace to the evidence you were given — never invent facts, and state "
-    "partial evidence as partial. Evidence/reasoning fields used for SCORING (criteria[].evidence, "
-    "criteria[].reasoning, fit_rationale, alignment_rationale) are short paraphrases (under 20 "
-    "words), never verbatim quotes except for exact figures, partner names, or programme names. "
-    "source_excerpt fields (feedback priority: these are shown directly to the user as supporting "
-    "evidence, not just used internally for scoring) may instead be a short, exact, verbatim "
-    "excerpt from the source — up to about 25 words — so the user can see the actual sentence a "
-    "finding is based on rather than a re-paraphrased version of it; still keep it tight and drop "
-    "surrounding boilerplate."
-)
-
-HIGHLIGHT_RULE = (
-    "HIGHLIGHT: in fit_rationale, alignment_rationale, delivery_model_evidence, "
-    "source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, "
-    "strategic_insight, and each criterion's evidence — bold exactly one 2-3 word "
-    "decision-relevant phrase with **asterisks**. Never bold a full sentence, a lone number, or "
-    "more than 3 words. Never bold names, titles, sources, URLs, booleans, or enums. Skip only "
-    "if the field is empty."
-)
-
-FIELD_ORDER_RULE = (
-    "FIELD ORDER: emit the JSON object's top-level keys in exactly the order shown in the JSON "
-    "shape below, with no exceptions. This matters because your reply can be cut off by an "
-    "output-length limit, and fields written first are the ones guaranteed to survive a cutoff — "
-    "so short, high-value summary fields (authenticity score, source quality, evidence recency, "
-    "delivery model, sector, eligibility, spend, entity structure) are placed before the larger "
-    "array fields (programmes, partners, decision_makers, geographies, red_flags), which are "
-    "placed last since they are the most likely to be truncated safely without losing the fields "
-    "other parts of the pipeline depend on."
-)
-
-CROSS_SECTION_CONSISTENCY_RULE = (
-    "CROSS-SECTION CONSISTENCY (feedback priority — read this last, apply it to everything "
-    "above): every fact you state in a narrative or summary field (csr_head_note, "
-    "key_facts_summary, delivery_model_evidence, fit_rationale, strategic_insight) must also "
-    "exist in the corresponding structured array (decision_makers[], programmes[], partners[]). "
-    "It is a critical error to name a person or programme in prose while leaving them out of, "
-    "or contradicting, the structured list — the structured arrays are what downstream reports "
-    "and spreadsheets read from, so anything true only in prose is invisible everywhere else and "
-    "anything contradicted in prose looks like a fabrication. Before finalizing your reply, "
-    "re-read every narrative field you wrote and confirm each named person and programme has a "
-    "matching structured entry, and that no narrative field asserts an absence ('no CSR head "
+    "funding_amount] evidence genuinely does not state anywhere for that programme — never guess a "
+    "value just to leave the list empty; be precise about what's actually missing versus what you "
+    "found elsewhere and should have already filled in.\n\n"
+    "DECISION_MAKER_RULE: include a person only if their TITLE or the evidence context around their "
+    "name specifically ties them to CSR, sustainability, corporate foundation, community/social "
+    "impact, or education/skilling partnerships — being merely named on the same page or in the same "
+    "press release as CSR content is not sufficient if their stated role is unrelated (software "
+    "engineer, sales/regional head, plant operations, unrelated business-unit leadership). When "
+    "uncertain, prefer to leave the person out. The CEO/MD/Chairperson may be included only if "
+    "evidence shows them personally quoted or credited on CSR/foundation matters, never by default "
+    "for holding the top role. Any person appearing in a source named 'people_search' already passed "
+    "a currency and CSR-relevance check upstream — transcribe them faithfully (name, title, "
+    "source_excerpt), set is_india_specific from what the excerpt says; only exclude one of these if "
+    "its own excerpt contains explicit former-role language (Previously, Formerly, Former, ex-, Past, "
+    "or a stated end year) the upstream check may have missed. Source-of-truth order (fall to the "
+    "next only when the one above yields nothing): (1) the company's own leadership/CSR-team page, "
+    "(2) a signed foreword or signatory in the annual/CSR report, (3) a press release naming the "
+    "person in role, (4) a LinkedIn search-result snippet — parse the snippet, never attempt to fetch "
+    "the profile page itself (authwall). A snippet-only contact is UNVERIFIED — label it via "
+    "tenure_status/is_india_specific plus a tenure_evidence note. CURRENCY TEST: reject as current any "
+    "headline/snippet whose former-role language (Previously, Formerly, Former, ex-, Past, a stated "
+    "end year) sits close to and describes THIS person's role; a bare year range or former-role "
+    "keyword describing something else elsewhere in the same excerpt does not disqualify them. THREE-"
+    "CHECK VERIFICATION before including anyone: (1) still at the company per the currency test, (2) "
+    "designation as stated is CSR/foundation/sustainability/philanthropy-relevant, not inferred from "
+    "context alone, (3) role genuinely covers this company's CSR function, not an unrelated "
+    "department. INDIA PRIORITY: when both an India-based and a global-level contact surface for the "
+    "same company, include both if evidence supports each, but set is_india_specific=true only for "
+    "the one whose title/scope is explicitly India-focused; a global CEO quoted in a press release is "
+    "a citation, not a route in. If nobody passes the currency test, return an empty list — returning "
+    "nobody is a usable result, a former employee shown as current is worse than nobody. "
+    "csr_head_note and decision_makers[] describe the same fact and must never contradict each other: "
+    "if anyone appears anywhere with a currency-test-passing CSR/foundation/sustainability title, add "
+    "them to decision_makers[] AND reference them by name in csr_head_note — only state no CSR head "
+    "was identified if decision_makers[] is genuinely empty after every rule above.\n\n"
+    "GEOGRAPHY_RULE: capture every state/city explicitly named as its own entry — prefer this over "
+    "country-level ('India') or vague scope ('across India', 'pan-India') whenever any more specific "
+    "place is named anywhere in evidence. If evidence genuinely only supports a vague scope with no "
+    "state/city named anywhere, include that vague entry rather than omit geography, but never let a "
+    "vague entry substitute for specific ones available elsewhere — include both if both exist.\n\n"
+    "SOURCE_INTEGRITY_RULE: before treating a fragment as evidence, confirm it's a genuine "
+    "descriptive sentence about the company's own activity, not a nav menu, link list, or heading "
+    "run-on, and confirm it's actually about the company being analysed and not a different entity "
+    "sharing the page (especially for people-search/LinkedIn snippets — a profile whose employer is a "
+    "different company is not evidence about this company even if this company's name appears "
+    "elsewhere on the page). A person's individual career history describes that person, never a "
+    "company programme. Some companies operate more than one distinct legal vehicle for CSR (a direct "
+    "India branch AND a separately-named foundation) — these are related but not interchangeable; for "
+    "every programme/partner/spend figure, note which specific named entity evidence actually "
+    "attributes it to whenever that's clear, and set funded_by_entity accordingly; if evidence is "
+    "ambiguous about which entity is responsible, say so rather than assume they're the same org.\n\n"
+    "EVIDENCE_STYLE_RULE: every field must trace to the evidence given — never invent facts, state "
+    "partial evidence as partial. Scoring-facing evidence/reasoning fields (criteria[].evidence, "
+    "criteria[].reasoning, fit_rationale, alignment_rationale) are short paraphrases under 20 words, "
+    "never verbatim quotes except exact figures/partner names/programme names. source_excerpt fields "
+    "are shown directly to the user as supporting evidence — these may instead be a short, exact, "
+    "verbatim excerpt up to about 25 words so the user sees the actual sentence a finding rests on, "
+    "still dropping surrounding boilerplate.\n\n"
+    "SEARCH_DIRECTIVE_RULE: for up to 5 genuinely open questions, emit an object with `question` "
+    "(short, human-readable), `search_query` (a concrete string to type directly into a search engine "
+    "— not a restatement of the question, specific enough to plausibly return the missing fact: "
+    "company name plus the precise missing detail, e.g. company name plus a named programme plus "
+    "\"geography\" or \"beneficiaries\", or company name plus \"CSR spend\" plus a fiscal year), "
+    "`target_field` (the dotted path into this JSON shape the answer would fill, e.g. "
+    "\"spend.history\", \"programmes[].geography\", \"decision_makers\", "
+    "\"entity_structure.foundation_entity\" — leave empty if no single field applies; when leaving it "
+    "empty is genuinely unavoidable, use a short unique slug built from the question itself so the "
+    "directive still has a stable identity downstream, e.g. \"open:named_ngo_partner_scale\"), and "
+    "`priority` (HIGH/MEDIUM/LOW, reflecting how much the missing fact would change scoring). Only a "
+    "question genuinely unresolved in the evidence given — this is a to-do list for a second research "
+    "pass, not general commentary.\n\n"
+    "CROSS_SECTION_CONSISTENCY_RULE (apply this to everything above, read it last): every fact stated "
+    "in a narrative/summary field (csr_head_note, key_facts_summary, delivery_model_evidence, "
+    "fit_rationale, strategic_insight) must also exist in the corresponding structured array "
+    "(decision_makers[], programmes[], partners[]). Naming a person or programme in prose while "
+    "leaving them out of, or contradicting, the structured list is a critical error — downstream "
+    "reports and spreadsheets read only from the structured arrays, so anything true only in prose is "
+    "invisible everywhere else, and anything contradicted in prose looks fabricated. Before "
+    "finalizing your reply, re-read every narrative field and confirm each named person and programme "
+    "has a matching structured entry, and that no narrative field asserts an absence ('no CSR head "
     "identified', 'no named programmes found') that the structured arrays contradict."
 )
 
-SEARCH_DIRECTIVE_RULE = (
-    "SEARCH_DIRECTIVES: for each of up to 5 genuinely open questions, emit an object with "
-    "`question` (short, human-readable), `search_query` (a concrete string you would type "
-    "directly into a search engine to resolve it — not a restatement of the question, and "
-    "specific enough to plausibly return the missing fact: include the company name and the "
-    "precise missing detail, e.g. company name plus a named programme plus \"geography\" or "
-    "\"beneficiaries\", or company name plus \"CSR spend\" plus a fiscal year), `target_field` "
-    "(the dotted path into this JSON shape the answer would fill, e.g. \"spend.history\", "
-    "\"programmes[].geography\", \"decision_makers\", \"entity_structure.foundation_entity\" — "
-    "leave empty if no single field applies), and `priority` (HIGH/MEDIUM/LOW, reflecting how "
-    "much the missing fact would change the eventual scoring). Only include a question that is "
-    "genuinely unresolved in the evidence you were given — this list is a to-do list for a "
-    "second research pass, not a general commentary field."
+CACHEABLE_SCORING_RULES = (
+    "SCORING PHILOSOPHY: most CSR activity in India is only partially documented online. Silence "
+    "about something is not evidence against it. Never score a criterion at 0, and never treat a "
+    "company as a poor fit, purely because a fact wasn't surfaced by the sources given — reserve 0 "
+    "only for evidence that actively contradicts fit. Where the record is quiet on a criterion, score "
+    "it from sector, scale, and adjacent CSR behavior visible elsewhere in evidence, and label it in "
+    "`evidence` as an inferred estimate, not a confirmed absence. When genuinely torn between two "
+    "adjacent scores, prefer the higher one — undocumented should never read as a negative signal. "
+    "This is per-criterion; it does not mean invent facts, and it does not mean treat every company as "
+    "a great fit — evidence that actively points away from fit should bring scores down honestly, "
+    "just as evidence supporting fit should bring them up. A low fit score and low research confidence "
+    "are NOT the same conclusion: if evidence is thin, say so plainly and let the evidence-coverage "
+    "gate (applied outside this prompt) handle whether the score is shown at all — do not pre-"
+    "emptively collapse toward a low score just because sources are sparse.\n\n"
+    "You may decline to score. If a criterion has no evidence in the extracted facts, emit score: "
+    "null with confidence: 0 and a one-line reason naming what was missing in `evidence`. Do not "
+    "guess a low number to fill the slot — a null score is not a bad score, it's the honest output "
+    "when research didn't reach that criterion, and the application excludes it from the average "
+    "rather than let it drag the average down. Scoring 1/5 because you found nothing is damaging "
+    "because it's indistinguishable downstream from a company genuinely assessed and found weak. "
+    "Score 0 only where a source actively contradicts the criterion. For any criterion scored null, "
+    "if you can see a concrete, ready-to-run search query that would plausibly resolve it, add it to "
+    "unscored_criteria_search_directives per SEARCH_DIRECTIVE_RULE — this is how the gap gets "
+    "followed up on, not just recorded.\n\n"
+    "CONSISTENCY: scores must be repeatable — the same evidence scored again should land on the same "
+    "numbers. Never assign a score from general impression, reputation, or brand size. For every "
+    "criterion, first identify the single most relevant fact/quote in extracted evidence, map that "
+    "fact to a score using the rubric line for that criterion, and write that fact (not a vibe) into "
+    "`evidence`. If two criteria could plausibly take the same score for the same underlying reason, "
+    "they should — don't vary scores across similar criteria without a distinct evidentiary reason for "
+    "each. Don't let overall enthusiasm about the company inflate individual scores beyond what each "
+    "one's own evidence supports.\n\n"
+    "CONFIDENCE_SEPARATION_RULE: you produce two independent judgements — do not let one bleed into "
+    "the other. fit_score is how well evidence you DO have indicates alignment; research_coverage is "
+    "how much of the picture you retrieved at all. A company can be a strong fit on thin evidence, or "
+    "a poor fit on thorough evidence — the report must say both. Do not compute fit_score yourself; "
+    "emit the criteria array and stop — the application computes the weighted average from what you "
+    "scored, and research_coverage from what you declined. Emitting your own fit_score reintroduces "
+    "exactly the blending this rule prevents. In fit_rationale, never explain a low score by saying "
+    "evidence was limited — if evidence was limited, the affected criteria should be null and the "
+    "rationale should speak only to what was actually found.\n\n"
+    "HIGHLIGHT: in fit_rationale, alignment_rationale, delivery_model_evidence, "
+    "source_quality_assessment, csr_head_note, evidence_recency, contact_pathway.channel, "
+    "strategic_insight, and each criterion's evidence — bold exactly one 2-3 word decision-relevant "
+    "phrase with **asterisks**. Never bold a full sentence, a lone number, or more than 3 words. Never "
+    "bold names, titles, sources, URLs, booleans, or enums. Skip only if the field is empty.\n\n"
+    "SEARCH_DIRECTIVE_RULE: for up to 5 genuinely open questions, emit an object with `question` "
+    "(short, human-readable), `search_query` (a concrete string to type directly into a search engine "
+    "— not a restatement of the question, specific enough to plausibly return the missing fact), "
+    "`target_field` (the criterion id this would resolve — for the scoring pass this must be one of "
+    "the 17 criteria ids, never empty and never a dotted evidence path), and `priority` "
+    "(HIGH/MEDIUM/LOW). Only a question genuinely unresolved in the evidence given.\n\n"
+    "CROSS_SECTION_CONSISTENCY_RULE: every fact named in a narrative field must be consistent with "
+    "the structured facts already given to you — never assert in prose an absence ('no CSR head "
+    "identified', 'no named programmes found') that the extracted facts contradict."
 )
 
 
-def _extraction_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
+def _extraction_prompt_static_block() -> str:
+    return CACHEABLE_EXTRACTION_RULES
+
+
+def _extraction_prompt_dynamic_block(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
     return f"""You are a meticulous fact-extraction analyst. Extract every concrete, sourced fact about {company}'s India CSR activity from the evidence below. Do NOT score or judge fit — that happens in a separate pass. Your only job here is complete, accurate, well-cited extraction.
 
 NGO MISSION (context only, for judging what counts as education-relevant — do not score against it here): {mission}
@@ -641,66 +480,32 @@ EVIDENCE (from sources actually fetched for {company} — numbered sources below
 SOURCES:
 {sources_manifest}
 
-{EVIDENCE_STATE_RULE}
-
-{TREND_RULE}
-
-{ENTITY_STRUCTURE_RULE.format(company=company)}
-
-{SPEND_VS_REVENUE_RULE}
-
-{EDUCATION_SPEND_RULE}
-
-{PROFIT_HISTORY_RULE}
-
-{PARTNER_RULE}
-
-{PROGRAMME_RULE}
-
-{TAP_PRIORITY_RULE}
-
-{DECISION_MAKER_RULE}
-
-{GEOGRAPHY_RULE}
-
-{SOURCE_INTEGRITY_RULE}
-
-{ENTITY_DISAMBIGUATION_RULE}
-
-{EVIDENCE_STYLE_RULE}
-
-{SEARCH_DIRECTIVE_RULE}
-
-{CROSS_SECTION_CONSISTENCY_RULE}
-
-{FIELD_ORDER_RULE}
-
 Extract, matching the JSON shape's key order exactly:
 1. overall_authenticity_score (0-100) — reflects sourcing quality (primary vs secondary, how many sources actually returned usable text), not evidence volume.
 2. source_quality_assessment — 1-2 sentences: primary (company/regulator) vs secondary (press/snippets) sourcing.
 3. evidence_recency — one sentence on how current the evidence appears.
-4. csr_head_note — one sentence, only from actual named-person context, never speculation from a bare title. Must agree with decision_makers[] per the CONSISTENCY sub-rule inside DECISION-MAKERS.
+4. csr_head_note — one sentence, only from actual named-person context, never speculation from a bare title. Must agree with decision_makers[] per DECISION_MAKER_RULE.
 5. delivery_model (FUNDER/IMPLEMENTER/HYBRID/UNCLEAR) + delivery_model_evidence (1 sentence).
 6. sector — from company-description language; UNKNOWN only if truly no clue.
-7. eligibility — Section 135 applicability (LIKELY/UNLIKELY/UNKNOWN) from net worth/turnover/profit figures (kept separate from spend), plus the plain numeric business-scale fields, plus the profit history required by the PROFIT HISTORY rule.
-8. spend — apply the SPEND VS REVENUE and EDUCATION SPEND rules strictly, including the mandatory multi-year trend search, and apply EVIDENCE_STATE_RULE / TREND_RULE to every figure and every history point.
-9. entity_structure — apply the ENTITY STRUCTURE rule; leave any layer empty rather than guessing.
+7. eligibility — Section 135 applicability (LIKELY/UNLIKELY/UNKNOWN) from net worth/turnover/profit figures (kept separate from spend), plus plain numeric business-scale fields, plus the profit history required by PROFIT_HISTORY_RULE.
+8. spend — apply SPEND_VS_REVENUE_RULE and EDUCATION_SPEND_RULE strictly, including the mandatory multi-year trend search, and apply EVIDENCE_STATE_RULE / TREND_RULE to every figure and history point.
+9. entity_structure — apply ENTITY_STRUCTURE_RULE; leave any layer empty rather than guessing.
 10. rfp_signal — an explicit call for NGO partners; default false/empty unless stated.
 11. board_affinity — named board/promoter personal education-philanthropy history; default false/empty unless stated.
 12. volunteering — named employee volunteering/payroll-giving touching education; default false/empty unless stated.
 13. group_foundation — CSR run via a separate parent/group foundation, only if explicitly named.
-14. key_facts_summary — 3-6 short bullet-style facts (as a single string, one per line prefixed with "- ") that most directly bear on education-CSR fit — this feeds directly into the scoring pass, so include anything that would move a fit judgment either up or down. Do not use this field as a dumping ground for a named programme or initiative that belongs in the programmes array instead.
-15. search_directives[] — apply the SEARCH_DIRECTIVES rule; up to 5 entries, each with question, search_query, target_field, priority.
-16. programmes[] — apply the PROGRAMME rule and the TAP_PRIORITY_RULE together: priority-area programmes (school education, STEM, AI, coding, digital skills, government schools) listed first and in full, then everything else briefly. Apply the delivery-channel/beneficiary specificity requirement and the chain-completeness fields to every entry.
-17. partners[] — apply the PARTNER rule, including similar_to_tap_profile, multi-year history, and named-format initiatives (DIBs, outcomes funds).
-18. decision_makers[] — apply the DECISION-MAKER source-of-truth order, currency test, three-check verification, and consistency sub-rule strictly; title, public_facing_score 0-100, tenure_status, is_india_specific, linkedin_url only if a literal linkedin.com/in/ URL is present in the evidence. Every people_search hit in the evidence that passes the currency test must appear here — see the people_search transcription note inside the DECISION-MAKER rule.
-19. geographies[] — apply the GEOGRAPHY rule; prefer state/city over country/vague-region entries.
+14. key_facts_summary — 3-6 short bullet-style facts (single string, one per line prefixed "- ") that most directly bear on education-CSR fit — feeds the scoring pass, include anything that would move a fit judgment either way. Never use this as a dumping ground for a programme that belongs in programmes[] instead.
+15. search_directives[] — apply SEARCH_DIRECTIVE_RULE; up to 5 entries.
+16. programmes[] — apply PROGRAMME_RULE and TAP_PRIORITY_RULE together: priority-area programmes listed first and in full, then everything else briefly. Apply delivery-channel/beneficiary specificity and chain-completeness fields to every entry.
+17. partners[] — apply PARTNER_RULE, including similar_to_tap_profile, multi-year history, and named-format initiatives.
+18. decision_makers[] — apply DECISION_MAKER_RULE's source-of-truth order, currency test, three-check verification, and consistency sub-rule strictly; linkedin_url only if a literal linkedin.com/in/ URL is present in evidence. Every people_search hit that passes the currency test must appear here.
+19. geographies[] — apply GEOGRAPHY_RULE; prefer state/city over country/vague-region entries.
 20. red_flags[] — genuine contradictions or marketing-not-substance signals, severity low/medium/high. Missing/undocumented details are NOT red flags.
 21. contact_pathway — the single most concrete real channel; "Not identified" if nothing exists.
 
-7b. eligibility.net_profit_history — apply the PROFIT HISTORY rule; this feeds a downstream statutory-obligation calculation, so profit-figure recall matters as much as spend-figure recall. Source 10 (multi_year_financials), when present, is specifically curated to contain side-by-side year figures — check it first for profit_history and spend.history.
+7b. eligibility.net_profit_history — apply PROFIT_HISTORY_RULE; source 10 (multi_year_financials), when present, is specifically curated for side-by-side year figures — check it first for profit_history and spend.history.
 
-Before replying, run the CROSS-SECTION CONSISTENCY check once over your own draft.
+Before replying, run the CROSS_SECTION_CONSISTENCY_RULE check once over your own draft.
 
 Reply with ONE JSON object, nothing else, no markdown fences.
 
@@ -722,7 +527,7 @@ JSON shape:
   "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>", "source_excerpt": "<short, verbatim ok>"}},
   "key_facts_summary": "<3-6 lines, each starting with '- '>",
   "search_directives": [{{"question": "<short item>", "search_query": "<concrete ready-to-run search query>", "target_field": "<dotted path or empty>", "priority": "<HIGH|MEDIUM|LOW>"}}],
-  "programmes": [{{"name": "<exact name>", "what_is_funded": "<precise funded activity>", "beneficiary_group": "<named beneficiary group>", "beneficiary_type": "<SCHOOL_CHILDREN_CURRICULUM|ADULT|OTHER>", "description": "<short, must cover delivery channel + beneficiary + one-off-vs-ongoing per PROGRAMME rule>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "funded_by_entity": "<name from entity_structure or empty>", "chain_missing_elements": ["<subset of beneficiaries|geography|partner|government_school_involvement|scale_or_outcomes|funding_amount>"], "source_excerpt": "<short, verbatim ok>", "confidence": "<confirmed|probable>"}}],
+  "programmes": [{{"name": "<exact name>", "what_is_funded": "<precise funded activity>", "beneficiary_group": "<named beneficiary group>", "beneficiary_type": "<SCHOOL_CHILDREN_CURRICULUM|ADULT|OTHER>", "description": "<short, must cover delivery channel + beneficiary + one-off-vs-ongoing per PROGRAMME_RULE>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "funded_by_entity": "<name from entity_structure or empty>", "chain_missing_elements": ["<subset of beneficiaries|geography|partner|government_school_involvement|scale_or_outcomes|funding_amount>"], "source_excerpt": "<short, verbatim ok>", "confidence": "<confirmed|probable>"}}],
   "partners": [{{"name": "<exact org name>", "relationship_type": "<funder|implementer|co-design|unclear>", "programme": "<or empty>", "year": "<or empty>", "geography": "<or empty>", "similar_to_tap_profile": <bool>, "funded_by_entity": "<name from entity_structure or empty>", "source_excerpt": "<short, verbatim ok, must show relationship language>", "confidence": "<confirmed|probable>"}}],
   "decision_makers": [{{"name": "<n>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "is_india_specific": <bool>, "source_excerpt": "<short, verbatim ok>", "linkedin_url": "<url or empty>"}}],
   "geographies": [{{"place": "<state/city preferred>", "source_excerpt": "<short, verbatim ok>"}}],
@@ -731,8 +536,23 @@ JSON shape:
 }}"""
 
 
-def _scoring_prompt(company: str, mission: str, mode: str, extraction: dict, sources_manifest: str,
-                     csr_obligation: dict | None = None) -> str:
+def _extraction_prompt_blocks(company: str, mission: str, evidence_text: str, sources_manifest: str) -> list[dict]:
+    return [
+        {"type": "text", "text": _extraction_prompt_static_block()},
+        {"type": "text", "text": _extraction_prompt_dynamic_block(company, mission, evidence_text, sources_manifest)},
+    ]
+
+
+def _extraction_prompt(company: str, mission: str, evidence_text: str, sources_manifest: str) -> str:
+    return "\n\n".join(block["text"] for block in _extraction_prompt_blocks(company, mission, evidence_text, sources_manifest))
+
+
+def _scoring_prompt_static_block() -> str:
+    return CACHEABLE_SCORING_RULES
+
+
+def _scoring_prompt_dynamic_block(company: str, mission: str, mode: str, extraction: dict, sources_manifest: str,
+                                   csr_obligation: dict | None = None) -> str:
     calibration = _mode_calibration(mode)
     extraction_json = json.dumps(extraction, ensure_ascii=False, indent=2)
 
@@ -760,26 +580,14 @@ EXTRACTED FACTS FOR {company} (already verified against evidence — numbered so
 SOURCES:
 {sources_manifest}
 {obligation_block}
-{SCORING_PHILOSOPHY}
-
-{SCORING_CONSISTENCY_RULE}
-
-{CONFIDENCE_SEPARATION_RULE}
-
-{HIGHLIGHT_RULE}
-
-{SEARCH_DIRECTIVE_RULE}
-
-{CROSS_SECTION_CONSISTENCY_RULE}
-
 Produce, in this order:
-1. criteria[] — all 17 ids below, in order, each with id, name (copy exactly as given), score 0-5 or null, confidence 0-100, short evidence, short reasoning, drawn only from the extracted facts above. Follow the CONSISTENCY rule above for every score. IMPORTANT: `confidence` must reflect how directly the extracted facts support THIS criterion specifically — not your confidence in the company overall, and not the confidence you assigned to a different criterion. A criterion resting on an inferred/sector-default judgment (per the SCORING PHILOSOPHY) should carry a materially lower confidence than one resting on an explicit, named fact. If a criterion has no evidence at all in the extracted facts, emit score: null, confidence: 0, and say what was missing in `evidence` — per SCORING PHILOSOPHY, do not guess a low number just to fill the slot:
+1. criteria[] — all 17 ids below, in order, each with id, name (copy exactly as given), score 0-5 or null, confidence 0-100, short evidence, short reasoning, drawn only from the extracted facts above. Follow CONSISTENCY for every score. `confidence` must reflect how directly the extracted facts support THIS criterion specifically — not overall company confidence, and not another criterion's confidence. A criterion resting on an inferred/sector-default judgment (per SCORING PHILOSOPHY) should carry materially lower confidence than one resting on an explicit, named fact. If a criterion has no evidence at all, emit score: null, confidence: 0, and say what was missing in `evidence` — per SCORING PHILOSOPHY, do not guess a low number just to fill the slot:
 {_rubric_block()}
 2. Do NOT compute or emit fit_score yourself — per CONFIDENCE_SEPARATION_RULE, the application computes it deterministically from the criteria array above. Stop after criteria and move directly to the narrative fields below.
 3. fit_rationale (2-4 sentences): justify the scoring from the extracted facts, stating plainly what's confirmed vs inferred vs undocumented. Never explain a low score by citing limited evidence — a criterion with limited evidence should be null, not low. If a named partner/programme suggests a plausible but unconfirmed entry path, you may add one sentence starting literally "Inference (unconfirmed):" naming that specific org/programme — never invent one not in the extracted facts. If decision_makers and/or partners/programmes are non-empty, end with one short sentence "Key contacts: A (Title), B (Title); Key partners: X, Y" using only names from the extracted facts — never write a sentence implying no contact or programme was found if either array is non-empty. Omit that closing sentence only if both lists are empty.
 4. overall_semantic_alignment (0-100) + alignment_rationale (1-2 sentences) — how well the company's actual activity matches the NGO mission semantically, independent of documentation completeness.
 5. strategic_insight — a 150-280 word standalone narrative (this is the lead summary shown to the user first, and should read as usable outreach material, not just an internal note): measured and evidence-grounded, leading with genuine strengths before caveats, stating plainly whether/why this is a good fit, naming strongest/weakest dimensions without dwelling on the weakest, flagging group-foundation routing if present, noting eligibility if uncertain, weaving in the CSR obligation signal above if present, and giving one concrete next step. Lead with priority-area programmes (school education, STEM, AI, coding, digital skills, government schools) over generic CSR themes when both exist in the extracted facts. When spend is discussed, lead with the education-specific figure/trend over the total CSR figure if both are available, and never state a trend word unless the spend series actually supports it (per TREND_RULE) — if only one year of spend is known, describe the single figure and do not claim a trend. When a specific programme or partner is TAP-relevant, name its delivery channel explicitly (in-school/curriculum vs adult/standalone vs digital, etc.) and state concretely how TAP's own model (AI-enabled WhatsApp delivery, government-school, curriculum-embedded electives) does or doesn't overlap with it — write this so a sentence could be lifted directly into an outreach email, rather than a generic theme match like "both work in education." If TAP-similar partners exist, mention that positively. {"Since this is a screen-mode pass, if the signal is promising but sourcing is thin, say plainly that a deep-research pass would surface more (spend figures, named partners, a decision-maker) rather than treating the gap as a weakness." if mode == "screen" else ""} End with the same "Key contacts: ...; Key partners: ..." sentence format as fit_rationale (only using names from the extracted facts, and never contradicting a non-empty decision_makers/partners/programmes list), omitted only if both lists are empty.
-6. unscored_criteria_search_directives[] — apply the SEARCH_DIRECTIVES rule, but populate this only for criteria you scored null above, with target_field set to that criterion's id. Never populate this for a criterion you actually scored — this is not a general commentary field, only a follow-up list tied directly to genuine null scores.
+6. unscored_criteria_search_directives[] — apply SEARCH_DIRECTIVE_RULE, but populate this only for criteria you scored null above, with target_field set to that criterion's id. Never populate this for a criterion you actually scored.
 
 All criteria ids appear exactly once, in the order listed, each with its name copied exactly as given above. Keep every string concise so the full reply fits comfortably in your output budget.
 
@@ -796,6 +604,22 @@ JSON shape:
   "strategic_insight": "<150-280 word narrative, one **2-3 word** highlight, optional Inference/Key-contacts clauses>",
   "unscored_criteria_search_directives": [{{"question": "<short item>", "search_query": "<concrete ready-to-run search query>", "target_field": "<criterion id>", "priority": "<HIGH|MEDIUM|LOW>"}}]
 }}"""
+
+
+def _scoring_prompt_blocks(company: str, mission: str, mode: str, extraction: dict, sources_manifest: str,
+                            csr_obligation: dict | None = None) -> list[dict]:
+    return [
+        {"type": "text", "text": _scoring_prompt_static_block()},
+        {"type": "text", "text": _scoring_prompt_dynamic_block(company, mission, mode, extraction, sources_manifest, csr_obligation)},
+    ]
+
+
+def _scoring_prompt(company: str, mission: str, mode: str, extraction: dict, sources_manifest: str,
+                     csr_obligation: dict | None = None) -> str:
+    return "\n\n".join(
+        block["text"]
+        for block in _scoring_prompt_blocks(company, mission, mode, extraction, sources_manifest, csr_obligation)
+    )
 
 
 class CriterionResultSchema(BaseModel):
@@ -1184,46 +1008,59 @@ def compute_csr_obligation_signal(eligibility: dict, spend: dict) -> dict:
 
 
 async def call_anthropic_chat(
-    prompt: str,
+    prompt: str | list[dict],
     max_tokens: int = 1400,
     temperature: float = 0.0,
     model: str | None = None,
     caller: str = "unknown",
+    use_prompt_caching: bool = False,
 ) -> str | None:
     if not settings.anthropic_configured:
         logger.warning("anthropic call skipped caller=%s reason=not_configured", caller)
         return None
 
-    estimated_prompt_tokens = estimate_tokens(prompt)
+    if isinstance(prompt, str):
+        user_content: str | list[dict] = prompt
+        full_prompt_text_for_estimate = prompt
+    else:
+        blocks = list(prompt)
+        if use_prompt_caching and blocks:
+            static_tokens = estimate_tokens(blocks[0].get("text", ""))
+            if static_tokens >= MIN_CACHEABLE_BLOCK_TOKENS:
+                blocks[0] = {**blocks[0], "cache_control": {"type": "ephemeral"}}
+        user_content = blocks
+        full_prompt_text_for_estimate = "\n\n".join(b.get("text", "") for b in blocks)
+
+    estimated_prompt_tokens = estimate_tokens(full_prompt_text_for_estimate)
     resolved_model = model or settings.anthropic_model
     payload = {
         "model": resolved_model,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "messages": [
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": user_content},
             {"role": "assistant", "content": "{"},
         ],
     }
 
+    headers = {
+        "x-api-key": settings.anthropic_api_key,
+        "anthropic-version": ANTHROPIC_API_VERSION,
+        "Content-Type": "application/json",
+    }
+    if use_prompt_caching:
+        headers["anthropic-beta"] = ANTHROPIC_PROMPT_CACHING_BETA_HEADER
+
     logger.info(
-        "anthropic request caller=%s model=%s max_tokens=%d estimated_prompt_tokens=%d temperature=%.2f",
-        caller, resolved_model, max_tokens, estimated_prompt_tokens, temperature,
+        "anthropic request caller=%s model=%s max_tokens=%d estimated_prompt_tokens=%d temperature=%.2f caching=%s",
+        caller, resolved_model, max_tokens, estimated_prompt_tokens, temperature, use_prompt_caching,
     )
-    _dump_llm_io(caller, "prompt", prompt)
-    logger.debug("anthropic FULL PROMPT caller=%s\n%s", caller, prompt)
+    _dump_llm_io(caller, "prompt", full_prompt_text_for_estimate)
+    logger.debug("anthropic FULL PROMPT caller=%s\n%s", caller, full_prompt_text_for_estimate)
 
     try:
         client = _get_http_client()
-        response = await client.post(
-            ANTHROPIC_MESSAGES_URL,
-            headers={
-                "x-api-key": settings.anthropic_api_key,
-                "anthropic-version": ANTHROPIC_API_VERSION,
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
+        response = await client.post(ANTHROPIC_MESSAGES_URL, headers=headers, json=payload)
     except httpx.HTTPError as exc:
         logger.error("anthropic transport error caller=%s error=%s", caller, exc)
         return None
@@ -1254,11 +1091,13 @@ async def call_anthropic_chat(
         logger.error("anthropic non-json response caller=%s raw_text=%r", caller, response.text[:2000])
         return None
 
+    usage = body.get("usage") or {}
     logger.info(
-        "anthropic response caller=%s status=%d stop_reason=%s input_tokens=%s output_tokens=%s",
+        "anthropic response caller=%s status=%d stop_reason=%s input_tokens=%s output_tokens=%s "
+        "cache_creation_input_tokens=%s cache_read_input_tokens=%s",
         caller, response.status_code, body.get("stop_reason"),
-        (body.get("usage") or {}).get("input_tokens"),
-        (body.get("usage") or {}).get("output_tokens"),
+        usage.get("input_tokens"), usage.get("output_tokens"),
+        usage.get("cache_creation_input_tokens"), usage.get("cache_read_input_tokens"),
     )
 
     if body.get("stop_reason") == "max_tokens":
@@ -1399,27 +1238,31 @@ def _looks_like_former_role(*texts: str) -> bool:
 
 _NARRATIVE_CSR_TITLE_PATTERN = re.compile(
     r"\b(csr|corporate social responsibility|esg|sustainability|corporate responsibility|"
-    r"social impact|community relations|philanthrop|csr\s*&?\s*esg|foundation)\b.{0,40}"
-    r"\b(lead|leader|head|director|manager|officer|committee|partner|chair)\b"
-    r"|\b(head|director|lead|leader|partner|chair|manager)\b.{0,40}"
+    r"social impact|community relations|philanthrop|csr\s*&?\s*esg|foundation|"
+    r"diversity|inclusion|d&i|di&e|responsible business|citizenship|purpose)\b.{0,50}"
+    r"\b(lead|leader|head|director|manager|officer|committee|partner|chair|"
+    r"vp|vice\s*president|avp|svp|evp|trustee|chief)\b"
+    r"|\b(head|director|lead|leader|partner|chair|manager|vp|vice\s*president|"
+    r"avp|svp|evp|trustee|chief|officer)\b.{0,50}"
     r"\b(csr|corporate social responsibility|esg|sustainability|corporate responsibility|"
-    r"social impact|community relations|philanthrop|foundation)\b",
+    r"social impact|community relations|philanthrop|foundation|diversity|inclusion|"
+    r"responsible business|citizenship|purpose)\b",
     re.IGNORECASE,
 )
 
 _NARRATIVE_NAME_PATTERN = re.compile(
-    r"\b((?:Dr\.?\s+)?[A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+){1,3})\b"
+    r"\b((?:Dr\.?\s+|Mr\.?\s+|Ms\.?\s+|Mrs\.?\s+)?[A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+){1,4})\b"
 )
 
 _NARRATIVE_NAME_STOPWORDS = {
     "CGI", "CSR", "ESG", "India", "TAP", "NGO", "MCD", "BMC", "SCERT",
-    "CEO", "MD", "The", "This", "That",
+    "CEO", "MD", "The", "This", "That", "Dr", "Mr", "Ms", "Mrs",
 }
 
 
 def _looks_like_person_name_token_run(candidate: str) -> bool:
-    tokens = [t for t in candidate.replace("Dr.", "Dr").split() if t]
-    core_tokens = [t.rstrip(".") for t in tokens if t.rstrip(".") not in ("Dr",)]
+    tokens = [t for t in re.sub(r"^(Dr|Mr|Ms|Mrs)\.?\s+", "", candidate).split() if t]
+    core_tokens = [t.rstrip(".") for t in tokens]
     if not (1 < len(core_tokens) <= 4):
         return False
     if any(tok in _NARRATIVE_NAME_STOPWORDS for tok in core_tokens):
@@ -1437,8 +1280,8 @@ def _extract_named_people_from_narrative(*texts: str) -> list[dict]:
             candidate = match.group(1).strip()
             if not _looks_like_person_name_token_run(candidate):
                 continue
-            window_start = max(0, match.start() - 80)
-            window_end = min(len(text), match.end() + 80)
+            window_start = max(0, match.start() - 90)
+            window_end = min(len(text), match.end() + 90)
             window = text[window_start:window_end]
             if not _NARRATIVE_CSR_TITLE_PATTERN.search(window):
                 continue
@@ -1467,6 +1310,8 @@ def _reconcile_narrative_named_people_into_decision_makers(extraction: dict, cal
         extraction.get("csr_head_note", ""),
         extraction.get("key_facts_summary", ""),
         extraction.get("delivery_model_evidence", ""),
+        extraction.get("fit_rationale", ""),
+        extraction.get("strategic_insight", ""),
     )
     narrative_people = _extract_named_people_from_narrative(*narrative_fields)
 
@@ -1495,6 +1340,38 @@ def _reconcile_narrative_named_people_into_decision_makers(extraction: dict, cal
             "_reconcile_narrative_named_people_into_decision_makers recovered names not in structured "
             "array caller=%s names=%s", caller, added_names,
         )
+    return extraction
+
+
+_NO_CSR_HEAD_CONTRADICTION_PATTERN = re.compile(
+    r"no\s+(?:named\s+)?(?:csr|sustainability)\s+head\s+(?:has\s+been\s+)?identified|"
+    r"no\s+csr\s+head\s+found|no\s+decision[\s-]makers?\s+found|"
+    r"no\s+named\s+programmes?\s+(?:found|identified)|"
+    r"insufficient\s+(?:evidence|data)\s+(?:on|for)\s+decision[\s-]makers?",
+    re.IGNORECASE,
+)
+
+
+def _enforce_decision_maker_narrative_consistency(extraction: dict) -> dict:
+    decision_makers = extraction.get("decision_makers") or []
+    narrative_fields = (
+        "csr_head_note", "key_facts_summary", "delivery_model_evidence",
+        "fit_rationale", "strategic_insight",
+    )
+    if decision_makers:
+        lead = decision_makers[0]
+        lead_line = f"{lead.get('name', '')} — {lead.get('title', '')}".strip(" —")
+        for field in narrative_fields:
+            value = extraction.get(field, "")
+            if isinstance(value, str) and value and _NO_CSR_HEAD_CONTRADICTION_PATTERN.search(value):
+                if field == "csr_head_note":
+                    extraction[field] = lead_line
+                else:
+                    extraction[field] = _NO_CSR_HEAD_CONTRADICTION_PATTERN.sub("", value).strip()
+    else:
+        note = extraction.get("csr_head_note", "")
+        if isinstance(note, str) and note and _NO_CSR_HEAD_CONTRADICTION_PATTERN.search(note):
+            extraction["csr_head_note"] = ""
     return extraction
 
 
@@ -1612,19 +1489,29 @@ def _build_auto_search_query(company: str, question: str) -> str:
     return f'"{company}" {question}'.strip()
 
 
-def _sanitize_search_directives(company: str, raw_value, cap: int = MAX_SEARCH_DIRECTIVES) -> list[dict]:
+def _slugify_directive_question(question: str) -> str:
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in (question or "").strip().lower())
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return f"open:{normalized[:60]}" if normalized else ""
+
+
+def _sanitize_search_directives(company: str, raw_value, cap: int = MAX_SEARCH_DIRECTIVES,
+                                 restrict_target_field_to: set | None = None) -> list[dict]:
     if not isinstance(raw_value, list):
         return []
     directives = []
     for entry in raw_value:
         if isinstance(entry, str):
+            if restrict_target_field_to is not None:
+                continue
             question = entry.strip()
             if not question:
                 continue
+            target_field = _slugify_directive_question(question)
             directives.append({
                 "question": question[:240],
                 "search_query": _build_auto_search_query(company, question)[:300],
-                "target_field": "",
+                "target_field": target_field,
                 "priority": "MEDIUM",
             })
         elif isinstance(entry, dict):
@@ -1634,10 +1521,16 @@ def _sanitize_search_directives(company: str, raw_value, cap: int = MAX_SEARCH_D
                 continue
             if not search_query:
                 search_query = _build_auto_search_query(company, question)
+            target_field = str(entry.get("target_field", "")).strip()[:160]
+            if restrict_target_field_to is not None:
+                if target_field not in restrict_target_field_to:
+                    continue
+            elif not target_field:
+                target_field = _slugify_directive_question(question)
             directives.append({
                 "question": question[:240],
                 "search_query": search_query[:300],
-                "target_field": str(entry.get("target_field", "")).strip()[:160],
+                "target_field": target_field,
                 "priority": _normalize_search_directive_priority(entry.get("priority", "")),
             })
         if len(directives) >= cap:
@@ -2035,6 +1928,7 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
     parsed = _sanitize_dict_for_model(parsed, FullAnalysisSchema)
     parsed["unscored_criteria_search_directives"] = _sanitize_search_directives(
         company_for_directives, raw_unscored_directives, cap=MAX_SEARCH_DIRECTIVES,
+        restrict_target_field_to=set(CRITERIA_IDS),
     )
 
     if isinstance(parsed.get("programmes"), list):
@@ -2122,6 +2016,8 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
         for entry in parsed["decision_makers"]:
             if isinstance(entry, dict) and entry.get("linkedin_url"):
                 entry["linkedin_url"] = _sanitize_linkedin_url(entry["linkedin_url"])
+
+    parsed = _enforce_decision_maker_narrative_consistency(parsed)
 
     try:
         return FullAnalysisSchema.model_validate(parsed)
@@ -2293,12 +2189,13 @@ async def extract_company_facts(
         )
         return None
 
-    prompt = _build(evidence_text)
+    prompt_blocks = _extraction_prompt_blocks(company, mission, evidence_text, sources_manifest)
     raw_reply = await call_anthropic_chat(
-        prompt,
+        prompt_blocks,
         temperature=0.0,
         max_tokens=EXTRACTION_OUTPUT_TOKEN_RESERVE,
         caller=f"extract_facts:{company}",
+        use_prompt_caching=True,
     )
     if raw_reply is None:
         logger.error("extract_company_facts got no reply company=%r", company)
@@ -2314,6 +2211,7 @@ async def extract_company_facts(
     extraction = reconcile_extraction(extraction, working_sources)
     extraction = _merge_verified_people_hits_into_extraction(extraction, working_sources, caller=f"extract_facts:{company}")
     extraction = _reconcile_narrative_named_people_into_decision_makers(extraction, caller=f"extract_facts:{company}")
+    extraction = _enforce_decision_maker_narrative_consistency(extraction)
 
     valid_sources = _valid_source_lookup(sources_manifest)
     extraction["delivery_model_source"] = _sanitize_source(extraction.get("delivery_model_source", ""), valid_sources)
@@ -2416,8 +2314,9 @@ async def score_extracted_facts(
                       "overall_authenticity_score", "evidence_recency",
                       "source_quality_assessment", "csr_head_note")
     }
-    prompt = _scoring_prompt(company, mission, mode, scoring_facts, sources_manifest, csr_obligation=csr_obligation)
-    prompt_tokens = estimate_tokens(prompt)
+    prompt_blocks = _scoring_prompt_blocks(company, mission, mode, scoring_facts, sources_manifest, csr_obligation=csr_obligation)
+    prompt_text_for_estimate = "\n\n".join(b["text"] for b in prompt_blocks)
+    prompt_tokens = estimate_tokens(prompt_text_for_estimate)
     output_ceiling = _anthropic_context_window() - SCORING_OUTPUT_TOKEN_RESERVE
 
     if prompt_tokens > output_ceiling:
@@ -2425,8 +2324,9 @@ async def score_extracted_facts(
         for list_field in ("programmes", "partners", "decision_makers", "geographies", "red_flags"):
             if trimmed_facts.get(list_field):
                 trimmed_facts[list_field] = trimmed_facts[list_field][:5]
-        prompt = _scoring_prompt(company, mission, mode, trimmed_facts, sources_manifest, csr_obligation=csr_obligation)
-        prompt_tokens = estimate_tokens(prompt)
+        prompt_blocks = _scoring_prompt_blocks(company, mission, mode, trimmed_facts, sources_manifest, csr_obligation=csr_obligation)
+        prompt_text_for_estimate = "\n\n".join(b["text"] for b in prompt_blocks)
+        prompt_tokens = estimate_tokens(prompt_text_for_estimate)
 
     if prompt_tokens > output_ceiling:
         logger.error(
@@ -2436,10 +2336,11 @@ async def score_extracted_facts(
         return None
 
     raw_reply = await call_anthropic_chat(
-        prompt,
+        prompt_blocks,
         temperature=0.0,
         max_tokens=SCORING_OUTPUT_TOKEN_RESERVE,
         caller=f"score_facts:{company}",
+        use_prompt_caching=True,
     )
     if raw_reply is None:
         logger.error("score_extracted_facts got no reply company=%r", company)
@@ -2453,6 +2354,7 @@ async def score_extracted_facts(
     parsed["_company_hint"] = company
     parsed["unscored_criteria_search_directives"] = _sanitize_search_directives(
         company, parsed.get("unscored_criteria_search_directives"), cap=MAX_SEARCH_DIRECTIVES,
+        restrict_target_field_to=set(CRITERIA_IDS),
     )
 
     logger.info(
@@ -2489,8 +2391,17 @@ async def analyze_and_score_company(
     sources_manifest: str,
     mode: str = "deep",
     cfg: dict | None = None,
+    precomputed_extraction: dict | None = None,
 ) -> dict | None:
-    extraction = await extract_company_facts(company, mission, cleaned_sources, sources_manifest)
+    if precomputed_extraction is not None:
+        extraction = precomputed_extraction
+        logger.info(
+            "analyze_and_score_company REUSING precomputed extraction company=%r mode=%r — "
+            "skipping a redundant extraction call",
+            company, mode,
+        )
+    else:
+        extraction = await extract_company_facts(company, mission, cleaned_sources, sources_manifest)
     if not extraction:
         return None
 
@@ -2521,6 +2432,7 @@ async def analyze_and_score_company(
     merged["unscored_criteria_search_directives"] = scoring.get("unscored_criteria_search_directives", [])
     merged["scoring_incomplete"] = False
     merged["_company_hint"] = company
+    merged = _reconcile_narrative_named_people_into_decision_makers(merged, caller=f"score_facts:{company}")
 
     validated = _repair_analysis(merged)
     result = validated.model_dump()
@@ -2579,13 +2491,13 @@ async def analyze_and_score_company(
         "analyze_and_score_company DONE company=%r mode=%s final_fit_score=%s research_coverage=%d "
         "authenticity=%d avg_criteria_confidence=%.1f weighted_criteria_confidence=%.1f coverage_insufficient=%s "
         "coverage_reason=%r research_confidence=%s partners=%d programmes=%d decision_makers=%d "
-        "unscored_search_directives=%d",
+        "unscored_search_directives=%d reused_extraction=%s",
         company, mode, result["fit_score"], result["research_coverage"], result["overall_authenticity_score"],
         result["average_criteria_confidence_pct"], result["weighted_criteria_confidence_pct"],
         result["evidence_coverage_insufficient"], result["evidence_coverage_reason"],
         result["research_confidence_label"],
         len(result["partners"]), len(result["programmes"]), len(result["decision_makers"]),
-        len(result.get("unscored_criteria_search_directives", [])),
+        len(result.get("unscored_criteria_search_directives", [])), precomputed_extraction is not None,
     )
     logger.info(
         "analyze_and_score_company criteria breakdown company=%r %s",
