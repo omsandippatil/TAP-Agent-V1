@@ -630,9 +630,20 @@ def is_search_derived_domain_trustworthy(company: str, host: str, search_result_
     return bool(_SEARCH_DERIVED_BUSINESS_CONTEXT_PATTERN.search(haystack))
 
 
-def mentions_company(company: str, text: str) -> bool:
+def mentions_company(company: str, text: str, known_domains: list[str] | None = None,
+                      url: str = "") -> bool:
     if not text:
         return False
+    if known_domains and url:
+        host = urlparse(url).netloc.lower()
+        if host and any(host == d or host.endswith("." + d) or d.endswith("." + host) for d in known_domains):
+            tokens = company_name_tokens(company)
+            if tokens:
+                lowered = text.lower()
+                if any(token in lowered for token in tokens):
+                    return True
+            elif company.lower() in text.lower():
+                return True
     if is_unreliable_for_blind_guessing(company):
         return _mentions_generic_company_name(company, text)
     lowered = text.lower()
@@ -818,8 +829,12 @@ def _record_blocked_response(url: str, status_code: int | None) -> None:
         )
 
 
-def accept_fetched_text(company: str, text: str, min_len: int = 400) -> bool:
-    return bool(text) and len(text) > min_len and is_csr_relevant(text) and mentions_company(company, text)
+def accept_fetched_text(company: str, text: str, min_len: int = 400, known_domains: list[str] | None = None,
+                         url: str = "") -> bool:
+    return (
+        bool(text) and len(text) > min_len and is_csr_relevant(text)
+        and mentions_company(company, text, known_domains=known_domains, url=url)
+    )
 
 
 def score_candidate_text(company: str, text: str, url: str = "") -> float:
@@ -1431,16 +1446,21 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
     best_candidate = [None]
     weak_snippet_fallback = [None]
     document_found_unreadable = [False]
+    known_company_domains: list[str] = []
 
     def consider(url: str, method: str, text: str):
         text_preview = (text or "")[:200].replace("\n", " ")
-        if accept_fetched_text(company, text, 250):
+        url_host = urlparse(url).netloc.lower() if url else ""
+        domain_is_confirmed = bool(url_host) and any(
+            url_host == d or url_host.endswith("." + d) for d in known_company_domains
+        )
+        if accept_fetched_text(company, text, 250, known_domains=known_company_domains, url=url):
             score = score_candidate_text(company, text, url)
             _vlog(
                 logging.INFO,
                 "india_csr_page CANDIDATE ACCEPTED company=%r url=%s method=%s score=%.1f "
-                "text_len=%d preview=%r",
-                company, url, method, score, len(text or ""), text_preview,
+                "text_len=%d domain_confirmed=%s preview=%r",
+                company, url, method, score, len(text or ""), domain_is_confirmed, text_preview,
             )
             if best_candidate[0] is None or score > best_candidate[0][0]:
                 source = make_source("india_csr_page", 1, url, text, "FOUND", method)
@@ -1457,10 +1477,13 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
         _vlog(
             logging.INFO,
             "india_csr_page CANDIDATE REJECTED company=%r url=%s method=%s reason=%s "
-            "text_len=%d preview=%r",
-            company, url, method, rejection_reason, len(text or ""), text_preview,
+            "text_len=%d domain_confirmed=%s preview=%r",
+            company, url, method, rejection_reason, len(text or ""), domain_is_confirmed, text_preview,
         )
-        if text and len(text) > 80 and mentions_company(company, text) and mentions_csr_context(text):
+        if (
+            text and len(text) > 80 and is_csr_relevant(text) and mentions_csr_context(text)
+            and (domain_is_confirmed or mentions_company(company, text))
+        ):
             score = score_candidate_text(company, text, url)
             _vlog(
                 logging.INFO,
@@ -1510,6 +1533,7 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
 
     discovered_domains = await discover_company_domains(company, search_cfg, budget, quota_guard)
     domains = [d for d in dict.fromkeys(discovered_domains + candidate_domains(company)) if not budget.is_domain_dead(d)]
+    known_company_domains = list(dict.fromkeys(discovered_domains + domains))
 
     async def check_homepage(domain: str):
         try:
