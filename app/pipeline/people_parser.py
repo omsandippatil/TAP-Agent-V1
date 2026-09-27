@@ -35,7 +35,15 @@ CSR_ROLE_KEYWORD_PATTERN = re.compile(
     r"corporate\s+social\s+responsibility|"
     r"inclusion\s+(?:head|lead|manager|director)|"
     r"diversity\s*(?:,|&|and)?\s*inclusion|"
-    r"philanthropy\s+(?:head|lead|manager|director))",
+    r"philanthropy\s+(?:head|lead|manager|director)|"
+    r"chief\s+(?:impact|purpose|citizenship)\s+officer|"
+    r"head\s+of\s+(?:impact|purpose|citizenship|responsible\s+business)|"
+    r"responsible\s+business\s+(?:head|lead|manager|director)|"
+    r"impact\s+(?:head|lead|manager|director)|"
+    r"purpose\s+(?:head|lead|manager|director)|"
+    r"csr\s*(?:&|and)\s*esg\s+(?:head|lead|manager|director)|"
+    r"esg\s*(?:&|and)\s*csr\s+(?:head|lead|manager|director)|"
+    r"sustainability\s*(?:&|and)\s*csr\s+(?:head|lead|manager|director))",
     re.IGNORECASE,
 )
 
@@ -48,7 +56,10 @@ CSR_FUNCTIONAL_TITLE_PATTERN = re.compile(
     r"social\s+impact\s+(?:head|lead|manager)|head\s+of\s+social\s+impact|"
     r"philanthropy\s+(?:head|lead|manager)|head\s+of\s+philanthropy|"
     r"community\s+(?:engagement|relations|development)\s+(?:head|lead|manager)|"
-    r"foundation\s+(?:director|head|manager))",
+    r"foundation\s+(?:director|head|manager)|"
+    r"chief\s+(?:impact|purpose|citizenship)\s+officer|"
+    r"head\s+of\s+(?:impact|purpose|citizenship|responsible\s+business)|"
+    r"responsible\s+business\s+(?:head|lead|manager|director))",
     re.IGNORECASE,
 )
 
@@ -66,20 +77,6 @@ SENIOR_EXECUTIVE_TITLE_PATTERN = re.compile(
 )
 
 ROLE_CLAUSE_SPLIT_PATTERN = re.compile(r"\s*(?:,|;|\band\b)\s*", re.IGNORECASE)
-
-# ---------------------------------------------------------------------------
-# REGIONAL RESPONSIBILITY vs LOCATION
-#
-# location_mentions_india() (above) only answers "is India mentioned
-# anywhere near this person at all" -- that is necessary but not sufficient
-# evidence that the person's ROLE covers India. "Country Head India" and
-# "worked on projects in India" both trip location_mentions_india() but only
-# the first is evidence of actual India responsibility. These patterns are
-# matched against individual role CLAUSES (via split_role_clauses), never
-# the whole snippet at once, for the same reason has_unverified_senior_title
-# is clause-scoped: a responsibility phrase in one clause must not vouch for
-# an unrelated clause about a different role or a different person's context.
-# ---------------------------------------------------------------------------
 
 INDIA_DIRECT_RESPONSIBILITY_PATTERN = re.compile(
     r"(india\s+head|head\s*(?:,|-|\u2013|\u2014)?\s*(?:of\s+)?[\w\s]{0,30}\bindia\b|"
@@ -99,14 +96,6 @@ INDIA_REGIONAL_RESPONSIBILITY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Weak signal: India merely appears near the person (bio, city, "worked in
-# India", quoted talking about India, etc.) with no head/lead/CSR-role
-# phrase attached to it. This intentionally overlaps with
-# location_mentions_india() -- it is the same underlying signal, just
-# explicitly named/scoped for the responsibility-vs-location distinction so
-# downstream ranking code has a field that says "this is ONLY a location
-# signal" rather than silently reusing the location field as if it were
-# proof of responsibility.
 INDIA_WEAK_MENTION_PATTERN = re.compile(r"\bindia\b|\bbharat\b", re.IGNORECASE)
 
 SENIORITY_KEYWORD_PATTERN_ORDER = [
@@ -405,23 +394,10 @@ def is_current_csr_role(raw_title: str, snippet: str) -> bool:
     return not FORMER_ROLE_KEYWORD_PATTERN.search(haystack)
 
 
-# Minimum fraction of a multi-word target company's significant tokens that
-# must appear in the resolved affiliation string before we call it a match.
-# A single shared token ("UBS" inside both "UBS" and "UBS Optimus
-# Foundation") is not enough evidence that the person is affiliated with the
-# SPECIFIC entity being searched for -- "UBS" is also true of thousands of
-# UBS employees who have nothing to do with the Foundation. Requiring most
-# tokens to match still allows minor wording differences (e.g. missing
-# "Foundation" suffix in a truncated LinkedIn headline) without accepting a
-# bare parent-brand mention as proof of affiliation with a specific
-# subsidiary/foundation/division.
 _COMPANY_MATCH_MIN_TOKEN_FRACTION = 0.6
 
 
 def _company_match_strength(affiliation_lower: str, tokens: list) -> float:
-    """Fraction of the target company's significant tokens found in the
-    resolved affiliation string. Returns 0.0 if there are no tokens to
-    check or the affiliation string is empty."""
     if not tokens or not affiliation_lower:
         return 0.0
     matched = sum(1 for token in tokens if token in affiliation_lower)
@@ -436,11 +412,6 @@ def is_currently_at_company(raw_title: str, snippet: str, affiliation: str, comp
         return False
 
     affiliation_lower = (affiliation or "").lower()
-    # For a single-word company name (e.g. "Ericsson", "Microsoft") any
-    # token match is already a full match, so the fraction-based bar below
-    # reduces to the old any() check automatically. For multi-word company
-    # names, this now requires MOST of the distinguishing tokens to be
-    # present, not just one -- see _COMPANY_MATCH_MIN_TOKEN_FRACTION.
     if _company_match_strength(affiliation_lower, tokens) < _COMPANY_MATCH_MIN_TOKEN_FRACTION:
         return False
 

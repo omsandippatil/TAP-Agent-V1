@@ -49,6 +49,20 @@ FINGERPRINT_WORD_LIMIT = 20
 
 LOG_SOURCE_TEXT_PREVIEW_CHARS = 400
 
+RELEVANCE_KEYWORD_WEIGHTS = {
+    "stem": 4, "artificial intelligence": 4, " ai ": 3, "coding": 4, "robotics": 3,
+    "digital skill": 4, "digital literacy": 4, "government school": 5, "public school": 4,
+    "teacher training": 4, "teacher capacity": 3, "curriculum": 3, "student": 3,
+    "beneficiar": 3, "school": 2, "21st century": 3, "21st-century": 3,
+    "e-learning": 3, "elearning": 3, "science fair": 3, "girls in": 3, "atal tinkering": 4,
+    "csr expenditure": 3, "csr spend": 3, "crore": 2, "lakh": 2, "foundation": 2,
+    "ngo partner": 3, "implementing partner": 3, "partnership": 2, "programme": 2,
+    "program": 2, "initiative": 2, "csr committee": 1, "sustainability report": 1,
+    "annexure": 1, "schedule vii": 1,
+}
+
+RELEVANCE_FLOOR_SCORE = -1000
+
 
 def normalize_whitespace_and_html(raw_text):
     if not raw_text:
@@ -105,14 +119,6 @@ def _stopword_fingerprint(sentence):
 
 
 def clean_source_text(raw_text, seen_fingerprints=None, source_name=""):
-    """Strip boilerplate/nav/cookie-banner lines and cross-source duplicate
-    sentences. This never rewrites, reorders, or drops sentences based on
-    topical relevance — it only removes junk and exact-duplicate boilerplate
-    that appears verbatim across multiple pages. The stopword fingerprint is
-    used purely as a cheap dedup key; the sentence text that is kept is
-    returned completely verbatim, so the model reads real grammatical
-    sentences rather than a stopword-stripped bag of words.
-    """
     if not raw_text:
         return ""
     if seen_fingerprints is None:
@@ -167,16 +173,6 @@ def estimate_tokens(text):
 
 
 def remove_stopwords_and_boilerplate(sources, company=""):
-    """The single entry point this module exposes to the rest of the
-    pipeline. For every FOUND source, strips boilerplate/nav junk and
-    cross-source duplicate sentences via clean_source_text(), and leaves
-    everything else about the source dict untouched. No relevance scoring,
-    no keyword weighting, no per-source priority — every source is treated
-    identically. `company` is accepted for interface symmetry with the rest
-    of the pipeline but is intentionally unused: which sentences survive
-    here must not depend on which company is being screened, only on
-    whether a sentence is boilerplate or a duplicate.
-    """
     if not sources:
         logger.info("remove_stopwords_and_boilerplate company=%r no sources provided", company)
         return sources
@@ -201,14 +197,49 @@ def remove_stopwords_and_boilerplate(sources, company=""):
     return cleaned
 
 
+def _sentence_relevance_score(sentence_lower):
+    return sum(weight for keyword, weight in RELEVANCE_KEYWORD_WEIGHTS.items() if keyword in sentence_lower)
+
+
+def relevance_ranked_sentences(text):
+    sentences = split_sentences(text)
+    scored = []
+    for position, sentence in enumerate(sentences):
+        score = _sentence_relevance_score(sentence.lower())
+        scored.append((score, position, sentence))
+    return scored
+
+
+def truncate_preserving_relevant_content(text, target_chars):
+    if not text or len(text) <= target_chars:
+        return text or ""
+
+    scored = relevance_ranked_sentences(text)
+    if not scored:
+        return text[:target_chars]
+
+    ordered_by_relevance = sorted(scored, key=lambda item: (-item[0], item[1]))
+
+    kept_positions = set()
+    used_chars = 0
+    for score, position, sentence in ordered_by_relevance:
+        addition = len(sentence) + 1
+        if used_chars + addition > target_chars and kept_positions:
+            continue
+        kept_positions.add(position)
+        used_chars += addition
+        if used_chars >= target_chars:
+            break
+
+    if not kept_positions:
+        return text[:target_chars]
+
+    ordered_sentences = [sentence for _, position, sentence in scored if position in kept_positions]
+    result = " ".join(ordered_sentences)
+    return result[:target_chars] if len(result) > target_chars else result
+
+
 def clean_and_budget_sources(sources, token_budget):
-    """Clean sources, then if the combined evidence still exceeds
-    token_budget, truncate every source proportionally to its own length.
-    This is deliberately dumb and transparent: no source is judged more
-    important than another here, so nothing about which source gets more
-    room depends on a code-level opinion about relevance. If content is
-    lost, it's lost evenly across all sources, not selectively.
-    """
     if not sources:
         logger.info("clean_and_budget_sources no sources provided token_budget=%s", token_budget)
         return sources
@@ -251,11 +282,11 @@ def clean_and_budget_sources(sources, token_budget):
             name = source.get("source_name")
             text = source["text"]
             target_chars = max(MIN_TRUNCATE_CHARS, int(len(text) * keep_ratio))
-            truncated_text = text[:target_chars]
+            truncated_text = truncate_preserving_relevant_content(text, target_chars)
             result_by_name[name] = {**source, "text": truncated_text}
             logger.info(
                 "clean_and_budget_sources TRUNCATED source=%r cleaned_chars=%d kept_chars=%d "
-                "pre_clean_chars=%d keep_ratio=%.3f",
+                "pre_clean_chars=%d keep_ratio=%.3f relevance_ranked=True",
                 name, len(text), len(truncated_text), pre_clean_lengths.get(name, 0), keep_ratio,
             )
         logger.info(

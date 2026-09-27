@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import random
+import threading
+import time
+from datetime import datetime, timezone
 
 import httpx
 
@@ -21,6 +24,64 @@ _KEY_FAILURE_RETRY_STATUSES = {400, 403, 429}
 
 class GoogleCseInvalidArgumentError(Exception):
     pass
+
+
+class _DailyQuotaTracker:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._day_key = self._current_day_key()
+        self._used_today = 0
+        self._exhausted_today = False
+
+    @staticmethod
+    def _current_day_key() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _roll_if_new_day(self):
+        current_day = self._current_day_key()
+        if current_day != self._day_key:
+            self._day_key = current_day
+            self._used_today = 0
+            self._exhausted_today = False
+
+    def record_usage(self):
+        with self._lock:
+            self._roll_if_new_day()
+            self._used_today += 1
+            cap = getattr(settings, "google_search_daily_cap", 0) or 0
+            if cap and self._used_today >= cap:
+                if not self._exhausted_today:
+                    logger.warning(
+                        "google search daily cap reached for the day cap=%d used=%d",
+                        cap, self._used_today,
+                    )
+                self._exhausted_today = True
+
+    def is_exhausted(self) -> bool:
+        with self._lock:
+            self._roll_if_new_day()
+            return self._exhausted_today
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            self._roll_if_new_day()
+            return {
+                "day": self._day_key,
+                "used_today": self._used_today,
+                "cap": getattr(settings, "google_search_daily_cap", 0) or 0,
+                "exhausted_today": self._exhausted_today,
+            }
+
+
+_daily_quota_tracker = _DailyQuotaTracker()
+
+
+def daily_quota_status() -> dict:
+    return _daily_quota_tracker.snapshot()
+
+
+def daily_quota_is_exhausted() -> bool:
+    return _daily_quota_tracker.is_exhausted()
 
 
 def _log_startup_status_once():
@@ -69,12 +130,15 @@ def google_search_configured_and_available(quota_guard=None) -> bool:
     _log_startup_status_once()
     if not settings.google_search_configured:
         return False
+    if daily_quota_is_exhausted():
+        return False
     if quota_guard is None:
         return True
     return bool(quota_guard.has_quota())
 
 
 async def _register_quota_usage(quota_guard) -> None:
+    _daily_quota_tracker.record_usage()
     if quota_guard is not None:
         await quota_guard.record_usage()
 
@@ -100,6 +164,8 @@ async def _call_with_key(query: str, num: int, api_key: str) -> tuple[list[dict]
         )
         if status_code == 400:
             raise GoogleCseInvalidArgumentError(body_text) from exc
+        if status_code == 429:
+            _daily_quota_tracker.record_usage()
         return None, status_code
     except httpx.HTTPError as exc:
         logger.warning("google custom search request failed error=%s query=%r", exc, query)

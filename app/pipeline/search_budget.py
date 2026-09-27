@@ -3,17 +3,34 @@ import logging
 logger = logging.getLogger("tap.search_budget")
 
 DEFAULT_MAX_GOOGLE_QUERIES = 34
+SCREEN_MAX_GOOGLE_QUERIES = 30
+
+SECOND_PASS_CATEGORIES = (
+    "second_pass_short_extract",
+    "second_pass_unreadable_doc",
+    "second_pass_education",
+    "second_pass_named_entity",
+    "second_pass_broad_fallback",
+    "second_pass_chained_followup",
+)
+
+DIRECTED_SEARCH_CATEGORY_PREFIX = "directed_search_field"
 
 CATEGORY_FLOORS_DEFAULT = {
     "csr_page": 4,
-    "annual_report": 2,
+    "annual_report": 3,
     "partner_search": 2,
     "education_programme_search": 3,
     "people_search": 2,
     "mca_filing": 1,
     "cin": 1,
     "legal_entity": 1,
-    "second_pass": 5,
+    "second_pass_short_extract": 2,
+    "second_pass_unreadable_doc": 2,
+    "second_pass_education": 3,
+    "second_pass_named_entity": 2,
+    "second_pass_broad_fallback": 1,
+    "second_pass_chained_followup": 3,
 }
 
 CATEGORY_SUCCESS_TARGET_DEFAULT = {
@@ -30,28 +47,59 @@ CATEGORY_SUCCESS_TARGET_DEFAULT = {
     "sector_eligibility_search": 1,
     "multi_year_financials": 1,
     "entity_resolution": 2,
+    "second_pass_short_extract": 2,
+    "second_pass_unreadable_doc": 2,
+    "second_pass_education": 1,
+    "second_pass_named_entity": 2,
+    "second_pass_broad_fallback": 1,
+    "second_pass_chained_followup": 3,
 }
 
 DEFAULT_MAX_EMPTY_STREAK = 2
 
 
+def default_category_floors_for_mode(mode: str) -> dict[str, int]:
+    floors = dict(CATEGORY_FLOORS_DEFAULT)
+    if mode == "screen":
+        floors["second_pass_education"] = 2
+        floors["second_pass_chained_followup"] = 2
+    return floors
+
+
+def default_category_success_targets_for_mode(mode: str) -> dict[str, int]:
+    targets = dict(CATEGORY_SUCCESS_TARGET_DEFAULT)
+    if mode == "screen":
+        targets["education_programme_search"] = 1
+    return targets
+
+
+def directed_search_category_for_field(target_field: str, fallback_index: int) -> str:
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in (target_field or "").strip().lower())
+    normalized = normalized.strip("_") or f"unlabelled_{fallback_index}"
+    return f"{DIRECTED_SEARCH_CATEGORY_PREFIX}_{normalized}"
+
+
 class SearchBudget:
 
-    def __init__(self, company: str, max_google_queries: int = DEFAULT_MAX_GOOGLE_QUERIES,
+    def __init__(self, company: str, max_google_queries: int | None = None,
                  category_floors: dict[str, int] | None = None,
                  category_success_target: dict[str, int] | None = None,
                  max_empty_streak: int = DEFAULT_MAX_EMPTY_STREAK,
                  mode: str = "deep"):
         self.company = company
         self.mode = mode
-        self.max_google_queries = max_google_queries
-        self.category_floors = dict(category_floors) if category_floors is not None else dict(CATEGORY_FLOORS_DEFAULT)
+        if max_google_queries is not None:
+            self.max_google_queries = max_google_queries
+        else:
+            self.max_google_queries = SCREEN_MAX_GOOGLE_QUERIES if mode == "screen" else DEFAULT_MAX_GOOGLE_QUERIES
+        self.category_floors = (
+            dict(category_floors) if category_floors is not None
+            else default_category_floors_for_mode(mode)
+        )
         self.category_success_target = (
             dict(category_success_target) if category_success_target is not None
-            else dict(CATEGORY_SUCCESS_TARGET_DEFAULT)
+            else default_category_success_targets_for_mode(mode)
         )
-        if mode == "screen":
-            self.category_success_target["education_programme_search"] = 1
         self.max_empty_streak = max_empty_streak
         self.google_queries_used = 0
         self.category_used: dict[str, int] = {}
@@ -66,6 +114,13 @@ class SearchBudget:
         self.dead_domains: set[str] = set()
         self.dead_paths: set[str] = set()
         self.guessed_path_miss_count: dict[str, int] = {}
+        self.quota_exhausted_globally = False
+
+    def register_dynamic_category(self, category: str, floor: int = 1, success_target: int = 1) -> None:
+        if not category:
+            return
+        self.category_floors.setdefault(category, floor)
+        self.category_success_target.setdefault(category, success_target)
 
     def set_resolved_domains(self, domains: list[str]):
         merged = list(dict.fromkeys([*self.resolved_domains, *(d for d in (domains or []) if d)]))
@@ -91,6 +146,8 @@ class SearchBudget:
         )
 
     def google_has_budget(self, category: str = "") -> bool:
+        if self.quota_exhausted_globally:
+            return False
         if self.google_queries_used >= self.max_google_queries:
             return False
         if category and self.category_is_satisfied(category):
@@ -137,6 +194,14 @@ class SearchBudget:
         if category:
             self.category_closed.add(category)
 
+    def mark_quota_exhausted_globally(self):
+        if not self.quota_exhausted_globally:
+            self.quota_exhausted_globally = True
+            logger.warning(
+                "search budget marking quota_exhausted_globally company=%r queries_used=%d",
+                self.company, self.google_queries_used,
+            )
+
     def ddgs_has_budget(self) -> bool:
         return False
 
@@ -180,4 +245,5 @@ class SearchBudget:
             "resolved_domains": list(self.resolved_domains),
             "dead_domains": len(self.dead_domains),
             "dead_paths": len(self.dead_paths),
+            "quota_exhausted_globally": self.quota_exhausted_globally,
         }

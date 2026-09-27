@@ -32,7 +32,8 @@ class SourceRegistry:
         self._lock = threading.Lock()
 
     def register(self, source_name: str, url: str = "", kind: str = "core",
-                 label: str = "", excerpt: str = "", parent_number: int | None = None) -> int:
+                 label: str = "", excerpt: str = "", parent_number: int | None = None,
+                 is_synthetic: bool = False) -> int:
         with self._lock:
             normalized_url = (url or "").strip()
             if normalized_url and normalized_url in self._url_to_number:
@@ -47,6 +48,7 @@ class SourceRegistry:
                 "domain": _domain_of(normalized_url),
                 "excerpt": (excerpt or "").strip()[:280],
                 "parent_number": parent_number,
+                "is_synthetic": is_synthetic,
             }
             self._entries.append(entry)
             if normalized_url:
@@ -63,12 +65,13 @@ class SourceRegistry:
             url=source.get("url", ""),
             kind="core",
             excerpt=source.get("text", ""),
+            is_synthetic=bool(source.get("is_synthetic")),
         )
         source["source_number"] = number
         return number
 
     def register_child_hit(self, source_name: str, url: str, label: str, excerpt: str,
-                            parent_number: int | None = None) -> int:
+                            parent_number: int | None = None, is_synthetic: bool = False) -> int:
         return self.register(
             source_name=source_name,
             url=url,
@@ -76,6 +79,7 @@ class SourceRegistry:
             label=label,
             excerpt=excerpt,
             parent_number=parent_number,
+            is_synthetic=is_synthetic,
         )
 
     def get_number_for_url(self, url: str) -> int:
@@ -88,8 +92,15 @@ class SourceRegistry:
         with self._lock:
             return list(self._entries)
 
+    def genuine_entries(self) -> list[dict]:
+        return [e for e in self.entries() if not e.get("is_synthetic")]
+
     def as_manifest_lines(self) -> list[str]:
-        return [f"[{e['number']}] {e['label']} — {e['domain'] or e['url']}" for e in self.entries()]
+        lines = []
+        for e in self.entries():
+            synthetic_tag = " (synthesized fact, not a direct fetch)" if e.get("is_synthetic") else ""
+            lines.append(f"[{e['number']}] {e['label']}{synthetic_tag} — {e['domain'] or e['url']}")
+        return lines
 
     def as_source_bank(self) -> list[dict]:
         return [
@@ -97,6 +108,7 @@ class SourceRegistry:
                 "number": e["number"], "label": e["label"], "source_name": e["source_name"],
                 "kind": e["kind"], "url": e["url"], "domain": e["domain"],
                 "excerpt": e["excerpt"], "parent_number": e["parent_number"],
+                "is_synthetic": e.get("is_synthetic", False),
             }
             for e in self.entries()
         ]

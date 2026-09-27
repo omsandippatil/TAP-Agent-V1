@@ -33,6 +33,16 @@ STRIP_TAGS = [
 
 MAIN_CONTENT_SELECTORS = ["main", "article", "[role=main]", "#content", ".content", ".main-content"]
 
+BLOCK_LEVEL_TEXT_TAGS = [
+    "p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "td", "th", "blockquote",
+    "dd", "dt", "figcaption", "summary", "caption", "pre",
+]
+
+GENERIC_CONTAINER_TAGS = ["div", "span", "section", "article"]
+
+MIN_CONTAINER_TEXT_LENGTH = 20
+MAX_CONTAINER_TEXT_LENGTH = 2000
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -145,7 +155,8 @@ def domain_resolves(domain: str, timeout: float = 1.5) -> bool:
 
 
 def make_source(source_name: str, priority: int, url: str = "", text: str = "",
-                 status: str = "NOT_FOUND", fetch_method: str = "search") -> dict:
+                 status: str = "NOT_FOUND", fetch_method: str = "search",
+                 is_synthetic: bool = False) -> dict:
     return {
         "source_name": source_name,
         "priority": priority,
@@ -153,6 +164,7 @@ def make_source(source_name: str, priority: int, url: str = "", text: str = "",
         "text": text,
         "status": status,
         "fetch_method": fetch_method,
+        "is_synthetic": is_synthetic,
     }
 
 
@@ -184,6 +196,41 @@ def _is_boilerplate_line(line: str) -> bool:
     return False
 
 
+def _direct_text_of_container(tag) -> str:
+    direct_pieces = []
+    for child in tag.children:
+        if getattr(child, "name", None) in GENERIC_CONTAINER_TAGS:
+            continue
+        if hasattr(child, "get_text"):
+            direct_pieces.append(child.get_text(" ", strip=True))
+        else:
+            piece = str(child).strip()
+            if piece:
+                direct_pieces.append(piece)
+    return " ".join(p for p in direct_pieces if p)
+
+
+def _extract_generic_container_text(root, seen_lines: set) -> list[str]:
+    lines = []
+    for tag_name in GENERIC_CONTAINER_TAGS:
+        for tag in root.find_all(tag_name):
+            if tag.find(BLOCK_LEVEL_TEXT_TAGS):
+                continue
+            text = _direct_text_of_container(tag)
+            if not text or len(text) < MIN_CONTAINER_TEXT_LENGTH:
+                continue
+            if len(text) > MAX_CONTAINER_TEXT_LENGTH:
+                continue
+            if _is_boilerplate_line(text):
+                continue
+            key = text.lower()[:120]
+            if key in seen_lines:
+                continue
+            seen_lines.add(key)
+            lines.append(text)
+    return lines
+
+
 def extract_main_text(soup, max_chars: int = 16000) -> str:
     for tag_name in STRIP_TAGS:
         for tag in soup.find_all(tag_name):
@@ -200,7 +247,7 @@ def extract_main_text(soup, max_chars: int = 16000) -> str:
 
     lines = []
     seen_lines = set()
-    for element in root.find_all(["p", "li", "h1", "h2", "h3", "h4", "td", "blockquote"]):
+    for element in root.find_all(BLOCK_LEVEL_TEXT_TAGS):
         text = element.get_text(" ", strip=True)
         if not text or _is_boilerplate_line(text):
             continue
@@ -209,6 +256,8 @@ def extract_main_text(soup, max_chars: int = 16000) -> str:
             continue
         seen_lines.add(key)
         lines.append(text)
+
+    lines.extend(_extract_generic_container_text(root, seen_lines))
 
     if not lines:
         return normalize_block_text(root.get_text("\n", strip=True), max_chars)
@@ -339,8 +388,9 @@ def build_sources_manifest(sources: list) -> str:
             continue
         number = source.get("source_number")
         prefix = f"[{number}] " if number else ""
+        synthetic_tag = " | SYNTHETIC (not a direct fetch)" if source.get("is_synthetic") else ""
         lines.append(
-            f"{prefix}{source.get('source_name', '')} | {source.get('status', '')} | {source.get('url', '')}"
+            f"{prefix}{source.get('source_name', '')} | {source.get('status', '')}{synthetic_tag} | {source.get('url', '')}"
         )
     return "\n".join(lines)
 
