@@ -21,8 +21,10 @@ FORMER_ROLE_PATTERN = _FORMER_ROLE_KEYWORD_PATTERN
 
 _FORMER_ROLE_PROXIMITY_WINDOW_CHARS = 50
 
+_NAME_TOKEN = r"[A-Z][a-zA-Z.'-]*"
+
 NARRATIVE_PERSON_PATTERN = re.compile(
-    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s*(?:[-\u2013\u2014,]|\()\s*(?:is\s+)?(?:the\s+)?"
+    rf"\b({_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{1,3}})\s*(?:[-\u2013\u2014,]|\()\s*(?:is\s+)?(?:the\s+)?"
     r"(Head\s+of\s+CSR|CSR\s+Head|Head\s*[-,]?\s*CSR|Chief\s+Sustainability\s+Officer|"
     r"Head\s+of\s+Sustainability|Sustainability\s+Head|Head\s+of\s+Foundation|"
     r"Foundation\s+Director|CSR\s+Director|CSR\s+Manager|CSR\s+Lead|"

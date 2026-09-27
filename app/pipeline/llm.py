@@ -1251,7 +1251,7 @@ _NARRATIVE_CSR_TITLE_PATTERN = re.compile(
 )
 
 _NARRATIVE_NAME_PATTERN = re.compile(
-    r"\b((?:Dr\.?\s+|Mr\.?\s+|Ms\.?\s+|Mrs\.?\s+)?[A-Z][a-zA-Z.'-]+(?:\s+[A-Z][a-zA-Z.'-]+){1,4})\b"
+    r"\b((?:Dr\.?\s+|Mr\.?\s+|Ms\.?\s+|Mrs\.?\s+)?[A-Z][a-zA-Z.'-]*(?:\s+[A-Z][a-zA-Z.'-]*){1,4})\b"
 )
 
 _NARRATIVE_NAME_STOPWORDS = {
