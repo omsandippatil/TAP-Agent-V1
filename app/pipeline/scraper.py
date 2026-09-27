@@ -2962,7 +2962,7 @@ async def run_targeted_queries(company: str, question_category: str, search_cfg:
 
     return make_source(f"followup_{question_category}", 10, status="NOT_FOUND")
 
-    async def fetch_screen_sources(company: str, search_cfg: dict, registry: SourceRegistry | None = None) -> list[dict]:
+async def fetch_screen_sources(company: str, search_cfg: dict, registry: SourceRegistry | None = None) -> list[dict]:
     budget = SearchBudget(company, mode="screen")
     job_deadline = time.monotonic() + DEEP_JOB_HARD_DEADLINE_SECONDS
 
