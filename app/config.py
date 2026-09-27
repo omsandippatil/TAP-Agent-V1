@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     google_search_engine_id: str = ""
     google_search_daily_cap: int = 90
     config_yaml_path: str = "config.yaml"
+    verbose_pipeline_logging: bool = True
+    llm_dump_dir: str = "/tmp/fundfinder_llm_dumps"
 
     class Config:
         env_file = ".env"

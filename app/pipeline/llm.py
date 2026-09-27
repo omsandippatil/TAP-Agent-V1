@@ -1,6 +1,7 @@
 import functools
 import json
 import logging
+import os
 import re
 import time
 import typing
@@ -31,6 +32,7 @@ MIN_PROMPT_TRIM_CHARS = 150
 MAX_PROMPT_SHRINK_ATTEMPTS = 6
 PROMPT_SHRINK_SAFETY_MARGIN = 120
 DEFAULT_ANTHROPIC_CONTEXT_WINDOW = 200000
+DEFAULT_LLM_DUMP_DIR = "/tmp/fundfinder_llm_dumps"
 
 ANTHROPIC_DEFAULT_COOLDOWN_SECONDS = 60.0
 
@@ -48,6 +50,30 @@ EXTRACTION_PRIORITY_KEYS = [
     "spend",
     "entity_structure",
 ]
+
+
+def _verbose_logging_enabled() -> bool:
+    return bool(getattr(settings, "verbose_pipeline_logging", True))
+
+
+def _llm_dump_dir() -> str:
+    return getattr(settings, "llm_dump_dir", DEFAULT_LLM_DUMP_DIR)
+
+
+def _dump_llm_io(caller: str, kind: str, content: str) -> None:
+    if not _verbose_logging_enabled():
+        return
+    try:
+        dump_dir = _llm_dump_dir()
+        os.makedirs(dump_dir, exist_ok=True)
+        safe_caller = re.sub(r"[^a-zA-Z0-9_.:-]", "_", caller)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(dump_dir, f"{timestamp}_{safe_caller}_{kind}.txt")
+        with open(path, "w", encoding="utf-8") as dump_file:
+            dump_file.write(content)
+        logger.info("llm io dumped caller=%s kind=%s path=%s bytes=%d", caller, kind, path, len(content))
+    except Exception as exc:
+        logger.warning("failed to dump llm io caller=%s kind=%s error=%s", caller, kind, exc)
 
 
 def _get_http_client() -> httpx.AsyncClient:
@@ -342,7 +368,10 @@ ENTITY_STRUCTURE_RULE = (
     "programme and partner extracted later must set funded_by_entity to whichever of these "
     "named entities the evidence actually attributes it to (or leave it empty if the "
     "evidence does not make that clear) — never silently default it to the parent company "
-    "name."
+    "name. If a single candidate legal-entity string appears to concatenate two different "
+    "companies' names (for example because a search snippet placed two unrelated company "
+    "mentions next to each other), do not treat that string as a real entity — only use "
+    "entity names that read as one coherent, single organisation."
 )
 
 PARTNER_RULE = (
@@ -1139,6 +1168,8 @@ async def call_anthropic_chat(
         "anthropic request caller=%s model=%s max_tokens=%d estimated_prompt_tokens=%d temperature=%.2f",
         caller, resolved_model, max_tokens, estimated_prompt_tokens, temperature,
     )
+    _dump_llm_io(caller, "prompt", prompt)
+    logger.debug("anthropic FULL PROMPT caller=%s\n%s", caller, prompt)
 
     try:
         client = _get_http_client()
@@ -1178,10 +1209,15 @@ async def call_anthropic_chat(
     try:
         body = response.json()
     except ValueError:
-        logger.error("anthropic non-json response caller=%s", caller)
+        logger.error("anthropic non-json response caller=%s raw_text=%r", caller, response.text[:2000])
         return None
 
-    logger.info("anthropic response caller=%s status=%d", caller, response.status_code)
+    logger.info(
+        "anthropic response caller=%s status=%d stop_reason=%s input_tokens=%s output_tokens=%s",
+        caller, response.status_code, body.get("stop_reason"),
+        (body.get("usage") or {}).get("input_tokens"),
+        (body.get("usage") or {}).get("output_tokens"),
+    )
 
     if body.get("stop_reason") == "max_tokens":
         logger.warning("anthropic response TRUNCATED caller=%s max_tokens=%d", caller, max_tokens)
@@ -1189,22 +1225,33 @@ async def call_anthropic_chat(
     content_blocks = body.get("content") or []
     text_parts = [block.get("text", "") for block in content_blocks if block.get("type") == "text"]
     if not text_parts:
-        logger.error("anthropic malformed response caller=%s", caller)
+        logger.error("anthropic malformed response caller=%s raw_body=%s", caller, json.dumps(body)[:2000])
         return None
-    return "{" + "".join(text_parts)
+    full_reply = "{" + "".join(text_parts)
+    _dump_llm_io(caller, "response", full_reply)
+    logger.debug("anthropic FULL RESPONSE caller=%s\n%s", caller, full_reply)
+    return full_reply
 
 
 def parse_json_response(raw_text: str | None, expected_keys: list[str] | None = None, caller: str = "unknown") -> dict:
     if not raw_text:
+        logger.warning("parse_json_response called with empty raw_text caller=%s", caller)
         return {}
     cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
     cleaned = re.sub(r"\s*```$", "", cleaned)
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, dict):
+            logger.info(
+                "parse_json_response OK caller=%s top_level_keys=%s",
+                caller, list(parsed.keys()),
+            )
             return parsed
-    except (json.JSONDecodeError, TypeError):
-        pass
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.warning(
+            "parse_json_response direct json.loads failed caller=%s error=%s chars=%d",
+            caller, exc, len(cleaned),
+        )
     recovered = _recover_partial_json(cleaned)
     if recovered:
         logger.info("parse_json_response recovered via partial-json fallback caller=%s chars=%d", caller, len(cleaned))
@@ -1216,7 +1263,7 @@ def parse_json_response(raw_text: str | None, expected_keys: list[str] | None = 
                     caller, missing,
                 )
         return recovered
-    logger.error("parse_json_response failed to recover any JSON caller=%s chars=%d", caller, len(cleaned))
+    logger.error("parse_json_response failed to recover any JSON caller=%s chars=%d raw_preview=%r", caller, len(cleaned), cleaned[:500])
     return {}
 
 
@@ -2154,6 +2201,39 @@ async def extract_company_facts(
         len(extraction.get("red_flags", [])), len((extraction.get("spend") or {}).get("history", []) or []),
         len(extraction.get("geographies", [])), extraction.get("entity_structure", {}),
     )
+    logger.info(
+        "extract_company_facts FULL DUMP company=%r csr_head_note=%r delivery_model=%r sector=%r "
+        "spend=%r eligibility=%r key_facts_summary=%r",
+        company, extraction.get("csr_head_note", ""), extraction.get("delivery_model", ""),
+        extraction.get("sector", {}), extraction.get("spend", {}), extraction.get("eligibility", {}),
+        extraction.get("key_facts_summary", ""),
+    )
+    for programme in extraction.get("programmes", []) or []:
+        logger.info(
+            "extract_company_facts PROGRAMME company=%r name=%r what_is_funded=%r confidence=%r "
+            "source_excerpt=%r",
+            company, programme.get("name"), programme.get("what_is_funded"),
+            programme.get("confidence"), programme.get("source_excerpt"),
+        )
+    for partner in extraction.get("partners", []) or []:
+        logger.info(
+            "extract_company_facts PARTNER company=%r name=%r relationship_type=%r confidence=%r "
+            "source_excerpt=%r",
+            company, partner.get("name"), partner.get("relationship_type"),
+            partner.get("confidence"), partner.get("source_excerpt"),
+        )
+    for person in extraction.get("decision_makers", []) or []:
+        logger.info(
+            "extract_company_facts DECISION_MAKER company=%r name=%r title=%r is_india_specific=%r "
+            "source_excerpt=%r",
+            company, person.get("name"), person.get("title"),
+            person.get("is_india_specific"), person.get("source_excerpt"),
+        )
+    for flag in extraction.get("red_flags", []) or []:
+        logger.info(
+            "extract_company_facts RED_FLAG company=%r flag=%r severity=%r explanation=%r",
+            company, flag.get("flag"), flag.get("severity"), flag.get("explanation"),
+        )
     return extraction
 
 
@@ -2208,6 +2288,18 @@ async def score_extracted_facts(
     logger.info(
         "score_extracted_facts DONE company=%r criteria_count=%d",
         company, len(parsed.get("criteria", []) or []),
+    )
+    for criterion in parsed.get("criteria", []) or []:
+        logger.info(
+            "score_extracted_facts CRITERION company=%r id=%r score=%r confidence=%r evidence=%r",
+            company, criterion.get("id"), criterion.get("score"),
+            criterion.get("confidence"), criterion.get("evidence"),
+        )
+    logger.info(
+        "score_extracted_facts NARRATIVE company=%r fit_rationale=%r alignment_rationale=%r "
+        "strategic_insight=%r",
+        company, parsed.get("fit_rationale", ""), parsed.get("alignment_rationale", ""),
+        parsed.get("strategic_insight", ""),
     )
     return parsed
 

@@ -7,6 +7,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from app.config import settings
 from app.pipeline import google_search
 from app.pipeline.people_parser import parse_linkedin_hit
 from app.pipeline.search_budget import SearchBudget
@@ -23,6 +24,16 @@ from app.pipeline.utils import (
 )
 
 logger = logging.getLogger("tap.scraper")
+
+
+def _verbose() -> bool:
+    return bool(getattr(settings, "verbose_pipeline_logging", True))
+
+
+def _vlog(level: int, msg: str, *args) -> None:
+    if _verbose():
+        logger.log(level, msg, *args)
+
 
 GENERIC_COMPANY_TOKENS = {
     "india", "limited", "ltd", "private", "pvt", "the", "and", "of",
@@ -832,6 +843,12 @@ async def search_web(query: str, budget: SearchBudget, max_results: int = 6,
     budget.record_query_results(category, len(results))
     if not results:
         logger.info("google search returned empty query=%r category=%r", query, category)
+    else:
+        _vlog(
+            logging.INFO,
+            "google search results query=%r category=%r count=%d urls=%s",
+            query, category, len(results), [r.get("href", "") for r in results],
+        )
     return results
 
 
@@ -865,6 +882,11 @@ async def fetch_page_text(url: str, max_chars: int = MAX_PAGE_TEXT_CHARS, verify
             text, _error_type = await asyncio.wait_for(
                 asyncio.to_thread(_fetch_page_text_sync, url, max_chars, verify_ssl),
                 timeout=FETCH_TASK_TIMEOUT_SECONDS,
+            )
+            _vlog(
+                logging.INFO,
+                "fetch_page_text DONE url=%s chars=%d preview=%r",
+                url, len(text or ""), (text or "")[:200].replace("\n", " "),
             )
             return text
         except asyncio.TimeoutError:
@@ -1004,6 +1026,11 @@ async def fetch_pdf_text(url: str, max_chars: int = MAX_PDF_TEXT_CHARS, max_page
             text, _error_type = await asyncio.wait_for(
                 asyncio.to_thread(_fetch_pdf_text_sync, url, max_chars, max_pages),
                 timeout=FETCH_TASK_TIMEOUT_SECONDS,
+            )
+            _vlog(
+                logging.INFO,
+                "fetch_pdf_text DONE url=%s chars=%d preview=%r",
+                url, len(text or ""), (text or "")[:200].replace("\n", " "),
             )
             return text
         except asyncio.TimeoutError:
@@ -1154,7 +1181,14 @@ async def resolve_india_legal_entity_name(company: str, search_cfg: dict, budget
             match = INDIA_LEGAL_ENTITY_PATTERN.search(haystack)
             if match:
                 candidate = re.sub(r"\s+", " ", match.group(1)).strip()
-                if is_plausible_legal_entity_name(company, candidate):
+                plausible = is_plausible_legal_entity_name(company, candidate)
+                _vlog(
+                    logging.INFO,
+                    "resolve_india_legal_entity_name CANDIDATE company=%r candidate=%r plausible=%s "
+                    "source_url=%r haystack_preview=%r",
+                    company, candidate, plausible, result.get("href", ""), haystack[:250],
+                )
+                if plausible:
                     resolved_name = candidate
                     break
         if resolved_name:
@@ -1264,16 +1298,41 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
     document_found_unreadable = [False]
 
     def consider(url: str, method: str, text: str):
+        text_preview = (text or "")[:200].replace("\n", " ")
         if accept_fetched_text(company, text, 250):
             score = score_candidate_text(company, text, url)
+            _vlog(
+                logging.INFO,
+                "india_csr_page CANDIDATE ACCEPTED company=%r url=%s method=%s score=%.1f "
+                "text_len=%d preview=%r",
+                company, url, method, score, len(text or ""), text_preview,
+            )
             if best_candidate[0] is None or score > best_candidate[0][0]:
                 source = make_source("india_csr_page", 1, url, text, "FOUND", method)
                 source["domain"] = urlparse(url).netloc.lower()
                 source["india_location_hits"] = find_india_location_mentions(text)[:10]
                 best_candidate[0] = (score, source)
             return
+        rejection_reason = (
+            "no_text" if not text else
+            "too_short" if len(text) <= 250 else
+            "fails_csr_relevance_check" if not is_csr_relevant(text) else
+            "company_not_mentioned"
+        )
+        _vlog(
+            logging.INFO,
+            "india_csr_page CANDIDATE REJECTED company=%r url=%s method=%s reason=%s "
+            "text_len=%d preview=%r",
+            company, url, method, rejection_reason, len(text or ""), text_preview,
+        )
         if text and len(text) > 80 and mentions_company(company, text) and mentions_csr_context(text):
             score = score_candidate_text(company, text, url)
+            _vlog(
+                logging.INFO,
+                "india_csr_page CANDIDATE WEAK_FALLBACK company=%r url=%s method=%s score=%.1f "
+                "text_len=%d",
+                company, url, method, score, len(text),
+            )
             if weak_snippet_fallback[0] is None or score > weak_snippet_fallback[0][0]:
                 source = make_source("india_csr_page", 1, url, text, "FOUND", method + "_snippet")
                 source["domain"] = urlparse(url).netloc.lower()
