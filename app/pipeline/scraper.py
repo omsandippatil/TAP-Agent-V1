@@ -2961,3 +2961,129 @@ async def run_targeted_queries(company: str, question_category: str, search_cfg:
         return best_candidate[1]
 
     return make_source(f"followup_{question_category}", 10, status="NOT_FOUND")
+
+    async def fetch_screen_sources(company: str, search_cfg: dict, registry: SourceRegistry | None = None) -> list[dict]:
+    budget = SearchBudget(company, mode="screen")
+    job_deadline = time.monotonic() + DEEP_JOB_HARD_DEADLINE_SECONDS
+
+    sources: list[dict] = []
+
+    try:
+        india_csr_page_source = await fetch_india_csr_page(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(india_csr_page_source)
+
+        related_entities = await discover_related_entities(
+            company, search_cfg, budget, deadline=job_deadline,
+        )
+
+        mca_portal_source = await fetch_mca_portal(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(mca_portal_source)
+
+        annual_report_source = await fetch_annual_report(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(annual_report_source)
+
+        people_source = await fetch_linkedin_people(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(people_source)
+
+        partner_source = await fetch_partner_source(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+            related_entities=related_entities, mode="screen",
+        )
+        sources.append(partner_source)
+
+        education_programme_source = await fetch_education_programme_source(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+            related_entities=related_entities, mode="screen",
+        )
+        sources.append(education_programme_source)
+
+    except DeepJobDeadlineExceeded:
+        logger.warning("fetch_screen_sources hit hard deadline company=%r sources_so_far=%d", company, len(sources))
+
+    logger.info(
+        "fetch_screen_sources DONE company=%r sources=%d found=%d",
+        company, len(sources), sum(1 for s in sources if s.get("status") == "FOUND"),
+    )
+    return sources
+
+
+async def fetch_deep_sources(company: str, search_cfg: dict, registry: SourceRegistry | None = None) -> list[dict]:
+    budget = SearchBudget(company, mode="deep")
+    job_deadline = time.monotonic() + DEEP_JOB_HARD_DEADLINE_SECONDS
+
+    sources: list[dict] = []
+
+    try:
+        india_csr_page_source = await fetch_india_csr_page(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(india_csr_page_source)
+
+        related_entities = await discover_related_entities(
+            company, search_cfg, budget, deadline=job_deadline,
+        )
+
+        mca_portal_source = await fetch_mca_portal(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(mca_portal_source)
+
+        national_csr_portal_source = await fetch_national_csr_portal(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(national_csr_portal_source)
+
+        annual_report_source = await fetch_annual_report(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(annual_report_source)
+
+        multi_year_financials_source = await fetch_multi_year_financials(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+            annual_report_source=annual_report_source,
+        )
+        sources.append(multi_year_financials_source)
+
+        people_source = await fetch_linkedin_people(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(people_source)
+
+        partner_source = await fetch_partner_source(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+            related_entities=related_entities, mode="deep",
+        )
+        sources.append(partner_source)
+
+        education_programme_source = await fetch_education_programme_source(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+            related_entities=related_entities, mode="deep",
+        )
+        sources.append(education_programme_source)
+
+        plans_source = await fetch_plans_source(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(plans_source)
+
+        sector_eligibility_source = await fetch_sector_eligibility_source(
+            company, search_cfg, budget, registry=registry, job_deadline=job_deadline,
+        )
+        sources.append(sector_eligibility_source)
+
+    except DeepJobDeadlineExceeded:
+        logger.warning("fetch_deep_sources hit hard deadline company=%r sources_so_far=%d", company, len(sources))
+
+    logger.info(
+        "fetch_deep_sources DONE company=%r sources=%d found=%d",
+        company, len(sources), sum(1 for s in sources if s.get("status") == "FOUND"),
+    )
+    return sources
