@@ -381,6 +381,14 @@ EDUCATION_PROGRAMME_QUERIES = [
     '"{c}" CSR India programme name students schools {site}',
 ]
 
+NAMED_INITIATIVE_SEED_QUERIES = [
+    '"{c}" ("Atal Tinkering" OR "Tinkering Lab") India schools',
+    '"{c}" (Spark OR "Digital Classroom" OR "Future Skill" OR "Girls in AI" OR "Girls in Data") CSR India',
+    '"{c}" ("Learning Links Foundation" OR eVidyaloka OR "Pratham" OR "Teach For India" OR "Akshaya Patra") partner India',
+    '"{c}" CSR India NGO education partner foundation named initiative announcement',
+    '"{c}" India CSR "in partnership with" school OR foundation OR NGO education',
+]
+
 CSR_PAGE_QUERIES = [
     '"{c}" (corporate social responsibility OR "CSR policy" OR "sustainability report" OR "ESG report") India {site}',
     '"{c}" CSR India filetype:pdf {site}',
@@ -577,13 +585,17 @@ def mentions_csr_context(snippet: str) -> bool:
 
 
 def is_csr_relevant(text: str) -> bool:
+    if not text:
+        return False
     lowered = text.lower()
     relevance_keywords = [
         "csr", "corporate social", "sustainability", "philanthrop",
         "community", "crore", "education", "skill", "digital",
         "social responsibility", "esg", "impact report",
     ]
-    return sum(1 for kw in relevance_keywords if kw in lowered) >= 2
+    if sum(1 for kw in relevance_keywords if kw in lowered) >= 2:
+        return True
+    return count_priority_education_hits(text) >= 2
 
 
 def count_priority_education_hits(text: str) -> int:
@@ -1793,10 +1805,12 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
     tried_urls = set()
     remaining_budget = [max_fetches]
     resolved_domain = [""]
+    accepted_candidates: list[tuple[float, dict]] = []
     best_candidate = [None]
     weak_snippet_fallback = [None]
     document_found_unreadable = [False]
     known_company_domains: list[str] = []
+    MAX_CSR_PAGE_CANDIDATES = 5
 
     def candidate_clears_bar() -> bool:
         return bool(best_candidate[0] and best_candidate[0][0] >= MIN_ACCEPT_SCORE)
@@ -1815,10 +1829,11 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
                 "text_len=%d domain_confirmed=%s preview=%r",
                 company, url, method, score, len(text or ""), domain_is_confirmed, text_preview,
             )
+            source = make_source("india_csr_page", 1, url, text, "FOUND", method)
+            source["domain"] = urlparse(url).netloc.lower()
+            source["india_location_hits"] = find_india_location_mentions(text)[:10]
+            accepted_candidates.append((score, source))
             if best_candidate[0] is None or score > best_candidate[0][0]:
-                source = make_source("india_csr_page", 1, url, text, "FOUND", method)
-                source["domain"] = urlparse(url).netloc.lower()
-                source["india_location_hits"] = find_india_location_mentions(text)[:10]
                 best_candidate[0] = (score, source)
             return
         rejection_reason = (
@@ -2012,16 +2027,37 @@ async def fetch_india_csr_page(company: str, search_cfg: dict, budget: SearchBud
             logger.info("india_csr_page recovered via unreadable-document fallback company=%r url=%s", company, url)
 
     if chosen:
-        result_source = chosen[1]
+        ranked = sorted(accepted_candidates, key=lambda pair: pair[0], reverse=True)
+        top_candidates = ranked[:MAX_CSR_PAGE_CANDIDATES] or [chosen]
+        if chosen not in top_candidates:
+            top_candidates = [chosen] + top_candidates[: MAX_CSR_PAGE_CANDIDATES - 1]
+
+        primary_source = top_candidates[0][1]
+        if len(top_candidates) > 1:
+            combined_text = "\n\n---\n\n".join(
+                f"[{cand_source['url']}]\n{cand_source['text'][:2500]}"
+                for _, cand_source in top_candidates
+            )
+            primary_source = dict(primary_source)
+            primary_source["text"] = normalize_block_text(combined_text, 10000)
+
         if registry is not None:
-            registry.register_core_source(result_source)
+            registry.register_core_source(primary_source)
+            for _, cand_source in top_candidates[1:]:
+                registry.register_child_hit(
+                    source_name="india_csr_page", url=cand_source["url"],
+                    label="CSR/CSR-adjacent page", excerpt=cand_source["text"][:200],
+                )
         budget.mark_category_hit("csr_page")
-        logger.info("india_csr_page DONE company=%r found=True score=%.1f", company, chosen[0])
+        logger.info(
+            "india_csr_page DONE company=%r found=True score=%.1f candidates_combined=%d",
+            company, chosen[0], len(top_candidates),
+        )
         if await _within_deadline(deadline):
             await _run_teaser_and_benefit_followups(
-                company, result_source.get("text", ""), budget, quota_guard, deadline, registry, "india_csr_page",
+                company, primary_source.get("text", ""), budget, quota_guard, deadline, registry, "india_csr_page",
             )
-        return result_source
+        return primary_source
 
     logger.info("india_csr_page DONE company=%r found=False document_found_unreadable=%s", company, document_found_unreadable[0])
     fallback = make_source("india_csr_page", 1, status="NOT_FOUND")
@@ -2582,7 +2618,7 @@ async def fetch_education_programme_source(company: str, search_cfg: dict, budge
 
     for target in search_targets:
         target_site_token = site_token if target == company else ""
-        for template in EDUCATION_PROGRAMME_QUERIES:
+        for template in EDUCATION_PROGRAMME_QUERIES + NAMED_INITIATIVE_SEED_QUERIES:
             if not await _within_deadline(deadline):
                 break
             if len(candidates) >= max_programme_sources * 2:
