@@ -1,5 +1,7 @@
 from fastapi.templating import Jinja2Templates
 
+from app.pipeline.llm import is_plausible_person_name
+
 templates = Jinja2Templates(directory="app/render/templates")
 
 
@@ -80,7 +82,7 @@ def merge_decision_makers(result: dict) -> list:
 
     for person in llm_people:
         name = (person.get("name") or "").strip()
-        if not name:
+        if not name or not is_plausible_person_name(name):
             continue
         key = name.lower()
         seen_names.add(key)
@@ -106,7 +108,7 @@ def merge_decision_makers(result: dict) -> list:
     for person in scraped_people:
         name = (person.get("name") or "").strip()
         key = name.lower()
-        if not name or key in seen_names:
+        if not name or key in seen_names or not is_plausible_person_name(name):
             continue
         seen_names.add(key)
         linkedin_url = person.get("url", "")

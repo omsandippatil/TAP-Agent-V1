@@ -8,8 +8,8 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.comments import Comment
 from openpyxl.drawing.image import Image as XLImage
-
-from app.pipeline.llm import LLM_UNAVAILABLE_EVIDENCE
+ 
+from app.pipeline.llm import LLM_UNAVAILABLE_EVIDENCE, is_plausible_person_name
 
 ARIAL = "Arial"
 HDR_FILL = PatternFill("solid", fgColor="0F3D3E")
@@ -59,7 +59,6 @@ SOURCE_LABELS = {
     "plans_search": "Partnerships & plans search",
     "sector_eligibility_search": "Sector & eligibility search",
 }
-
 
 def _strip_highlight_markers(text: str) -> str:
     return _HIGHLIGHT_PATTERN.sub(r"\1", text or "")

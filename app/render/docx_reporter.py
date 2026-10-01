@@ -11,7 +11,7 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.shared import RGBColor
 
-from app.pipeline.llm import LLM_UNAVAILABLE_EVIDENCE
+from app.pipeline.llm import LLM_UNAVAILABLE_EVIDENCE, is_plausible_person_name
 
 FONT_NAME = "Calibri"
 
@@ -415,7 +415,7 @@ def merge_decision_makers(result: dict) -> list:
 
     for person in llm_people:
         name = (person.get("name") or "").strip()
-        if not name:
+        if not name or not is_plausible_person_name(name):
             continue
         key = name.lower()
         seen_names.add(key)
@@ -433,7 +433,7 @@ def merge_decision_makers(result: dict) -> list:
     for person in scraped_people:
         name = (person.get("name") or "").strip()
         key = name.lower()
-        if not name or key in seen_names:
+        if not name or key in seen_names or not is_plausible_person_name(name):
             continue
         seen_names.add(key)
         merged.append({
