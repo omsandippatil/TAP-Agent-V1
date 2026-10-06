@@ -108,7 +108,7 @@ _NAME_TITLE_SPLIT_PATTERN = re.compile(
 )
 
 _NAME_TOKEN_STOPWORDS = {
-    "The", "This", "That", "CGI", "CSR", "ESG", "India", "Ltd", "Limited", "Foundation",
+    "The", "This", "That", "CSR", "ESG", "India", "Ltd", "Limited", "Foundation",
 }
 
 
@@ -511,65 +511,17 @@ async def _run_directed_search_after_scoring(company: str, mode: str, cfg: dict,
     if not new_sources:
         return summary, sources, analysis
 
+    # New evidence only helps if facts are re-extracted from it, so redo the full analysis.
     merged_sources = sources + new_sources
     mission = cfg.get("org_mission") or llm.DEFAULT_MISSION
     sources_manifest = merge_manifest_with_registry(build_sources_manifest(merged_sources), registry)
     cleaned_sources = clean_and_budget_sources(
         merged_sources, llm.evidence_token_budget(company, mission, sources_manifest)
     )
-
-    csr_obligation_signal = llm.compute_csr_obligation_signal(
-        analysis.get("eligibility", {}), analysis.get("spend", {})
+    retried = await llm.analyze_and_score_company(
+        company, mission, cleaned_sources, sources_manifest, mode=mode, cfg=cfg,
     )
-    scoring_extraction = {
-        k: v for k, v in analysis.items()
-        if k not in ("open_questions", "key_facts_summary", "overall_authenticity_score",
-                      "evidence_recency", "source_quality_assessment", "csr_head_note")
-    }
-    re_scoring = await llm.score_extracted_facts(
-        company, mission, mode, scoring_extraction, sources_manifest, cfg=cfg,
-        csr_obligation=csr_obligation_signal,
-    )
-    if not re_scoring:
-        return summary, merged_sources, analysis
-
-    updated_analysis = dict(analysis)
-    updated_analysis["criteria"] = re_scoring.get("criteria", analysis.get("criteria", []))
-    updated_analysis["fit_rationale"] = re_scoring.get("fit_rationale", analysis.get("fit_rationale", ""))
-    updated_analysis["overall_semantic_alignment"] = re_scoring.get(
-        "overall_semantic_alignment", analysis.get("overall_semantic_alignment", 0)
-    )
-    updated_analysis["alignment_rationale"] = re_scoring.get(
-        "alignment_rationale", analysis.get("alignment_rationale", "")
-    )
-    updated_analysis["strategic_insight"] = re_scoring.get(
-        "strategic_insight", analysis.get("strategic_insight", "")
-    )
-
-    if updated_analysis.get("criteria"):
-        coverage_insufficient, coverage_reason = llm.evidence_coverage_is_too_low(
-            updated_analysis["criteria"], updated_analysis.get("overall_authenticity_score", 0)
-        )
-        updated_analysis["evidence_coverage_insufficient"] = coverage_insufficient
-        updated_analysis["evidence_coverage_reason"] = coverage_reason
-        updated_analysis["average_criteria_confidence_pct"] = round(
-            llm.average_criteria_confidence(updated_analysis["criteria"]), 1
-        )
-        updated_analysis["weighted_criteria_confidence_pct"] = round(
-            llm.weighted_average_criteria_confidence(updated_analysis["criteria"]), 1
-        )
-        updated_analysis["research_confidence_label"] = llm.research_confidence_label(
-            updated_analysis["criteria"], updated_analysis.get("overall_authenticity_score", 0), coverage_insufficient,
-        )
-        updated_analysis["fit_score"] = llm.compute_final_fit_score(
-            criteria=updated_analysis["criteria"],
-            authenticity_score=updated_analysis.get("overall_authenticity_score", 0),
-            mode=mode,
-            company=company,
-        )
-        updated_analysis["research_coverage"] = llm.compute_research_coverage(updated_analysis["criteria"])
-
-    return summary, merged_sources, updated_analysis
+    return summary, merged_sources, retried or analysis
 
 
 def _merge_directed_search_summaries(pre: dict | None, post: dict | None) -> dict:
@@ -643,7 +595,9 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
         sources, llm.evidence_token_budget(company, mission, sources_manifest)
     )
 
-    directed_search_budget = SearchBudget(company, mode=mode)
+    directed_search_budget = SearchBudget(
+        company, max_google_queries=12, category_floors={}, category_success_target={}, mode=mode,
+    )
     directed_search_summary_pre: dict | None = None
     directed_search_summary_post: dict | None = None
 
@@ -662,6 +616,7 @@ async def score(company: str, sources: list, cfg: dict, quota_guard=None,
 
         analysis = await llm.analyze_and_score_company(
             company, mission, cleaned_sources, sources_manifest, mode=mode, cfg=cfg,
+            precomputed_extraction=re_extraction or extraction,
         )
 
         if analysis:

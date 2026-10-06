@@ -16,7 +16,6 @@ from app.pipeline.llm import LLM_UNAVAILABLE_EVIDENCE, is_plausible_person_name
 FONT_NAME = "Calibri"
 
 TEAL_DARK = RGBColor(0x0F, 0x3D, 0x3E)
-TEAL = RGBColor(0x0F, 0x76, 0x6E)
 TEAL_MID = RGBColor(0x14, 0x6B, 0x65)
 TEAL_LIGHT = RGBColor(0x20, 0xB2, 0xAA)
 YELLOW = RGBColor(0xF5, 0xC5, 0x18)
@@ -26,13 +25,11 @@ GREY = RGBColor(0x6B, 0x72, 0x80)
 GREEN = RGBColor(0x16, 0xA3, 0x4A)
 AMBER = RGBColor(0xD9, 0x77, 0x06)
 RED = RGBColor(0xDC, 0x26, 0x26)
-LINKEDIN_BLUE = RGBColor(0x0A, 0x66, 0xC2)
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
 CREAM_HEX = "FAF7F2"
 TEAL_DARK_HEX = "0F3D3E"
 TEAL_MID_HEX = "146B65"
 TEAL_SOFT_HEX = "E6F5F3"
-YELLOW_HEX = "F5C518"
 YELLOW_SOFT_HEX = "FEF7DC"
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "ff_logo.png")
@@ -53,9 +50,6 @@ SOURCE_LABELS = {
 
 UNSCORED_GREY = RGBColor(0x9C, 0xA3, 0xA3)
 UNSCORED_GREY_HEX = "9CA3A3"
-COVERAGE_BANNER_HEX = "8A6200"
-
-
 def fit_hex(score):
     if score is None:
         return UNSCORED_GREY_HEX
@@ -68,20 +62,6 @@ def fit_hex(score):
     if score >= 45:
         return "D97706"
     return "DC2626"
-
-
-def fit_color(score):
-    if score is None:
-        return UNSCORED_GREY
-    if score >= 90:
-        return TEAL_DARK
-    if score >= 80:
-        return TEAL_MID
-    if score >= 65:
-        return TEAL_LIGHT
-    if score >= 45:
-        return AMBER
-    return RED
 
 
 def fit_label(score):

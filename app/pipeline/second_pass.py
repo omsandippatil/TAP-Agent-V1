@@ -19,7 +19,7 @@ from app.pipeline.scraper import (
     NAMED_NGO_PATTERN,
     RELATED_ENTITY_NAME_PATTERN,
 )
-from app.pipeline.utils import make_source, normalize_block_text
+from app.pipeline.utils import make_source
 
 logger = logging.getLogger("tap.second_pass")
 
@@ -139,7 +139,9 @@ async def run_second_pass_recovery(company, search_cfg, sources, registry=None, 
                                     max_google_queries=SECOND_PASS_MAX_GOOGLE_QUERIES,
                                     deadline_seconds=SECOND_PASS_DEADLINE_SECONDS,
                                     budget: SearchBudget | None = None):
-    budget = budget or SearchBudget(company, max_google_queries=max_google_queries)
+    budget = budget or SearchBudget(
+        company, max_google_queries=max_google_queries, category_floors={}, category_success_target={},
+    )
     deadline = time.monotonic() + deadline_seconds
     recovered = []
     queries_run = []

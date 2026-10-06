@@ -17,8 +17,6 @@ _ROLE_INDICATOR_WORD_PATTERN = re.compile(
     r"\b(role|position|served|was|as|title|designation)\b", re.IGNORECASE,
 )
 
-FORMER_ROLE_PATTERN = _FORMER_ROLE_KEYWORD_PATTERN
-
 _FORMER_ROLE_PROXIMITY_WINDOW_CHARS = 50
 
 _NAME_TOKEN = r"[A-Z][a-zA-Z.'-]*"

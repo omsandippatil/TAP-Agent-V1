@@ -82,18 +82,9 @@ class SourceRegistry:
             is_synthetic=is_synthetic,
         )
 
-    def get_number_for_url(self, url: str) -> int:
-        return self._url_to_number.get((url or "").strip(), 0)
-
-    def lookup_number_by_source_name(self, source_name: str) -> int | None:
-        return self._name_to_number.get((source_name or "").strip())
-
     def entries(self) -> list[dict]:
         with self._lock:
             return list(self._entries)
-
-    def genuine_entries(self) -> list[dict]:
-        return [e for e in self.entries() if not e.get("is_synthetic")]
 
     def as_manifest_lines(self) -> list[str]:
         lines = []

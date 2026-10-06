@@ -24,7 +24,6 @@
           <span class="history-row-name">{{ row.company }}</span>
           <span class="history-row-meta">
             {{ 'Deep research' if row.mode == 'deep' else 'Screen' }}
-            {% if row.status == 'error' %} · failed{% elif row.status == 'running' %} · running{% endif %}
             · {{ row.created_at[:10] if row.created_at else '' }}
           </span>
         </div>

@@ -132,24 +132,6 @@ def merge_decision_makers(result: dict) -> list:
     return merged
 
 
-def resolve_source_ref(source_ref, source_bank_numbers: dict, source_bank_names: dict, source_urls: dict, source_labels: dict) -> dict | None:
-    if source_ref is None or source_ref == "":
-        return None
-    if isinstance(source_ref, int) or (isinstance(source_ref, str) and source_ref.isdigit()):
-        entry = source_bank_numbers.get(int(source_ref))
-        if entry:
-            return {"label": entry.get("label", ""), "url": entry.get("url", ""), "number": entry.get("number")}
-        return None
-    entry = source_bank_names.get(source_ref)
-    if entry:
-        return {"label": entry.get("label", ""), "url": entry.get("url", ""), "number": entry.get("number")}
-    url = source_urls.get(source_ref, "")
-    label = source_labels.get(source_ref, source_ref)
-    if url or label:
-        return {"label": label, "url": url, "number": None}
-    return None
-
-
 def _normalize_file_entry(value) -> dict:
     if isinstance(value, dict):
         return {

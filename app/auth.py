@@ -1,10 +1,9 @@
 import logging
 import time
 
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from supabase import create_client, Client
-
 from fastapi import Request
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from supabase import Client, create_client
 
 from app.config import settings
 
@@ -37,9 +36,7 @@ def encode_session(payload: dict) -> str:
 def decode_session(token: str) -> dict | None:
     try:
         return _serializer().loads(token, max_age=settings.session_max_age_seconds)
-    except SignatureExpired:
-        return None
-    except BadSignature:
+    except (SignatureExpired, BadSignature):
         return None
 
 
@@ -65,50 +62,22 @@ def exchange_code_for_session(auth_code: str) -> tuple[dict | None, str | None]:
         return None, "Could not complete sign in with Google."
     if response.user is None or response.session is None:
         return None, "Could not complete sign in with Google."
-    return _session_payload_from_response(response), None
-
-
-def _session_payload_from_response(response) -> dict:
-    user = response.user
-    session = response.session
     return {
-        "user_id": user.id,
-        "email": user.email,
-        "access_token": session.access_token if session else None,
-        "refresh_token": session.refresh_token if session else None,
+        "user_id": response.user.id,
+        "email": response.user.email,
         "issued_at": int(time.time()),
-    }
-
-
-def refresh_session(refresh_token: str) -> dict | None:
-    client = get_anon_client()
-    if client is None or not refresh_token:
-        return None
-    try:
-        response = client.auth.refresh_session(refresh_token)
-    except Exception as exc:
-        logger.info("refresh_session failed error=%s", exc)
-        return None
-    if response.user is None or response.session is None:
-        return None
-    return _session_payload_from_response(response)
+    }, None
 
 
 def get_current_user(request: Request) -> dict | None:
     token = request.cookies.get(settings.session_cookie_name)
-    if not token:
-        return None
-    session = decode_session(token)
-    if session is None:
-        return None
-    return session
+    return decode_session(token) if token else None
 
 
 def set_session_cookie(response, session_payload: dict) -> None:
-    token = encode_session(session_payload)
     response.set_cookie(
         key=settings.session_cookie_name,
-        value=token,
+        value=encode_session(session_payload),
         max_age=settings.session_max_age_seconds,
         httponly=True,
         samesite="lax",

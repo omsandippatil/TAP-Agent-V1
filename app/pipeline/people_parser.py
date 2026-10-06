@@ -78,26 +78,6 @@ SENIOR_EXECUTIVE_TITLE_PATTERN = re.compile(
 
 ROLE_CLAUSE_SPLIT_PATTERN = re.compile(r"\s*(?:,|;|\band\b)\s*", re.IGNORECASE)
 
-INDIA_DIRECT_RESPONSIBILITY_PATTERN = re.compile(
-    r"(india\s+head|head\s*(?:,|-|\u2013|\u2014)?\s*(?:of\s+)?[\w\s]{0,30}\bindia\b|"
-    r"india\s+lead|lead\s*(?:,|-|\u2013|\u2014)?\s*(?:of\s+)?[\w\s]{0,30}\bindia\b|"
-    r"india\s+(?:csr|philanthropy|social\s+impact|social\s+finance)|"
-    r"(?:csr|philanthropy|social\s+impact|social\s+finance)\s*(?:,|-|\u2013|\u2014)?\s*india|"
-    r"country\s+head\s*(?:,|-|\u2013|\u2014)?\s*india|india\s+country\s+head)",
-    re.IGNORECASE,
-)
-
-INDIA_REGIONAL_RESPONSIBILITY_PATTERN = re.compile(
-    r"(india\s*(?:&|and)\s*middle\s*east(?:\s*(?:&|and)\s*africa)?|"
-    r"middle\s*east\s*(?:&|and)\s*india|"
-    r"india\s*(?:&|and)\s*south\s*asia|south\s*asia\s*(?:&|and)\s*india|"
-    r"india\s+region|india\s+operations|"
-    r"regional\s+head[^.;]{0,40}india|india[^.;]{0,40}regional\s+head)",
-    re.IGNORECASE,
-)
-
-INDIA_WEAK_MENTION_PATTERN = re.compile(r"\bindia\b|\bbharat\b", re.IGNORECASE)
-
 SENIORITY_KEYWORD_PATTERN_ORDER = [
     ("C_SUITE", re.compile(r"\b(chief\s+\w+\s+officer|c[a-z]o)\b", re.IGNORECASE)),
     ("VP", re.compile(r"\b(vice\s+president|vp)\b", re.IGNORECASE)),

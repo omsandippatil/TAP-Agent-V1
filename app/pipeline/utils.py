@@ -1,8 +1,6 @@
 import hashlib
-import json
 import logging
 import re
-import time
 
 import certifi
 import requests
@@ -266,119 +264,11 @@ def extract_main_text(soup, max_chars: int = 16000) -> str:
     return normalize_block_text(combined, max_chars)
 
 
-def extract_table_rows(soup, max_rows: int = 200) -> list[list[str]]:
-    rows = []
-    for table in soup.find_all("table"):
-        for tr in table.find_all("tr"):
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-            cells = [c for c in cells if c]
-            if cells:
-                rows.append(cells)
-            if len(rows) >= max_rows:
-                return rows
-    return rows
-
-
 def combine_source_texts(sources: list) -> str:
     return "\n\n".join(
         source["text"] for source in sources
         if source.get("status") == "FOUND" and source.get("text")
     )
-
-
-CSR_SIGNAL_KEYWORDS = [
-    "csr", "corporate social", "philanthrop", "social responsibility",
-    "schedule vii", "csr spend", "csr expenditure", "csr budget",
-    "csr obligation", "csr fund", "community investment", "sustainability",
-    "foundation", "ngo", "education", "skill", "crore", "lakh",
-    "partnered", "partnership", "initiative", "programme", "program",
-]
-
-SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+")
-COMPANY_STOPWORDS = {
-    "india", "limited", "ltd", "private", "pvt", "the", "and", "of",
-    "company", "corp", "corporation", "inc", "group", "technologies",
-    "solutions", "services", "international",
-}
-
-
-def company_tokens(company: str) -> list[str]:
-    return [
-        token for token in re.sub(r"[^a-z0-9 ]", " ", company.lower()).split()
-        if len(token) > 2 and token not in COMPANY_STOPWORDS
-    ]
-
-
-def sentence_mentions_company(sentence_lower: str, tokens: list[str]) -> bool:
-    if not tokens:
-        return True
-    return any(token in sentence_lower for token in tokens)
-
-
-def sentence_csr_signal_count(sentence_lower: str) -> int:
-    return sum(1 for kw in CSR_SIGNAL_KEYWORDS if kw in sentence_lower)
-
-
-def score_sentence(sentence: str, tokens: list[str]) -> int:
-    lowered = sentence.lower()
-    if len(sentence) < 25:
-        return -1
-    score = sentence_csr_signal_count(lowered) * 2
-    if sentence_mentions_company(lowered, tokens):
-        score += 3
-    return score
-
-
-def relevant_excerpt_from_text(text: str, company: str, max_chars: int) -> str:
-    tokens = company_tokens(company)
-    sentences = SPLIT_PATTERN.split(text)
-    scored = [(score_sentence(s, tokens), s.strip()) for s in sentences]
-    scored = [(score, s) for score, s in scored if score >= 0 and s]
-
-    if not scored:
-        return clean_text(text, max_chars)
-
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-
-    kept, used_chars = [], 0
-    for score, sentence in scored:
-        if score <= 0 and used_chars > 0:
-            break
-        addition = len(sentence) + 1
-        if used_chars + addition > max_chars:
-            break
-        kept.append(sentence)
-        used_chars += addition
-
-    if not kept:
-        return clean_text(text, max_chars)
-    return clean_text(" ".join(kept), max_chars)
-
-
-def trim_source_for_relevance(source: dict, company: str, per_source_budget: int) -> str:
-    text = source.get("text", "")
-    if not text:
-        return ""
-    if len(text) <= per_source_budget:
-        return text
-    return relevant_excerpt_from_text(text, company, per_source_budget)
-
-
-def build_relevant_evidence_text(sources: list, company: str, total_budget: int = 9000) -> str:
-    found_sources = [s for s in sources if s.get("status") == "FOUND" and s.get("text")]
-    if not found_sources:
-        return ""
-
-    per_source_budget = max(600, total_budget // max(len(found_sources), 1))
-    chunks = []
-    for source in found_sources:
-        trimmed = trim_source_for_relevance(source, company, per_source_budget)
-        if trimmed:
-            label = source.get("source_name", "source")
-            chunks.append(f"[{label}]\n{trimmed}")
-
-    combined = "\n\n".join(chunks)
-    return combined[:total_budget]
 
 
 def build_sources_manifest(sources: list) -> str:
@@ -407,10 +297,6 @@ def merge_manifest_with_registry(sources_manifest: str, registry) -> str:
     if not sources_manifest:
         return registry_block
     return sources_manifest + "\n\n" + registry_block
-
-
-def to_json(value) -> str:
-    return json.dumps(value, indent=2, ensure_ascii=False, default=str)
 
 
 def evidence_hash(sources: list) -> str:

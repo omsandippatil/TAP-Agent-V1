@@ -61,9 +61,6 @@ RELEVANCE_KEYWORD_WEIGHTS = {
     "annexure": 1, "schedule vii": 1,
 }
 
-RELEVANCE_FLOOR_SCORE = -1000
-
-
 def normalize_whitespace_and_html(raw_text):
     if not raw_text:
         return ""
@@ -170,31 +167,6 @@ def estimate_tokens(text):
     if not text:
         return 0
     return _estimate_tokens_cached(text)
-
-
-def remove_stopwords_and_boilerplate(sources, company=""):
-    if not sources:
-        logger.info("remove_stopwords_and_boilerplate company=%r no sources provided", company)
-        return sources
-
-    seen_fingerprints = set()
-    cleaned = []
-    for source in sources:
-        if source.get("status") != "FOUND" or not source.get("text"):
-            cleaned.append(source)
-            continue
-        cleaned_text = clean_source_text(
-            source["text"], seen_fingerprints, source_name=source.get("source_name", ""),
-        )
-        cleaned.append({**source, "text": cleaned_text})
-
-    logger.info(
-        "remove_stopwords_and_boilerplate DONE company=%r sources_total=%d sources_found=%d "
-        "distinct_fingerprints=%d",
-        company, len(sources), sum(1 for s in sources if s.get("status") == "FOUND"),
-        len(seen_fingerprints),
-    )
-    return cleaned
 
 
 def _sentence_relevance_score(sentence_lower):

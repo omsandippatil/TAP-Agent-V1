@@ -27,6 +27,3 @@ def load_config() -> dict:
     return loaded or {}
 
 
-def reload_config() -> dict:
-    load_config.cache_clear()
-    return load_config()

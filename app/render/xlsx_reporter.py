@@ -9,11 +9,10 @@ from openpyxl.utils import get_column_letter
 from openpyxl.comments import Comment
 from openpyxl.drawing.image import Image as XLImage
  
-from app.pipeline.llm import LLM_UNAVAILABLE_EVIDENCE, is_plausible_person_name
+from app.pipeline.llm import LLM_UNAVAILABLE_EVIDENCE
 
 ARIAL = "Arial"
 HDR_FILL = PatternFill("solid", fgColor="0F3D3E")
-SUBHDR_FILL = PatternFill("solid", fgColor="146B65")
 SUB_FILL = PatternFill("solid", fgColor="E6F5F3")
 HIGHLIGHT_FILL = PatternFill("solid", fgColor="F5C518")
 FLAG_FILL_HIGH = PatternFill("solid", fgColor="FBEAEA")
@@ -32,7 +31,6 @@ BANNER_SUB = Font(name=ARIAL, color="B8E3E0", size=9)
 TEAL_BOLD = Font(name=ARIAL, bold=True, color="0F3D3E", size=10)
 YELLOW_BOLD = Font(name=ARIAL, bold=True, color="8A6200", size=10)
 AMBER_BOLD = Font(name=ARIAL, bold=True, color="B4530A", size=10)
-BOLD = Font(name=ARIAL, bold=True, size=10)
 BODY = Font(name=ARIAL, size=10)
 SMALL = Font(name=ARIAL, size=9, color="666666")
 LINK_FONT = Font(name=ARIAL, size=10, color=LINK_FONT_COLOR, underline="single", bold=True)

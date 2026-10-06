@@ -55,11 +55,6 @@ main {
   padding: 40px 0 32px;
 }
 
-.brand-mark {
-  display: inline-flex;
-  margin-bottom: 18px;
-}
-
 .hero-section h1 {
   font-size: 26px;
   font-weight: 700;
@@ -175,35 +170,8 @@ main {
   box-shadow: var(--shadow-sm);
 }
 
-.back {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 32px;
-  color: var(--grey);
-  text-decoration: none;
-  font-size: 13px;
-  font-weight: 500;
-  transition: color 0.15s ease;
-}
-
-.back:hover {
-  color: var(--accent);
-}
-
 .report {
   max-width: 100%;
-}
-
-.report-brand {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 20px;
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--accent);
-  letter-spacing: 0.2px;
 }
 
 .report-head {
@@ -422,19 +390,6 @@ main {
   margin-bottom: 12px;
 }
 
-.section-head-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-  flex-wrap: wrap;
-}
-
-.section-head-row h2 {
-  margin-bottom: 0;
-}
-
 .tag {
   font-size: 11.5px;
   font-weight: 600;
@@ -454,11 +409,6 @@ main {
   text-align: justify;
 }
 
-.panel-flush {
-  padding: 0;
-  overflow: hidden;
-}
-
 .panel-footnote {
   font-size: 12px;
   color: var(--grey);
@@ -467,11 +417,6 @@ main {
   padding-top: 14px;
   border-top: 1px solid var(--line-soft);
   text-align: justify;
-}
-
-.panel-footnote-padded {
-  margin: 0;
-  padding: 14px 20px;
 }
 
 .bar-row {
@@ -505,17 +450,6 @@ main {
   color: var(--accent-mid);
   background: var(--good-soft);
   border: 1px solid #cfe9df;
-  padding: 2px 8px;
-  border-radius: 999px;
-  white-space: nowrap;
-}
-
-.weight-pill {
-  font-size: 10.5px;
-  font-weight: 500;
-  color: var(--grey);
-  background: transparent;
-  border: 1px dashed var(--line);
   padding: 2px 8px;
   border-radius: 999px;
   white-space: nowrap;
@@ -597,21 +531,6 @@ tbody tr:last-child td {
 
 tbody tr:hover {
   background: var(--panel);
-}
-
-.col-narrow {
-  text-align: center;
-  width: 56px;
-}
-
-.col-criterion {
-  min-width: 180px;
-}
-
-td.confirm {
-  color: var(--warn);
-  background: var(--warn-soft);
-  font-style: italic;
 }
 
 .downloads {
@@ -911,37 +830,6 @@ ul li:last-child {
   text-align: justify;
 }
 
-#result.is-loading {
-  pointer-events: none;
-}
-
-.source-link {
-  position: relative;
-}
-
-.source-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  margin-right: 8px;
-  background: var(--line);
-  flex-shrink: 0;
-}
-
-.source-link-found .source-dot {
-  background: var(--good);
-}
-
-.source-link-missing .source-dot {
-  background: var(--line);
-}
-
-.source-link-missing {
-  opacity: 0.6;
-  pointer-events: none;
-}
-
 .topnav {
   display: flex;
   align-items: center;
@@ -978,18 +866,6 @@ ul li:last-child {
 
 .topnav-link:hover {
   color: var(--accent);
-}
-
-.topnav-signup {
-  background: var(--accent);
-  color: var(--accent-contrast);
-  padding: 7px 14px;
-  border-radius: 999px;
-}
-
-.topnav-signup:hover {
-  color: var(--accent-contrast);
-  opacity: 0.88;
 }
 
 .topnav-email {
@@ -1114,87 +990,6 @@ nav.topnav button.topnav-back svg {
 .suggest-score {
   font-size: 0.75rem;
   color: var(--grey);
-}
-
-.auth-section {
-  max-width: 380px;
-  margin: 64px auto;
-  padding: 0 20px;
-}
-
-.auth-section h1 {
-  font-size: 24px;
-  font-weight: 700;
-  letter-spacing: -0.3px;
-  color: var(--accent);
-}
-
-.auth-form {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 20px;
-}
-
-.auth-label {
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: var(--ink-soft);
-  margin-top: 10px;
-}
-
-.auth-input {
-  padding: 10px 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  font-size: 0.95rem;
-  font-family: inherit;
-  color: var(--ink);
-  background: var(--bg);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.auth-input:focus {
-  outline: none;
-  border-color: var(--accent-mid);
-  box-shadow: 0 0 0 3px rgba(20, 107, 101, 0.12);
-}
-
-.auth-submit {
-  margin-top: 18px;
-  padding: 12px;
-  border: none;
-  border-radius: var(--radius-sm);
-  background: var(--accent);
-  color: var(--accent-contrast);
-  font-weight: 700;
-  font-size: 0.95rem;
-  cursor: pointer;
-  transition: opacity 0.15s ease, transform 0.05s ease;
-}
-
-.auth-submit:hover {
-  opacity: 0.88;
-}
-
-.auth-submit:active {
-  transform: translateY(1px);
-}
-
-.auth-switch {
-  margin-top: 16px;
-  font-size: 0.85rem;
-  color: var(--grey);
-}
-
-.auth-switch a {
-  color: var(--accent-mid);
-  font-weight: 600;
-  text-decoration: none;
-}
-
-.auth-switch a:hover {
-  text-decoration: underline;
 }
 
 .auth-page {
@@ -1467,3 +1262,20 @@ nav.topnav button.topnav-back svg {
     padding: 14px 18px;
   }
 }
+.mt-12 { margin-top: 12px; }
+.mt-14 { margin-top: 14px; }
+.person-card { display: flex; flex-direction: column; gap: 4px; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.person-card-top { display: flex; align-items: center; gap: 6px; }
+.person-name-link { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-mid); text-decoration: none; }
+.person-name-link:hover { text-decoration: underline; }
+.source-row { font-size: 13px; font-weight: 600; color: var(--accent-mid); text-decoration: none; padding: 6px 0; }
+.evidence-link { color: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }
+
+.mt-12 { margin-top: 12px; }
+.mt-14 { margin-top: 14px; }
+.person-card { display: flex; flex-direction: column; gap: 4px; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.person-card-top { display: flex; align-items: center; gap: 6px; }
+.person-name-link { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-mid); text-decoration: none; }
+.person-name-link:hover { text-decoration: underline; }
+.source-row { font-size: 13px; font-weight: 600; color: var(--accent-mid); text-decoration: none; padding: 6px 0; }
+.evidence-link { color: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }

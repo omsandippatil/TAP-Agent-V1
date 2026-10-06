@@ -2,7 +2,6 @@ import asyncio
 import logging
 import random
 import threading
-import time
 from datetime import datetime, timezone
 
 import httpx
@@ -74,10 +73,6 @@ class _DailyQuotaTracker:
 
 
 _daily_quota_tracker = _DailyQuotaTracker()
-
-
-def daily_quota_status() -> dict:
-    return _daily_quota_tracker.snapshot()
 
 
 def daily_quota_is_exhausted() -> bool:

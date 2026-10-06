@@ -112,10 +112,6 @@ def build_scoring_view(extraction: dict) -> dict:
     return scoring_facts
 
 
-def build_scoring_view_for_directed_rescore(analysis: dict) -> dict:
-    return build_scoring_view(analysis)
-
-
 def _verbose_logging_enabled() -> bool:
     return bool(getattr(settings, "verbose_pipeline_logging", True))
 
@@ -250,7 +246,7 @@ def _rubric_block() -> str:
 @functools.lru_cache(maxsize=1)
 def _criteria_json_template() -> str:
     return ",\n".join(
-        f'    {{"id": "{cid}", "score": <0-5 or null>, "confidence": <0-100>, "evidence": "<short paraphrase>", "reasoning": "<short>"}}'
+        f'    {{"id": "{cid}", "score": <0-5 or null>, "confidence": <0-100>, "evidence": "<short paraphrase>", "reasoning": "<short>", "source": "<source number or empty>"}}'
         for cid in CRITERIA_IDS
     )
 
@@ -586,6 +582,8 @@ Extract, matching the JSON shape's key order exactly:
 7b. eligibility.net_profit_history — apply PROFIT_HISTORY_RULE; source 10 (multi_year_financials), when present, is specifically curated for side-by-side year figures — check it first for profit_history and spend.history.
 
 Before replying, run the CROSS_SECTION_CONSISTENCY_RULE check once over your own draft.
+Every `source` field takes only the bracketed number of the supporting entry in SOURCES (e.g. 3), or empty.
+Every `source` field takes only the bracketed number of the supporting entry in SOURCES (e.g. 3), or empty.
 
 Reply with ONE JSON object, nothing else, no markdown fences.
 
@@ -597,22 +595,24 @@ JSON shape:
   "csr_head_note": "<one sentence>",
   "delivery_model": "<FUNDER|IMPLEMENTER|HYBRID|UNCLEAR>",
   "delivery_model_evidence": "<sentence>",
+  "delivery_model_source": "<source number only>",
+  "delivery_model_source": "<source number only>",
   "sector": {{"sector": "<sector>", "sub_sector": "<or empty>", "reasoning": "<short>"}},
-  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number, 0 if unknown>, "net_profit_inr_crore": <number, 0 if unknown>, "net_profit_fiscal_year": "<if stated>", "net_profit_history": [{{"fiscal_year": "<year>", "net_profit_inr_crore": <number, 0 if unknown>, "source_excerpt": "<short, verbatim ok>"}}], "net_profit_trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>"}},
-  "spend": {{"inr_crore": <number, 0 if unknown, education-specific only>, "display": "<exact CSR-labeled education figure or empty>", "fiscal_year": "<if stated>", "is_education_specific": <bool>, "education_pct_of_total_csr": <number, 0 if unknown>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short, verbatim ok>", "state": "<FOUND|NOT_FOUND_IN_SOURCE|CONFIRMED_ABSENT>", "start_year": "<four-digit year if stated, else empty>", "trend_direction": "UNKNOWN", "trend_evidence": "<short>", "series_state": "<FOUND|NOT_FOUND_IN_SOURCE|CONFIRMED_ABSENT>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number, 0 if unknown>, "display": "<as stated>", "source_excerpt": "<short, verbatim ok>"}}], "total_csr_inr_crore": <number, 0 if unknown>, "total_csr_display": "<as stated or empty>", "total_csr_fiscal_year": "<if stated>"}},
+  "eligibility": {{"plausibly_mandated": "<LIKELY|UNLIKELY|UNKNOWN>", "reasoning": "<short>", "net_worth_turnover_signal": "<short>", "net_worth_turnover_inr_crore": <number, 0 if unknown>, "net_profit_inr_crore": <number, 0 if unknown>, "net_profit_fiscal_year": "<if stated>", "net_profit_history": [{{"fiscal_year": "<year>", "net_profit_inr_crore": <number, 0 if unknown>, "source_excerpt": "<short, verbatim ok>", "source": "<source number only, e.g. 3>", "source": "<source number only, e.g. 3>"}}], "net_profit_trend_direction": "<RISING|FLAT|DECLINING|UNKNOWN>"}},
+  "spend": {{"inr_crore": <number, 0 if unknown, education-specific only>, "display": "<exact CSR-labeled education figure or empty>", "fiscal_year": "<if stated>", "is_education_specific": <bool>, "education_pct_of_total_csr": <number, 0 if unknown>, "has_disclosed_budget": <bool>, "confidence": <0-100>, "source_excerpt": "<short, verbatim ok>", "source": "<source number only, e.g. 3>", "source": "<source number only, e.g. 3>", "state": "<FOUND|NOT_FOUND_IN_SOURCE|CONFIRMED_ABSENT>", "start_year": "<four-digit year if stated, else empty>", "trend_direction": "UNKNOWN", "trend_evidence": "<short>", "series_state": "<FOUND|NOT_FOUND_IN_SOURCE|CONFIRMED_ABSENT>", "history": [{{"fiscal_year": "<year>", "inr_crore": <number, 0 if unknown>, "display": "<as stated>", "source_excerpt": "<short, verbatim ok>", "source": "<source number only, e.g. 3>", "source": "<source number only, e.g. 3>"}}], "total_csr_inr_crore": <number, 0 if unknown>, "total_csr_display": "<as stated or empty>", "total_csr_fiscal_year": "<if stated>"}},
   "entity_structure": {{"parent_company": "<name or empty>", "india_entity": "<name or empty>", "foundation_entity": "<name or empty>", "notes": "<short, only if evidence clarifies how these relate>"}},
-  "rfp_signal": {{"present": <bool>, "channel": "<short>", "evidence": "<short>"}},
-  "board_affinity": {{"present": <bool>, "person_name": "<name or empty>", "connection": "<short>", "source_excerpt": "<short, verbatim ok>"}},
-  "volunteering": {{"present": <bool>, "programme_name": "<name or empty>", "description": "<short>", "source_excerpt": "<short, verbatim ok>"}},
-  "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>", "source_excerpt": "<short, verbatim ok>"}},
+  "rfp_signal": {{"present": <bool>, "channel": "<short>", "evidence": "<short>", "source": "<source number only, e.g. 3>"}},
+  "board_affinity": {{"present": <bool>, "person_name": "<name or empty>", "connection": "<short>", "source_excerpt": "<short, verbatim ok>", "source": "<source number only, e.g. 3>", "source": "<source number only, e.g. 3>"}},
+  "volunteering": {{"present": <bool>, "programme_name": "<name or empty>", "description": "<short>", "source_excerpt": "<short, verbatim ok>", "source": "<source number only, e.g. 3>", "source": "<source number only, e.g. 3>"}},
+  "group_foundation": {{"routed_through_group": <bool>, "foundation_name": "<name or empty>", "explanation": "<short>", "source_excerpt": "<short, verbatim ok>", "source": "<source number only, e.g. 3>", "source": "<source number only, e.g. 3>"}},
   "key_facts_summary": "<3-6 lines, each starting with '- '>",
   "search_directives": [{{"question": "<short item>", "search_query": "<concrete ready-to-run search query>", "target_field": "<dotted path or empty>", "priority": "<HIGH|MEDIUM|LOW>"}}],
-  "programmes": [{{"name": "<exact name>", "what_is_funded": "<precise funded activity>", "beneficiary_group": "<named beneficiary group>", "beneficiary_type": "<SCHOOL_CHILDREN_CURRICULUM|ADULT|OTHER>", "description": "<short, must cover delivery channel + beneficiary + one-off-vs-ongoing per PROGRAMME_RULE>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "funded_by_entity": "<name from entity_structure or empty>", "chain_missing_elements": ["<subset of beneficiaries|geography|partner|government_school_involvement|scale_or_outcomes|funding_amount>"], "source_excerpt": "<short, verbatim ok>", "confidence": "<confirmed|probable>"}}],
-  "partners": [{{"name": "<exact org name>", "relationship_type": "<funder|implementer|co-design|unclear>", "programme": "<or empty>", "year": "<or empty>", "geography": "<or empty>", "similar_to_tap_profile": <bool>, "funded_by_entity": "<name from entity_structure or empty>", "source_excerpt": "<short, verbatim ok, must show relationship language>", "confidence": "<confirmed|probable>"}}],
-  "decision_makers": [{{"name": "<actual person name>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "is_india_specific": <bool>, "source_excerpt": "<short, verbatim ok>", "linkedin_url": "<url or empty>"}}],
-  "geographies": [{{"place": "<state/city preferred>", "source_excerpt": "<short, verbatim ok>"}}],
-  "red_flags": [{{"flag": "<short label>", "severity": "<low|medium|high>", "explanation": "<short>"}}],
-  "contact_pathway": {{"channel": "<sentence>", "evidence": "<short>"}}
+  "programmes": [{{"name": "<exact name>", "what_is_funded": "<precise funded activity>", "beneficiary_group": "<named beneficiary group>", "beneficiary_type": "<SCHOOL_CHILDREN_CURRICULUM|ADULT|OTHER>", "description": "<short, must cover delivery channel + beneficiary + one-off-vs-ongoing per PROGRAMME_RULE>", "is_multi_year": <bool>, "cohort_or_scale": "<if stated>", "funded_by_entity": "<name from entity_structure or empty>", "chain_missing_elements": ["<subset of beneficiaries|geography|partner|government_school_involvement|scale_or_outcomes|funding_amount>"], "source_excerpt": "<short, verbatim ok>", "source": "<source number only, e.g. 3>", "source": "<source number only, e.g. 3>", "confidence": "<confirmed|probable>"}}],
+  "partners": [{{"name": "<exact org name>", "relationship_type": "<funder|implementer|co-design|unclear>", "programme": "<or empty>", "year": "<or empty>", "geography": "<or empty>", "similar_to_tap_profile": <bool>, "funded_by_entity": "<name from entity_structure or empty>", "source_excerpt": "<short, verbatim ok, must show relationship language>", "source": "<source number only, e.g. 3>", "source": "<source number only, e.g. 3>", "confidence": "<confirmed|probable>"}}],
+  "decision_makers": [{{"name": "<actual person name>", "title": "<title>", "public_facing_score": <0-100>, "tenure_status": "<NEW_UNDER_1YR|ESTABLISHED_1_3YR|ENTRENCHED_3YR_PLUS|UNKNOWN>", "tenure_evidence": "<short>", "is_india_specific": <bool>, "source_excerpt": "<short, verbatim ok>", "source": "<source number only, e.g. 3>", "source": "<source number only, e.g. 3>", "linkedin_url": "<url or empty>"}}],
+  "geographies": [{{"place": "<state/city preferred>", "source_excerpt": "<short, verbatim ok>", "source": "<source number only, e.g. 3>", "source": "<source number only, e.g. 3>"}}],
+  "red_flags": [{{"flag": "<short label>", "severity": "<low|medium|high>", "explanation": "<short>", "source": "<source number only, e.g. 3>"}}],
+  "contact_pathway": {{"channel": "<sentence>", "evidence": "<short>", "source": "<source number only, e.g. 3>"}}
 }}"""
 
 
@@ -692,14 +692,6 @@ def _scoring_prompt_blocks(company: str, mission: str, mode: str, extraction: di
         {"type": "text", "text": _scoring_prompt_static_block()},
         {"type": "text", "text": _scoring_prompt_dynamic_block(company, mission, mode, extraction, sources_manifest, csr_obligation)},
     ]
-
-
-def _scoring_prompt(company: str, mission: str, mode: str, extraction: dict, sources_manifest: str,
-                     csr_obligation: dict | None = None) -> str:
-    return "\n\n".join(
-        block["text"]
-        for block in _scoring_prompt_blocks(company, mission, mode, extraction, sources_manifest, csr_obligation)
-    )
 
 
 class CriterionResultSchema(BaseModel):
@@ -1371,7 +1363,7 @@ _NARRATIVE_NAME_PATTERN = re.compile(
 )
 
 _NARRATIVE_NAME_STOPWORDS = {
-    "CGI", "CSR", "ESG", "India", "TAP", "NGO", "MCD", "BMC", "SCERT",
+    "CSR", "ESG", "India", "TAP", "NGO", "MCD", "BMC", "SCERT",
     "CEO", "MD", "The", "This", "That", "Dr", "Mr", "Ms", "Mrs",
 }
 
@@ -2247,16 +2239,11 @@ def _repair_analysis(parsed: dict) -> FullAnalysisSchema:
 
 
 def _valid_source_lookup(sources_manifest: str) -> set[str]:
-    valid = set()
-    for line in sources_manifest.splitlines():
-        parts = line.split("|")
-        if parts and parts[0].strip():
-            valid.add(parts[0].strip())
-    return valid
+    return set(re.findall(r"^\[(\d+)\]", sources_manifest or "", re.MULTILINE))
 
 
 def _sanitize_source(value: str, valid_sources: set[str]) -> str:
-    cleaned = (value or "").strip()
+    cleaned = str(value or "").strip().strip("[]").strip()
     return cleaned if cleaned in valid_sources else ""
 
 
@@ -2649,20 +2636,3 @@ async def analyze_and_score_company(
     return result
 
 
-async def api_health_check() -> dict:
-    google_ok = settings.google_search_configured
-    if not settings.anthropic_configured:
-        anthropic_status = {"ok": False, "model": None, "message": "ANTHROPIC_API_KEY not set — analysis and scoring are unavailable"}
-    else:
-        reply = await call_anthropic_chat('Reply with JSON: {"status":"ok"}', max_tokens=20, caller="api_health_check")
-        if reply:
-            anthropic_status = {"ok": True, "model": settings.anthropic_model, "message": f"Claude connected ({settings.anthropic_model}) — full AI analysis active"}
-        else:
-            anthropic_status = {"ok": False, "model": None, "message": "Anthropic API unreachable — analysis and scoring are unavailable"}
-    return {
-        "anthropic": anthropic_status,
-        "google_search": {
-            "configured": google_ok,
-            "message": "Google Custom Search configured" if google_ok else "Google Search not configured — using DDGS fallback for all queries",
-        },
-    }

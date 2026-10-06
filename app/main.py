@@ -1,14 +1,17 @@
 import asyncio
 import base64
+import html
 import logging
 import time
 import uuid
+from collections import defaultdict, deque
 
-from fastapi import FastAPI, Form, Request, Response
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import auth, db
+from app.config import settings
 from app.pipeline import scorer, scraper
 from app.pipeline.config_loader import load_config
 from app.pipeline.source_registry import SourceRegistry
@@ -38,6 +41,38 @@ HISTORY_SEARCH_RESULT_LIMIT = 8
 _INFLIGHT_JOB_BY_KEY: dict[tuple, str] = {}
 _JOBS_LOCK = asyncio.Lock()
 
+RUN_WINDOW_SECONDS = 3600
+_RUNS: dict[str, deque] = defaultdict(deque)
+
+
+def _too_many_runs(request: Request) -> bool:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    ip = forwarded or (request.client.host if request.client else "unknown")
+    now = time.monotonic()
+    window = _RUNS[ip]
+    while window and now - window[0] > RUN_WINDOW_SECONDS:
+        window.popleft()
+    if len(window) >= settings.screen_runs_per_hour:
+        return True
+    window.append(now)
+    return False
+
+RUN_WINDOW_SECONDS = 3600
+_RUNS: dict[str, deque] = defaultdict(deque)
+
+
+def _too_many_runs(request: Request) -> bool:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    ip = forwarded or (request.client.host if request.client else "unknown")
+    now = time.monotonic()
+    window = _RUNS[ip]
+    while window and now - window[0] > RUN_WINDOW_SECONDS:
+        window.popleft()
+    if len(window) >= settings.screen_runs_per_hour:
+        return True
+    window.append(now)
+    return False
+
 
 def _is_htmx_request(request: Request) -> bool:
     return request.headers.get("HX-Request", "").lower() == "true"
@@ -48,12 +83,8 @@ def _encode_file(content_bytes: bytes, filename: str, mime: str) -> tuple[str, s
     return filename, mime, b64
 
 
-def _slugify(company: str) -> str:
-    return "".join(ch if ch.isalnum() else "_" for ch in company.strip().lower()).strip("_") or "company"
-
-
 def _job_key(company: str, mode: str) -> tuple:
-    return (_slugify(company), mode)
+    return (db.slugify(company), mode)
 
 
 def _job_ttl_seconds(job: dict) -> int:
@@ -150,7 +181,7 @@ async def _run_screen_job(job_id: str, company: str, mode: str, user_id: str | N
         docx_bytes = None
         xlsx_bytes = None
         if mode == "deep":
-            slug = _slugify(company)
+            slug = db.slugify(company)
             docx_bytes = await generate_docx_report(company, result, mode)
             docx_filename = f"tap_csr_{slug}_deep.docx"
             files["Word Report (.docx)"] = _encode_file(
@@ -369,6 +400,20 @@ async def screen(request: Request, company: str = Form(...), mode: str = Form("s
             status_code=400,
         )
 
+    if _too_many_runs(request):
+        # 200 on purpose: htmx only swaps 2xx responses
+        return HTMLResponse(
+            '<div class="ff-error"><strong>Hourly research limit reached.</strong>'
+            "<p>Please try again a little later.</p></div>"
+        )
+
+    if _too_many_runs(request):
+        # 200 on purpose: htmx only swaps 2xx responses
+        return HTMLResponse(
+            '<div class="ff-error"><strong>Hourly research limit reached.</strong>'
+            "<p>Please try again a little later.</p></div>"
+        )
+
     _prune_expired_jobs()
 
     user = _current_user(request)
@@ -408,7 +453,7 @@ async def screen_status(request: Request, job_id: str):
         job["created_at"] = time.monotonic()
         return HTMLResponse(
             '<div class="ff-error"><strong>Something went wrong running that request.</strong>'
-            f'<p>{error_message}</p></div>'
+            f'<p>{html.escape(str(error_message))}</p></div>'
         )
 
     screening_id = job.get("screening_id")
